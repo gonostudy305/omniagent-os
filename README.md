@@ -51,7 +51,8 @@ flowchart TD
 ## 🚀 Key Features
 
 - **Single Source of Truth (SSOT):** Maintain one canonical copy of skills to eliminate redundant copies across agent directories.
-- **Smart Path Decoupling:** Replaces brittle hardcoded paths (`.claude/...`, `.agents/...`) with portable references or automated generator renderers.
+- **Safe Skill Manager MVP:** Inventory, plan, copy, update, and roll back *managed* skill copies. Existing unmanaged skills are never replaced automatically.
+- **Smart Path Decoupling (planned):** Future per-agent adapters will replace brittle hardcoded paths (`.claude/...`, `.agents/...`) with portable references or generated renderers.
 - **Clean Source & Reproducible Dependencies:** Keeps repository source free of committed vendor packages (`node_modules`), with planned hydration scripts for skills requiring local runtime environments.
 - **Preserved System Runtimes:** Safely isolates vendor-specific runtimes (e.g., OpenAI `.system` skills) without polluting cross-agent tool registries.
 - **Audit & Validation Tooling:** Built-in Python scripts to audit, deduplicate, and verify parity across all local agent installations.
@@ -66,6 +67,8 @@ flowchart TD
 ├── LICENSE
 ├── audit_skills.py           # Fast SHA-256 hash & line-level unified diff auditor
 ├── generate_report.py        # Generates markdown audit reports
+├── omniagent.py              # Safe discover / plan / apply / rollback CLI
+├── tests/                    # Synthetic audit and Skill Manager safety tests
 ├── SKILLS_AUDIT_REPORT.md    # Case study audit report across 4 skill stores
 └── ssot/                     # Local SSOT directory (managed locally / .gitignored)
     └── skills/               # Canonical, clean skills library
@@ -86,6 +89,46 @@ Add `--store NAME=PATH` (repeatable) to audit custom skill directories. Run the 
 ### 2. Inspect Audit Results
 The scripts write `audit.json`, `audit_report.md` and `narrative_report.md` to `.local/reports/` (git-ignored, since they contain machine-specific paths and skill names). `SKILLS_AUDIT_REPORT.md` in this repo is a static, anonymized example.
 
+### 3. Manage skills safely (v0.2 preview)
+
+`omniagent.py` only writes to explicitly selected targets. **Plan does not change any files.** It never overwrites an existing unmanaged skill, and it deliberately leaves Codex's internal `.codex/skills/.system` alone. The default mode copies files, so Windows symlink privileges are not required.
+
+Example from PowerShell (run at the repo root):
+
+```powershell
+# Read-only: show which standard stores are present (SSOT may be absent).
+python omniagent.py discover
+
+# Review changes for a single agent, using your private local SSOT.
+$skills = Join-Path $PWD 'ssot\skills'
+$claude = Join-Path $HOME '.claude\skills'
+python omniagent.py plan --source $skills --target "claude=$claude"
+
+# Only after reviewing the plan: install missing skills and update managed,
+# unchanged copies. Leave unmanaged skills and local edits untouched.
+python omniagent.py apply --source $skills --target "claude=$claude" --yes --skip-blocked
+
+# Copy the transaction ID printed by apply to undo that operation later:
+python omniagent.py rollback --transaction 'YYYYMMDDTHHMMSSZ-xxxxxxxxxxxx' --yes
+```
+
+For multiple stores, repeat `--target NAME=PATH`, e.g. `--target "agents=$HOME\.agents\skills"`. To deploy just one skill, use `--skill NAME` (repeatable).
+
+Important safety boundaries:
+
+- Backups, transaction journals, hashes, and machine-specific paths remain under `.local/manager/`, which is excluded from Git. **Back up this folder securely** if you want to keep rollback capability.
+- A skill is changed only if the manager previously installed it *and* its current content still matches the recorded checksum. Unmanaged collisions or manual edits are blocked. `--skip-blocked` explicitly leaves those entries alone.
+- `node_modules`, `.git`, and caches are not copied. Suspected credential files and source symlinks cause a refusal. Dependencies are **not hydrated** yet.
+- This preview does not rewrite hardcoded paths inside `SKILL.md`, merge second brains, or manage external agent runtimes. It does not guarantee crash-safe filesystem transactions or coordinate concurrent managers using different state directories.
+- On Windows, run the CLI from a normal user PowerShell session; test with disposable `--target` directories before using real agent stores.
+
+Run isolated tests (no third-party Python packages required):
+
+```powershell
+python tests/test_audit.py
+python -m unittest discover -s tests -p test_skill_manager.py -v
+```
+
 ---
 
 ## 🗺 Roadmap
@@ -93,7 +136,8 @@ The scripts write `audit.json`, `audit_report.md` and `narrative_report.md` to `
 - [x] Phase 1: Safe multi-agent configuration backup with zero credential leakage.
 - [x] Phase 2: Complete cross-agent skill audit and line-level diff drift analysis.
 - [x] Phase 3: Extraction of canonical SSOT structure (local-first).
-- [ ] Phase 4: CLI for symlinking or generating per-agent configs on demand.
+- [x] Phase 4a: Conservative local Skill Manager MVP (discover, plan, copy, rollback).
+- [ ] Phase 4b: Per-agent path templating, adapters, dependency-aware validation, and stronger transaction recovery.
 - [ ] Phase 5: Automated dependency hydration for skills with package requirements.
 - [ ] Phase 6: Cross-Agent Memory Integration via MCP (Memorix / Local Knowledge Graph).
 
