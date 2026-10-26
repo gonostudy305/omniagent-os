@@ -94,15 +94,15 @@ Cần ít nhất hai biến. Thứ tự áp dụng: `.claude/skills` trước, r
 
 Trong bản sao, đổi đường dẫn thành `{{SKILLS_DIR}}` và `{{AGENT_CONFIG_DIR}}`, rồi dùng `path_adapter.py` xem trước so với thư mục thật.
 
-| Kho | ads-management | cip-design | threejs |
+| Kho | skill-A | skill-B | skill-C |
 |---|---|---|---|
 | claude | match | match | match |
-| agents | drift | drift | match |
+| agents | match | drift | drift |
 
 - claude khớp 3/3: bản render lại đúng bản đang cài, nên chuyển SSOT sang template không đổi nội dung của claude.
-- threejs khớp ở agents: cơ chế đúng với trường hợp đường dẫn thuần túy.
-- ads-management ở agents lệch vì bản cài **chưa được chuyển đổi trọn vẹn**: `SKILL.md` đã đổi sang `.agents/skills`, nhưng một file trong `references/` còn `.claude/skills`. Adapter sẽ sửa được lỗi bỏ sót này.
-- cip-design lệch ở một file script (khoảng dòng 431); chưa xác định là đường dẫn hay thay đổi mã.
+- skill-A khớp ở agents: cơ chế đúng với trường hợp đường dẫn thuần túy.
+- skill-B ở agents lệch vì bản cài **chưa được chuyển đổi trọn vẹn**: `SKILL.md` đã đổi sang `.agents/skills`, nhưng một file trong `references/` còn `.claude/skills`. Adapter sẽ sửa được lỗi bỏ sót này.
+- skill-C lệch ở một file script (khoảng dòng 431); chưa xác định là đường dẫn hay thay đổi mã.
 
 ### Phát hiện cho thiết kế v0.3b
 
@@ -110,11 +110,11 @@ Trong bản sao, đổi đường dẫn thành `{{SKILLS_DIR}}` và `{{AGENT_CON
 2. **Hash trong `state.json` phải đổi:** `state.json` lưu hash của SSOT chưa render. Nếu SSOT chứa placeholder, các bản đã quản lý sẽ bị coi là cần `update`. v0.3b phải băm bản đã render theo từng agent trước khi nối vào `plan` và `apply`, và có đường nâng cấp state cũ.
 3. **CRLF:** `brainstorm` chỉ khác dấu xuống dòng nhưng vẫn bị coi là lệch. Không chuẩn hóa CRLF trong hàm băm chung vì sẽ đổi hash của mọi bản đang quản lý. Xử lý riêng ở bước `adopt`, lưu hash thực của thư mục đích.
 4. **Placeholder lạ:** adapter coi mọi chuỗi `{{CHỮ_HOA}}` trong file không khai báo là lỗi `unsafe`. SSOT có 5 file chứa chuỗi kiểu này (thuộc skill tài liệu SEO và nhóm `synced`), nên cần giới hạn kiểm tra vào file được khai báo hoặc cho phép bỏ qua có cấu hình.
-5. **Bản cài có thể sai sẵn:** bản của agents có file chưa chuyển đổi (xem ads-management). Khi apply qua adapter, phải xem trước và cần xác nhận riêng, vì nó thay đổi nội dung file mà người dùng đã cài.
+5. **Bản cài có thể sai sẵn:** bản của agents có file chưa chuyển đổi (xem skill-B). Khi apply qua adapter, phải xem trước và cần xác nhận riêng, vì nó thay đổi nội dung file mà người dùng đã cài.
 
 ### Việc kế tiếp
 
 - Sửa `--diff` (UTF-8) và thêm test.
 - Thiết kế render-aware hash trong `plan`/`apply`/state; thử trên bản sao rồi mới nối vào `apply`.
-- Xem lại `cip-design` và 4 skill `needs_review` của agents.
+- Xem lại `skill-C` và 4 skill `needs_review` của agents.
 - Quyết định cách xử lý CRLF ở `adopt`.
