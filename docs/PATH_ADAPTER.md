@@ -46,6 +46,19 @@ For the `agents` target, the in-memory expected content becomes
 `.claude/skills/demo-skill/scripts/run.py`. Files not named in `files` are
 kept byte-for-byte, and an undeclared template placeholder is an error.
 
+Some skills legitimately contain literal `{{UPPER_CASE}}` text (for example
+mail or document templates). List those files under `ignore_placeholders` for the
+skill: they are copied unchanged and not treated as templates. A file cannot be
+in both `files` and `ignore_placeholders`; any other file with a placeholder
+still fails closed.
+
+```json
+"skills": { "demo-skill": { "files": ["SKILL.md"], "ignore_placeholders": ["references/mail.md"] } }
+```
+
+Command output is forced to UTF-8 (invalid characters replaced) so `--diff`
+works on Windows consoles that default to cp1252.
+
 Supported placeholders: `{{SKILLS_DIR}}`, `{{AGENT_CONFIG_DIR}}`,
 `{{SECRET_DIR}}` (paths only, **never secret values**) and built-in
 `{{SKILL_NAME}}`. Undefined placeholders cause a hard failure. Manifest path

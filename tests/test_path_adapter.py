@@ -140,6 +140,39 @@ class PathAdapterTests(unittest.TestCase):
         self.assertIn("Read-only preview", out.getvalue())
         self.assertFalse(self.state.exists())
 
+    def test_ignored_placeholder_file_is_allowed_but_unlisted_one_still_fails(self):
+        (self.source_skill / "references").mkdir()
+        (self.source_skill / "references" / "tpl.md").write_text("Hello {{FIRST_NAME}}\n", encoding="utf-8")
+        self.config["skills"]["demo-skill"]["ignore_placeholders"] = ["references/tpl.md"]
+        self.manifest.write_text(json.dumps(self.config), encoding="utf-8")
+        manifest = adapter.load_manifest(self.manifest)
+        digest, rendered = adapter.rendered_skill(
+            self.source_skill, ["SKILL.md"], manifest["targets"]["agents"], ["references/tpl.md"])
+        self.assertNotIn("references/tpl.md", rendered)
+        with self.assertRaises(SafetyError):
+            adapter.rendered_skill(self.source_skill, ["SKILL.md"], manifest["targets"]["agents"])
+
+    def test_ignore_list_cannot_overlap_template_files(self):
+        self.config["skills"]["demo-skill"]["ignore_placeholders"] = ["SKILL.md"]
+        self.manifest.write_text(json.dumps(self.config), encoding="utf-8")
+        with self.assertRaises(SafetyError):
+            adapter.load_manifest(self.manifest)
+
+    def test_diff_with_non_ascii_survives_cp1252_console(self):
+        import os
+        import subprocess
+        dest = self.agents / "demo-skill"
+        dest.mkdir(parents=True)
+        (dest / "SKILL.md").write_text("# Demo\nTiếng Việt \u1eef\n", encoding="utf-8")
+        env = {**os.environ, "PYTHONIOENCODING": "cp1252"}
+        result = subprocess.run(
+            [sys.executable, str(Path(adapter.__file__)), "--manifest", str(self.manifest),
+             "--source", str(self.source), "--state-dir", str(self.state),
+             "--target", f"agents={self.agents}", "--skill", "demo-skill", "--diff"],
+            capture_output=True, env=env)
+        self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8", "replace"))
+        self.assertNotIn(b"Traceback", result.stderr)
+
     def test_diff_requires_one_skill_and_target(self):
         err = io.StringIO()
         with contextlib.redirect_stderr(err):

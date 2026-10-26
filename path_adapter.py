@@ -77,7 +77,7 @@ def load_manifest(path: Path) -> dict:
     for skill, config in data["skills"].items():
         if not SKILL_NAME.fullmatch(skill) or not isinstance(config, dict):
             raise SafetyError(f"Invalid skill mapping: {skill!r}")
-        _check_keys(config, {"files"}, f"skill {skill}")
+        _check_keys(config, {"files", "ignore_placeholders"}, f"skill {skill}")
         files = config.get("files")
         if (not isinstance(files, list) or not files or
                 any(not isinstance(f, str) for f in files)):
@@ -86,6 +86,13 @@ def load_manifest(path: Path) -> dict:
             _check_relpath(item)
         if len(set(files)) != len(files):
             raise SafetyError(f"Repeated template file for skill: {skill}")
+        ignored = config.get("ignore_placeholders", [])
+        if not isinstance(ignored, list) or any(not isinstance(f, str) for f in ignored):
+            raise SafetyError(f"Skill {skill}: ignore_placeholders must be a list of files")
+        for item in ignored:
+            _check_relpath(item)
+        if len(set(ignored)) != len(ignored) or set(ignored) & set(files):
+            raise SafetyError(f"Skill {skill}: ignore_placeholders must be unique and not also templates")
     return data
 
 
@@ -101,7 +108,8 @@ def _render(data: bytes, variables: dict[str, str], *, name: str, relative: str)
     return PLACEHOLDER.sub(replace, data)
 
 
-def rendered_skill(skill_dir: Path, template_files: list[str], variables: dict[str, str]) -> tuple[str, dict[str, bytes]]:
+def rendered_skill(skill_dir: Path, template_files: list[str], variables: dict[str, str],
+                   ignore_files: list[str] | None = None) -> tuple[str, dict[str, bytes]]:
     """Hash a virtual rendered tree using the manager's deterministic digest layout."""
     entries = dict(skill_files(skill_dir))
     missing = set(template_files) - entries.keys()
@@ -121,7 +129,7 @@ def rendered_skill(skill_dir: Path, template_files: list[str], variables: dict[s
                 raise SafetyError(f"Template file is not UTF-8: {skill_dir.name}/{relative}") from exc
             body = _render(body, variables, name=skill_dir.name, relative=relative)
             rendered[relative] = body
-        elif PLACEHOLDER.search(body):
+        elif relative not in (ignore_files or ()) and PLACEHOLDER.search(body):
             raise SafetyError(f"Undeclared template placeholder: {skill_dir.name}/{relative}")
         digest.update(relative.encode("utf-8") + b"\0" + body + b"\0")
     return digest.hexdigest(), rendered
@@ -143,7 +151,8 @@ def adapter_plan(source: Path, state_dir: Path, targets: dict[str, Path], manife
         if skill_dir.is_symlink() or not skill_dir.is_dir():
             raise SafetyError(f"Missing canonical skill: {skill_dir}")
         for agent, root in targets.items():
-            digest, rendered = rendered_skill(skill_dir, config["files"], manifest["targets"][agent])
+            digest, rendered = rendered_skill(skill_dir, config["files"], manifest["targets"][agent],
+                                        config.get("ignore_placeholders"))
             dest = root / name
             if dest.is_symlink() or (dest.exists() and not dest.is_dir()):
                 status = "unsafe"
@@ -190,7 +199,17 @@ def show_diff(entry: dict) -> None:
             print(f"{relative}: matches rendered content")
 
 
+def _utf8_streams() -> None:
+    """Windows consoles often use cp1252; diffs may contain any Unicode text."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
+
+
 def cli(argv: list[str] | None = None) -> int:
+    _utf8_streams()
     parser = argparse.ArgumentParser(description="Read-only per-agent path adapter preview")
     parser.add_argument("--manifest", type=Path, required=True, help="Explicit opt-in JSON template manifest")
     parser.add_argument("--source", type=Path, default=DEFAULT_SOURCE)
