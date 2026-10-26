@@ -32,6 +32,8 @@ DEFAULT_TARGETS = {
 }
 EXCLUDED_DIRS = {"node_modules", ".git", "__pycache__", ".local"}
 EXCLUDED_FILES = {".ds_store", "thumbs.db"}
+# Regenerable local artifacts: ignored when reading an installed copy, never copied or hashed.
+RUNTIME_DIRS = {"node_modules", "__pycache__"}
 SECRET_FILES = {"auth.json", ".env", ".claude.json"}
 ENV_TEMPLATES = {".env.example", ".env.sample", ".env.template"}
 SKILL_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
@@ -90,13 +92,15 @@ def skill_files(skill: Path, *, source: bool = True) -> list[tuple[str, Path]]:
             subdir = root_path / dirname
             if dirname in EXCLUDED_DIRS and source:
                 dirs.remove(dirname)
+            elif not source and dirname in RUNTIME_DIRS:
+                dirs.remove(dirname)
             elif subdir.is_symlink():
                 raise SafetyError(f"Symlink in skill source is not allowed: {subdir}")
             elif dirname in EXCLUDED_DIRS:
                 raise SafetyError(f"Extra directory in managed copy: {subdir}")
         for name in names:
             path = root_path / name
-            if source and (name.lower() in EXCLUDED_FILES or name.endswith(".pyc")):
+            if (source and name.lower() in EXCLUDED_FILES) or name.endswith(".pyc"):
                 continue
             if (name.lower() in SECRET_FILES or (name.lower().startswith(".env.") and name.lower() not in ENV_TEMPLATES)
                     or path.suffix.lower() in {".pem", ".key", ".token"}):
@@ -115,6 +119,8 @@ def skill_directories(skill: Path, *, source: bool = True) -> list[str]:
         for name in list(dirs):
             path = root_path / name
             if name in EXCLUDED_DIRS and source:
+                dirs.remove(name)
+            elif not source and name in RUNTIME_DIRS:
                 dirs.remove(name)
             elif path.is_symlink() or name in EXCLUDED_DIRS:
                 raise SafetyError(f"Unexpected directory or symlink: {path}")
@@ -137,6 +143,11 @@ def tree_digest(skill: Path, *, source: bool = True) -> str:
                 digest.update(chunk)
         digest.update(b"\0")
     return digest.hexdigest()
+
+
+def has_vendor(skill: Path) -> bool:
+    """True if an installed copy holds node_modules, which update/rollback would delete."""
+    return any("node_modules" in dirs for _, dirs, _ in os.walk(skill, followlinks=False))
 
 
 def sources_at(source: Path) -> dict[str, tuple[Path, str]]:
@@ -302,6 +313,8 @@ def plan(source: Path, state_dir: Path, targets: dict[str, Path],
                             status = "unchanged"
                         else:
                             status = "update_adopted" if record.get("origin") == "adopted" else "update"
+                            if has_vendor(dest):
+                                status = "blocked_vendor"
             elif record:
                 status = "conflict_missing"
             else:
@@ -528,7 +541,7 @@ def _rollback_locked(state_dir: Path, transaction: str) -> int:
     # Validate the whole transaction first; never delete a user-edited skill.
     for a in actions:
         dest = Path(a["destination"])
-        if (dest.is_symlink() or not dest.is_dir()
+        if (dest.is_symlink() or not dest.is_dir() or has_vendor(dest)
                 or tree_digest(dest, source=False) != a["source_hash"]
                 or state["managed"].get(str(dest), {}).get("hash") != a["source_hash"]
                 or state["managed"].get(str(dest), {}).get("source") != a["source"]

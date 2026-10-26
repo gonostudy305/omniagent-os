@@ -125,16 +125,44 @@ class ManagerTests(unittest.TestCase):
         self.assertTrue((self.target / "writing" / "SKILL.md").is_file())
         self.assertTrue((gemini / "writing" / "SKILL.md").is_file())
 
-    def test_adopt_refuses_target_with_unmanaged_vendor_files(self):
-        make_skill(self.source, "writing", "same")
+    def test_adopt_ignores_runtime_artifacts_and_keeps_them(self):
+        source_skill = make_skill(self.source, "writing", "same")
         target_skill = make_skill(self.target, "writing", "same")
+        for skill in (source_skill, target_skill):
+            (skill / "scripts").mkdir()
+            (skill / "scripts" / "run.py").write_text("print('hi')", encoding="utf-8")
         vendor = target_skill / "node_modules" / "lib"
         vendor.mkdir(parents=True)
         (vendor / "dep.js").write_text("user-managed dependency")
+        cache = target_skill / "scripts" / "__pycache__"
+        cache.mkdir(parents=True)
+        (cache / "x.cpython-313.pyc").write_bytes(b"cache")
+        self.assertIn("eligible", self.run_cli("adopt", *self.common()).stdout)
         result = self.run_cli("adopt", *self.common(), "--yes")
-        self.assertIn("unsafe", result.stdout)
+        self.assertIn("Adoption transaction", result.stdout)
         self.assertTrue((vendor / "dep.js").exists())
+        self.assertTrue((cache / "x.cpython-313.pyc").exists())
+        self.assertIn("already_managed", self.run_cli("adopt", *self.common()).stdout)
+
+    def test_non_runtime_extra_directory_still_makes_adopt_unsafe(self):
+        make_skill(self.source, "writing", "same")
+        target_skill = make_skill(self.target, "writing", "same")
+        (target_skill / ".git").mkdir()
+        self.assertIn("unsafe", self.run_cli("adopt", *self.common(), "--yes").stdout)
         self.assertFalse((self.state / "state.json").exists())
+
+    def test_update_of_adopted_skill_with_node_modules_is_blocked(self):
+        skill = make_skill(self.source, "writing", "v1")
+        target_skill = make_skill(self.target, "writing", "v1")
+        (target_skill / "node_modules").mkdir()
+        (target_skill / "node_modules" / "dep.js").write_text("keep")
+        self.run_cli("adopt", *self.common(), "--yes")
+        (skill / "SKILL.md").write_text("---\nname: writing\n---\nv2\n", encoding="utf-8")
+        self.assertIn("blocked_vendor", self.run_cli("plan", *self.common()).stdout)
+        self.run_cli("apply", *self.common(), "--yes", "--allow-update-adopted", expected=2)
+        self.run_cli("apply", *self.common(), "--yes", "--allow-update-adopted", "--skip-blocked")
+        self.assertTrue((target_skill / "node_modules" / "dep.js").exists())
+        self.assertIn("v1", (target_skill / "SKILL.md").read_text(encoding="utf-8"))
 
     def test_adopted_skill_cannot_be_updated_without_extra_consent(self):
         skill = make_skill(self.source, "writing", "v1")
