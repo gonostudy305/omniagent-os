@@ -78,11 +78,13 @@ flowchart TD
 ### 1. Audit your local environment
 Run the non-destructive audit script to inspect your current skills across Claude, Gemini, and Codex:
 ```powershell
-python audit_skills.py
+python audit_skills.py --output .local/reports
+python generate_report.py --input .local/reports/audit.json
 ```
+Add `--store NAME=PATH` (repeatable) to audit custom skill directories. Run the tests with `python tests/test_audit.py`.
 
 ### 2. Inspect Audit Results
-The script generates `skills_audit_data.json` and `SKILLS_AUDIT_REPORT.md` (kept local by `.gitignore`) to report duplicate counts, hardcoded path drifts, and unique skills per agent.
+The scripts write `audit.json`, `audit_report.md` and `narrative_report.md` to `.local/reports/` (git-ignored, since they contain machine-specific paths and skill names). `SKILLS_AUDIT_REPORT.md` in this repo is a static, anonymized example.
 
 ---
 

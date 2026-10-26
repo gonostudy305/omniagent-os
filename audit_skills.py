@@ -2,6 +2,7 @@ import os
 import sys
 import hashlib
 import json
+import argparse
 import re
 from pathlib import Path
 from datetime import datetime
@@ -20,8 +21,6 @@ STORES = {
     'agents': Path.home() / '.agents' / 'skills',
     'codex_sys': Path.home() / '.codex' / 'skills' / '.system'
 }
-
-WORKSPACE = Path(r'D:\Downloads D\Study\WORK\Agent OS Gono')
 
 def hash_file(p: Path) -> str:
     h = hashlib.sha256()
@@ -100,7 +99,8 @@ def scan_skill_dir(skill_dir: Path):
         'meta': meta
     }
 
-def main():
+def main(out_dir: Path):
+    out_dir.mkdir(parents=True, exist_ok=True)
     print("Bắt đầu quét 4 kho skills...", flush=True)
     audit_data = {}
     store_summaries = {}
@@ -179,7 +179,7 @@ def main():
         }
 
     # Output JSON
-    output_json_path = WORKSPACE / 'skills_audit_data.json'
+    output_json_path = out_dir / 'audit.json'
     with open(output_json_path, 'w', encoding='utf-8') as f:
         json.dump({
             'timestamp': datetime.now().isoformat(),
@@ -197,11 +197,10 @@ def main():
     print(f"Đã ghi JSON chi tiết vào {output_json_path}", flush=True)
 
     # Output Markdown Report
-    output_md_path = WORKSPACE / 'SKILLS_AUDIT_REPORT.md'
+    output_md_path = out_dir / 'audit_report.md'
     with open(output_md_path, 'w', encoding='utf-8') as f:
         f.write("# Báo cáo Audit & Ma trận So sánh 4 Kho Skills (Phase 2)\n\n")
         f.write(f"**Thời gian thực hiện:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
-        f.write(f"**Thư mục làm việc:** `{WORKSPACE}`\n\n")
 
         f.write("## 1. Tổng quan các kho Skills\n\n")
         f.write("| Kho lưu trữ | Đường dẫn | Số skills | Số source files | File vendor (node_modules) | Dung lượng source |\n")
@@ -264,4 +263,10 @@ def main():
     print(f"Đã ghi Báo cáo Markdown chi tiết vào {output_md_path}", flush=True)
 
 if __name__ == '__main__':
-    main()
+    ap = argparse.ArgumentParser(description='Audit skill stores of local AI agents (read-only).')
+    ap.add_argument('--output', type=Path, default=Path('.local/reports'), help='directory for audit.json and audit_report.md (keep it git-ignored)')
+    ap.add_argument('--store', action='append', metavar='NAME=PATH', help='override default stores (repeatable)')
+    args = ap.parse_args()
+    if args.store:
+        STORES = {n: Path(p) for n, p in (s.split('=', 1) for s in args.store)}
+    main(args.output)

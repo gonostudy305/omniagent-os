@@ -1,5 +1,6 @@
 import sys
 import json
+import argparse
 from pathlib import Path
 
 # Đảm bảo UTF-8
@@ -9,8 +10,10 @@ if sys.stdout.encoding != 'utf-8':
     except Exception:
         pass
 
-WORKSPACE = Path(r'D:\Downloads D\Study\WORK\Agent OS Gono')
-data_file = WORKSPACE / 'skills_audit_data.json'
+ap = argparse.ArgumentParser(description='Render a narrative report from audit.json.')
+ap.add_argument('--input', type=Path, default=Path('.local/reports/audit.json'))
+args = ap.parse_args()
+data_file = args.input
 
 with open(data_file, 'r', encoding='utf-8') as f:
     data = json.load(f)
@@ -48,13 +51,11 @@ for item in data['content_drift']:
         else:
             version_diffs.append(name)
 
-report_path = WORKSPACE / 'SKILLS_AUDIT_REPORT.md'
+report_path = data_file.with_name('narrative_report.md')
 with open(report_path, 'w', encoding='utf-8') as f:
     f.write('''# BÁO CÁO AUDIT & ĐỐI CHIẾU 4 KHO SKILLS (PHASE 2)
 
 **Ngày báo cáo:** 26/10/2026  
-**Thư mục làm việc:** `d:\\Downloads D\\Study\\WORK\\Agent OS Gono`  
-**Dữ liệu thô JSON:** [skills_audit_data.json](file:///D:/Downloads%20D/Study/WORK/Agent%20OS%20Gono/skills_audit_data.json)
 
 ---
 
@@ -155,4 +156,4 @@ flowchart TD
 4. **Chuẩn hóa đường dẫn:** Thay thế các đường dẫn hardcode `.claude/skills/` bằng định dạng tương đối hoặc template để tương thích 100% với cả 3 agent.
 ''')
 
-print("Đã tạo thành công SKILLS_AUDIT_REPORT.md!")
+print(f"Đã tạo {report_path}")

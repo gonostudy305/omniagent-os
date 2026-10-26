@@ -62,3 +62,4 @@ desktop.ini
 # Third-party / internal skills: not published until sources and licenses are reviewed
 ssot/skills/
 skills_audit_data.json
+.local/
