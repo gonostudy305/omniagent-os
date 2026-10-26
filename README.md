@@ -155,6 +155,11 @@ example, once your private manifest and fixture are ready:
 python path_adapter.py --manifest .local/adapters.json `
   --source .local/adapter-fixtures/skills `
   --target "agents=$HOME\.agents\skills" --skill demo-skill --diff
+
+# Compare source_hash, render_hash and installed_hash without changing state:
+python omniagent.py plan --adapter-manifest .local/adapters.json `
+  --source .local/adapter-fixtures/skills `
+  --target "agents=$HOME\.agents\skills" --skill demo-skill --json
 ```
 
 This command does **not** write to agent stores or manager state. Do not run

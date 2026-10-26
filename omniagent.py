@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import difflib
 import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -593,6 +594,11 @@ def cli(argv: list[str] | None = None) -> int:
         part.add_argument("--state-dir", type=Path, default=DEFAULT_STATE)
         part.add_argument("--target", action="append", metavar="NAME=PATH")
         part.add_argument("--skill", action="append", help="only manage named skill (repeatable)")
+        if command == "plan":
+            part.add_argument("--adapter-manifest", type=Path,
+                              help="read-only preview of per-agent rendered hashes (v0.3a)")
+            part.add_argument("--json", action="store_true",
+                              help="print all hash fields as JSON in the local terminal")
         if command == "apply":
             part.add_argument("--yes", action="store_true", help="explicitly approve filesystem writes")
             part.add_argument("--skip-blocked", action="store_true")
@@ -638,15 +644,38 @@ def cli(argv: list[str] | None = None) -> int:
                     show_adoption_diff(a)
             print(f"Eligible exact matches: {sum(a['status'] == 'eligible' for a in actions)}")
             return 0
-        actions = plan(source, state_dir, targets, selected)
+        if args.command == "plan" and args.adapter_manifest:
+            # When this file is launched as __main__, share its module with the
+            # adapter so both sides use the same SafetyError and manager logic.
+            sys.modules.setdefault("omniagent", sys.modules[__name__])
+            adapter_file = REPO_ROOT / "path_adapter.py"
+            if not adapter_file.is_file():
+                raise SafetyError("Path Adapter module not installed next to omniagent.py")
+            spec = importlib.util.spec_from_file_location("_omniagent_adapter", adapter_file)
+            if spec is None or spec.loader is None:
+                raise SafetyError("Unable to load Path Adapter module")
+            adapter_module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(adapter_module)
+            adapter_manifest = adapter_module.load_manifest(args.adapter_manifest.expanduser().absolute())
+            actions = adapter_module.render_aware_plan(source, state_dir, targets,
+                                                       adapter_manifest, selected)
+        else:
+            actions = plan(source, state_dir, targets, selected)
         if args.command == "apply":
             if not args.yes:
                 raise SafetyError("Apply modifies skill folders; inspect plan first, then use --yes")
             transaction, actions = apply(source, state_dir, targets, selected,
                                          args.skip_blocked, args.allow_update_adopted)
             print(f"Transaction: {transaction or '(nothing changed)'}")
-        for a in actions:
-            print(f"{a['target']:10} {a['status']:18} {a['name']}")
+        if args.command == "plan" and args.json:
+            print(json.dumps(actions, indent=2, ensure_ascii=True))
+        else:
+            for a in actions:
+                print(f"{a['target']:10} {a['status']:18} {a['name']}")
+                if args.command == "plan" and args.adapter_manifest:
+                    installed = a["installed_hash"] or "(missing/unsafe)"
+                    print(f"  source={a['source_hash'][:12]} render={a['render_hash'][:12]} "
+                          f"installed={installed[:12]}")
         return 0
     except (SafetyError, OSError, ValueError, json.JSONDecodeError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)

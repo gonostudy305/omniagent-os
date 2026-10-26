@@ -3,6 +3,7 @@
 import contextlib
 import io
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -10,7 +11,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import path_adapter as adapter
-from omniagent import SafetyError, tree_digest
+from omniagent import SafetyError, plan, tree_digest
 
 
 class PathAdapterTests(unittest.TestCase):
@@ -52,6 +53,15 @@ class PathAdapterTests(unittest.TestCase):
         (skill / "scripts" / "run.py").write_text("print('ok')\n", encoding="utf-8")
         return skill
 
+    def record_managed(self, root: Path, digest: str, *, adopted: bool = False):
+        record = {"source": str(self.source_skill.resolve()), "hash": digest}
+        if adopted:
+            record["origin"] = "adopted"
+        self.state.mkdir(parents=True, exist_ok=True)
+        (self.state / "state.json").write_text(json.dumps({
+            "version": 1, "managed": {str(root / "demo-skill"): record}
+        }), encoding="utf-8")
+
     def test_manifest_and_target_specific_hash(self):
         config = adapter.load_manifest(self.manifest)
         agents_digest, rendered = adapter.rendered_skill(
@@ -71,6 +81,104 @@ class PathAdapterTests(unittest.TestCase):
         )
         target = self.copy_rendered(self.agents, ".agents/skills")
         self.assertEqual(tree_digest(target, source=False), expected)
+
+    def test_render_plan_distinguishes_three_hashes_without_false_update(self):
+        target = self.copy_rendered(self.agents, ".agents/skills")
+        installed_hash = tree_digest(target, source=False)
+        raw_hash = tree_digest(self.source_skill)
+        self.assertNotEqual(raw_hash, installed_hash)
+        self.record_managed(self.agents, installed_hash)
+        before = (target / "SKILL.md").read_bytes()
+        state_before = (self.state / "state.json").read_bytes()
+
+        self.assertEqual(plan(self.source, self.state, {"agents": self.agents})[0]["status"], "update")
+        result = adapter.render_aware_plan(self.source, self.state, {"agents": self.agents}, self.config)[0]
+        self.assertEqual(result["status"], "unchanged")
+        self.assertEqual(result["source_hash"], raw_hash)
+        self.assertEqual(result["render_hash"], installed_hash)
+        self.assertEqual(result["installed_hash"], installed_hash)
+        self.assertTrue(result["render_matches_installed"])
+        self.assertEqual((target / "SKILL.md").read_bytes(), before)
+        self.assertEqual((self.state / "state.json").read_bytes(), state_before)
+
+    def test_render_plan_hash_differs_per_agent_but_source_hash_is_shared(self):
+        agents_target = self.copy_rendered(self.agents, ".agents/skills")
+        claude_target = self.copy_rendered(self.claude, ".claude/skills")
+        results = adapter.render_aware_plan(
+            self.source, self.state, {"agents": self.agents, "claude": self.claude}, self.config)
+        by_agent = {item["target"]: item for item in results}
+        self.assertEqual(by_agent["agents"]["source_hash"], by_agent["claude"]["source_hash"])
+        self.assertNotEqual(by_agent["agents"]["render_hash"], by_agent["claude"]["render_hash"])
+        self.assertEqual(by_agent["agents"]["render_hash"], tree_digest(agents_target, source=False))
+        self.assertEqual(by_agent["claude"]["render_hash"], tree_digest(claude_target, source=False))
+        self.assertTrue(all(item["status"] == "blocked_unmanaged" for item in results))
+
+    def test_render_plan_keeps_unmanaged_collision_blocked_even_if_render_matches(self):
+        self.copy_rendered(self.agents, ".agents/skills")
+        result = adapter.render_aware_plan(self.source, self.state, {"agents": self.agents}, self.config)[0]
+        self.assertEqual(result["status"], "blocked_unmanaged")
+        self.assertTrue(result["render_matches_installed"])
+        self.assertIsNone(result["recorded_hash"])
+        self.assertFalse(self.state.exists())
+
+    def test_render_plan_keeps_manual_edit_conflict_even_if_render_matches(self):
+        target = self.copy_rendered(self.agents, ".agents/skills")
+        self.record_managed(self.agents, "0" * 64)
+        result = adapter.render_aware_plan(self.source, self.state, {"agents": self.agents}, self.config)[0]
+        self.assertEqual(result["status"], "conflict")
+        self.assertTrue(result["render_matches_installed"])
+        self.assertNotEqual(result["recorded_hash"], result["installed_hash"])
+
+    def test_render_plan_recommends_update_but_does_not_write(self):
+        target = self.copy_rendered(self.agents, ".claude/skills")
+        self.record_managed(self.agents, tree_digest(target, source=False), adopted=True)
+        before = (target / "SKILL.md").read_bytes()
+        result = adapter.render_aware_plan(self.source, self.state, {"agents": self.agents}, self.config)[0]
+        self.assertEqual(result["status"], "update_adopted")
+        self.assertFalse(result["render_matches_installed"])
+        self.assertEqual((target / "SKILL.md").read_bytes(), before)
+
+    def test_render_plan_retains_vendor_guard(self):
+        target = self.copy_rendered(self.agents, ".claude/skills")
+        self.record_managed(self.agents, tree_digest(target, source=False))
+        (target / "node_modules").mkdir()
+        (target / "node_modules" / "index.js").write_text("vendor")
+        result = adapter.render_aware_plan(self.source, self.state, {"agents": self.agents}, self.config)[0]
+        self.assertEqual(result["status"], "blocked_vendor")
+        self.assertTrue((target / "node_modules" / "index.js").exists())
+
+    def test_render_plan_non_templated_skill_keeps_raw_hash(self):
+        plain = self.source / "plain"
+        plain.mkdir()
+        (plain / "SKILL.md").write_text("# No variables\n")
+        results = adapter.render_aware_plan(self.source, self.state, {"agents": self.agents}, self.config)
+        by_name = {item["name"]: item for item in results}
+        self.assertEqual(by_name["plain"]["source_hash"], by_name["plain"]["render_hash"])
+        self.assertIsNone(by_name["plain"]["installed_hash"])
+        self.assertEqual(by_name["plain"]["status"], "install")
+
+    def test_manager_cli_render_plan_json_is_read_only(self):
+        target = self.copy_rendered(self.agents, ".agents/skills")
+        self.record_managed(self.agents, tree_digest(target, source=False))
+        cmd = [sys.executable, "-I", str(Path(adapter.__file__).parent / "omniagent.py"),
+               "plan", "--adapter-manifest", str(self.manifest), "--source", str(self.source),
+               "--state-dir", str(self.state), "--target", f"agents={self.agents}", "--json"]
+        state_before = (self.state / "state.json").read_bytes()
+        cp = subprocess.run(cmd, text=True, capture_output=True, encoding="utf-8")
+        self.assertEqual(cp.returncode, 0, cp.stderr)
+        result = json.loads(cp.stdout)[0]
+        self.assertEqual(result["status"], "unchanged")
+        self.assertEqual(result["installed_hash"], result["render_hash"])
+        self.assertEqual((self.state / "state.json").read_bytes(), state_before)
+
+    def test_apply_cannot_use_adapter_manifest(self):
+        cmd = [sys.executable, "-I", str(Path(adapter.__file__).parent / "omniagent.py"),
+               "apply", "--adapter-manifest", str(self.manifest), "--yes",
+               "--source", str(self.source), "--target", f"agents={self.agents}"]
+        cp = subprocess.run(cmd, text=True, capture_output=True, encoding="utf-8")
+        self.assertNotEqual(cp.returncode, 0)
+        self.assertIn("unrecognized arguments", cp.stderr)
+        self.assertFalse(self.agents.exists())
 
     def test_plan_is_read_only_and_classifies_targets(self):
         exact = self.copy_rendered(self.agents, ".agents/skills")

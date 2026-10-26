@@ -82,11 +82,37 @@ $agents = Join-Path $HOME '.agents\skills'
 # The target is *read*, never written.
 python path_adapter.py --manifest .local/adapters.json `
   --source $fixture --target "agents=$agents" --skill demo-skill --diff
+
+# Additional v0.3a preview: manager statuses against rendered hashes.
+# JSON is printed to your local terminal only (no private report file).
+python omniagent.py plan --adapter-manifest .local/adapters.json `
+  --source $fixture --target "agents=$agents" --skill demo-skill --json
 ```
 
 `--diff` is optional and requires exactly one `--skill` and one `--target`.
 It may display private target content **only in the local terminal**; do not
 paste it into a public issue. Omitting `--diff` prints status and a short hash.
+
+### Three distinct hashes in `omniagent.py plan`
+
+The optional `--adapter-manifest` is accepted by **`plan` only**. It adds:
+
+- `source_hash`: SHA-256 of the raw canonical SSOT tree (with placeholders).
+- `render_hash`: SHA-256 of the expected tree after per-agent rendering.
+- `installed_hash`: SHA-256 of the existing target tree; `null` if absent or
+  unsafe to read. The installed comparison ignores regenerable caches.
+
+`recorded_hash` is the existing v0.2 manager state value, if any, and
+`render_matches_installed` indicates byte-for-byte equality of the relevant
+tree hashes. **No manager state is migrated or written.** Existing `blocked`,
+`blocked_unmanaged`, and `conflict` statuses remain blocked even when rendered
+content happens to match the installed bytes. Only *managed and unmodified*
+entries can be reclassified from a false `update` to `unchanged`.
+
+The JSON includes machine-specific paths and potentially private skill names;
+do not upload it to GitHub. For ordinary v0.2 operations without this option,
+`omniagent.py plan`, `adopt`, `apply` and `rollback` behave exactly as before.
+In particular, **`apply --adapter-manifest` is intentionally unsupported**.
 
 ## Status meanings
 
@@ -110,9 +136,10 @@ update, so v0.2's `blocked_vendor` guard must remain in place.
    secrets. Do not publish private samples.
 2. Make portable copies of only the verified cases and confirm `match` with
    `path_adapter.py` against the existing agent installation.
-3. Integrate rendered hashes and file generation into `omniagent.py` with
-   transaction journals, backups, explicit opt-in, rollback and target
-   revalidation. Until then, **do not run `omniagent.py apply` against a
-   templated canonical SSOT**: it currently copies template source literally.
+3. Build adapter-aware `apply`/`adopt`/`rollback` with transaction journals,
+   backups, explicit opt-in and target revalidation. The manager's read-only
+   `plan --adapter-manifest` is available, but **do not run `omniagent.py apply`
+   against a templated canonical SSOT**: it still copies template source
+   literally.
 4. Test on disposable stores on both Windows and Linux; then smoke-test the
    behavior of Claude, Codex and Antigravity, one skill at a time.

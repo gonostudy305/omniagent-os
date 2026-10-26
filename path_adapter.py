@@ -20,9 +20,12 @@ from omniagent import (
     DEFAULT_STATE,
     SKILL_NAME,
     SafetyError,
+    has_vendor,
     parse_targets,
+    plan,
     skill_directories,
     skill_files,
+    state_at,
     tree_digest,
     validate_layout,
 )
@@ -167,6 +170,64 @@ def adapter_plan(source: Path, state_dir: Path, targets: dict[str, Path], manife
                             "rendered_hash": digest, "destination": str(dest),
                             "rendered_files": rendered})
     return results
+
+
+def render_aware_plan(source: Path, state_dir: Path, targets: dict[str, Path],
+                      manifest: dict, selected: set[str] | None = None) -> list[dict]:
+    """Preview v0.2 manager statuses against per-agent rendered hashes.
+
+    This is *only* a read-only plan. The v0.2 state schema, apply, adopt and
+    rollback continue to use unrendered sources and must not consume this plan.
+    """
+    # Reuse conservative unmanaged/conflict classification from v0.2.
+    actions = plan(source, state_dir, targets, selected)
+    for agent in targets:
+        if agent not in manifest["targets"]:
+            raise SafetyError(f"No adapter variables configured for target: {agent}")
+    for skill in manifest["skills"]:
+        if not (source / skill / "SKILL.md").is_file() or (source / skill).is_symlink():
+            raise SafetyError(f"Missing canonical templated skill: {source / skill}")
+
+    managed = state_at(state_dir)["managed"]
+    result = []
+    for item in actions:
+        name, agent = item["name"], item["target"]
+        source_hash = item["source_hash"]
+        if name in manifest["skills"]:
+            config = manifest["skills"][name]
+            render_hash, _ = rendered_skill(
+                Path(item["source"]), config["files"], manifest["targets"][agent],
+                config.get("ignore_placeholders"),
+            )
+        else:
+            render_hash = source_hash
+
+        dest = Path(item["destination"])
+        installed_hash = None
+        if dest.is_dir() and not dest.is_symlink():
+            try:
+                installed_hash = tree_digest(dest, source=False)
+            except (SafetyError, OSError):
+                pass
+        record = managed.get(item["destination"])
+        status = item["status"]
+        # Only reinterpret entries already proven managed and unchanged by
+        # the v0.2 manager. Never relax blocked/unmanaged/conflict statuses.
+        if (record and status in {"unchanged", "update", "update_adopted", "blocked_vendor"}
+                and installed_hash is not None and installed_hash == record.get("hash")):
+            if installed_hash == render_hash:
+                status = "unchanged"
+            else:
+                status = "update_adopted" if record.get("origin") == "adopted" else "update"
+                if has_vendor(dest):
+                    status = "blocked_vendor"
+        result.append({**item, "status": status,
+                       "render_hash": render_hash,
+                       "installed_hash": installed_hash,
+                       "recorded_hash": record.get("hash") if record else None,
+                       "render_matches_installed": (installed_hash is not None
+                                                    and installed_hash == render_hash)})
+    return result
 
 
 def show_diff(entry: dict) -> None:
