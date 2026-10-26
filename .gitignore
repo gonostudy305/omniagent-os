@@ -1,0 +1,64 @@
+# Local Agent SSOT Skills Store (DO NOT COMMIT PROPRIETARY OR 3RD PARTY SKILLS)
+ssot/skills/
+ssot/build_manifest.json
+skills_audit_data.json
+PHASE3_SSOT_REPORT.md
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environments
+venv/
+.venv/
+ENV/
+
+# Node / JS Vendor
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Secrets & Local credentials
+.env
+.env.*
+*.secret
+*.pem
+*.key
+*.token
+auth.json
+.claude.json
+google_client_secret*.json
+
+# OS Specific
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs & Temporary files
+*.log
+*.tmp
+.trash/
+
+# Third-party / internal skills: not published until sources and licenses are reviewed
+ssot/skills/
+skills_audit_data.json
