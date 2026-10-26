@@ -7,6 +7,7 @@ Managed copies are tracked under .local/manager, never in the public repository.
 from __future__ import annotations
 
 import argparse
+import difflib
 import hashlib
 import json
 import os
@@ -172,21 +173,94 @@ def save_json(path: Path, data: dict) -> None:
     os.replace(temp_path, path)
 
 
+def process_alive(pid: int) -> bool | None:
+    """True/False if the OS can tell; None means unknown (never auto-unlock)."""
+    if pid <= 0:
+        return None
+    if pid == os.getpid():
+        return True
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+        kernel.OpenProcess.restype = wintypes.HANDLE
+        kernel.WaitForSingleObject.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+        kernel.WaitForSingleObject.restype = wintypes.DWORD
+        kernel.CloseHandle.argtypes = (wintypes.HANDLE,)
+        handle = kernel.OpenProcess(0x00100000, False, pid)  # SYNCHRONIZE, not terminate access
+        if not handle:
+            return False if ctypes.get_last_error() == 87 else None  # ERROR_INVALID_PARAMETER
+        try:
+            result = kernel.WaitForSingleObject(handle, 0)
+            return False if result == 0 else True if result == 0x102 else None
+        finally:
+            kernel.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return None
+    return True
+
+
+@contextmanager
+def recovery_mutex(state_dir: Path):
+    """OS-released lock serializes stale-lock recovery across new CLI processes."""
+    with (state_dir / "manager.mutex").open("a+b") as handle:
+        handle.seek(0)
+        if os.name == "nt":
+            import msvcrt
+            try:
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            except OSError as exc:
+                raise SafetyError("Another Skill Manager process holds the OS mutex") from exc
+            try:
+                yield
+            finally:
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as exc:
+                raise SafetyError("Another Skill Manager process holds the OS mutex") from exc
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
 @contextmanager
 def manager_lock(state_dir: Path):
-    """Avoid concurrent writers sharing the same private manager state."""
+    """Lock writers; reclaim an orphaned PID lock only if definitely dead."""
     state_dir.mkdir(parents=True, exist_ok=True)
     lockfile = state_dir / "manager.lock"
-    try:
-        fd = os.open(lockfile, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-    except FileExistsError as exc:
-        raise SafetyError(f"Manager is locked: {lockfile}. Confirm no process is running before removing a stale lock.") from exc
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(str(os.getpid()))
-        yield
-    finally:
-        lockfile.unlink(missing_ok=True)
+    with recovery_mutex(state_dir):
+        if lockfile.exists():
+            raw_pid = lockfile.read_text(encoding="utf-8", errors="replace").strip()
+            alive = process_alive(int(raw_pid)) if raw_pid.isdecimal() else None
+            if alive is not False:
+                raise SafetyError(f"Manager lock may still be active: {lockfile}. "
+                                  "Verify the other process has exited before manual recovery.")
+            # OS mutex prevents two new managers from reclaiming the same stale file.
+            # Older managers still use O_EXCL, so they cannot race past our new lock.
+            lockfile.unlink()
+        try:
+            fd = os.open(lockfile, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError as exc:
+            raise SafetyError(f"Manager lock acquired by another process: {lockfile}") from exc
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(str(os.getpid()))
+            yield
+        finally:
+            lockfile.unlink(missing_ok=True)
 
 
 def state_at(state_dir: Path) -> dict:
@@ -227,7 +301,7 @@ def plan(source: Path, state_dir: Path, targets: dict[str, Path],
                         elif current == source_hash:
                             status = "unchanged"
                         else:
-                            status = "update"
+                            status = "update_adopted" if record.get("origin") == "adopted" else "update"
             elif record:
                 status = "conflict_missing"
             else:
@@ -236,6 +310,86 @@ def plan(source: Path, state_dir: Path, targets: dict[str, Path],
                             "source": str(skill_dir.resolve()), "source_hash": source_hash,
                             "destination": str(dest)})
     return actions
+
+
+def adoption_plan(source: Path, state_dir: Path, targets: dict[str, Path],
+                  selected: set[str] | None = None) -> list[dict]:
+    """Inspect existing unmanaged folders, without modifying any skill or state."""
+    result = []
+    for item in plan(source, state_dir, targets, selected):
+        status = item["status"]
+        if status == "blocked_unmanaged":
+            try:
+                digest = tree_digest(Path(item["destination"]), source=False)
+            except (SafetyError, OSError):
+                status = "unsafe"
+            else:
+                status = "eligible" if digest == item["source_hash"] else "mismatch"
+        elif status in {"update", "update_adopted", "unchanged"}:
+            status = "already_managed"
+        result.append({**item, "status": status})
+    return result
+
+
+def show_adoption_diff(item: dict) -> None:
+    """Display only an explicitly requested local SKILL.md diff; never persist it."""
+    if item["status"] != "mismatch":
+        return
+    source = Path(item["source"]) / "SKILL.md"
+    target = Path(item["destination"]) / "SKILL.md"
+    if (not source.is_file() or source.is_symlink() or not target.is_file()
+            or target.is_symlink() or source.stat().st_size > 1_000_000
+            or target.stat().st_size > 1_000_000):
+        print("SKILL.md missing, linked, or too large; inspect manually")
+        return
+    before = source.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)
+    after = target.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)
+    lines = list(difflib.unified_diff(before, after, fromfile="SSOT/SKILL.md",
+                                      tofile="target/SKILL.md", n=3))
+    if lines:
+        print("CAUTION: diff may include private local content; terminal display only.")
+        for line in lines[:150]:
+            print(line, end="" if line.endswith("\n") else "\n")
+        if len(lines) > 150:
+            print(f"... {len(lines) - 150} more diff lines omitted")
+    else:
+        print("SKILL.md matches; the difference is in assets, files, or directories")
+
+
+def adopt(source: Path, state_dir: Path, targets: dict[str, Path],
+          selected: set[str] | None) -> tuple[str | None, list[dict]]:
+    """Record exactly matching existing skills as adopted; never touch target files."""
+    with manager_lock(state_dir):
+        actions = adoption_plan(source, state_dir, targets, selected)
+        eligible = [a for a in actions if a["status"] == "eligible"]
+        if not eligible:
+            return None, actions
+        # A second verification under the exclusive manager lock guards against
+        # target edits made while discovering candidates.
+        for item in eligible:
+            dest = Path(item["destination"])
+            if dest.is_symlink() or not dest.is_dir() or tree_digest(dest, source=False) != item["source_hash"]:
+                raise SafetyError(f"Skill changed during adoption; no state written: {dest}")
+        state = state_at(state_dir)
+        if any(item["destination"] in state["managed"] for item in eligible):
+            raise SafetyError("Skill became managed during adoption; no state written")
+        transaction = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:12]
+        journal_path = state_dir / "transactions" / f"{transaction}.json"
+        journal = {"version": 1, "kind": "adopt", "status": "applied",
+                   "transaction": transaction, "actions": eligible}
+        save_json(journal_path, journal)
+        try:
+            for item in eligible:
+                state["managed"][item["destination"]] = {
+                    "source": item["source"], "hash": item["source_hash"],
+                    "origin": "adopted", "adopted_transaction": transaction,
+                }
+            save_json(state_dir / "state.json", state)
+        except Exception:
+            journal["status"] = "failed"
+            save_json(journal_path, journal)
+            raise
+        return transaction, actions
 
 
 def copy_skill(source: Path, destination: Path, expected_hash: str) -> None:
@@ -257,19 +411,23 @@ def remove_managed(path: Path) -> None:
 
 
 def apply(source: Path, state_dir: Path, targets: dict[str, Path],
-          selected: set[str] | None, skip_blocked: bool) -> tuple[str | None, list[dict]]:
+          selected: set[str] | None, skip_blocked: bool,
+          allow_update_adopted: bool = False) -> tuple[str | None, list[dict]]:
     with manager_lock(state_dir):
-        return _apply_locked(source, state_dir, targets, selected, skip_blocked)
+        return _apply_locked(source, state_dir, targets, selected, skip_blocked, allow_update_adopted)
 
 
 def _apply_locked(source: Path, state_dir: Path, targets: dict[str, Path],
-                  selected: set[str] | None, skip_blocked: bool) -> tuple[str | None, list[dict]]:
+                  selected: set[str] | None, skip_blocked: bool,
+                  allow_update_adopted: bool) -> tuple[str | None, list[dict]]:
     actions = plan(source, state_dir, targets, selected)
-    blocked = [a for a in actions if a["status"].startswith(("blocked", "conflict"))]
+    blocked = [a for a in actions if a["status"].startswith(("blocked", "conflict"))
+               or (a["status"] == "update_adopted" and not allow_update_adopted)]
     if blocked and not skip_blocked:
         raise SafetyError(f"{len(blocked)} existing skills are unmanaged or changed; "
                           "nothing applied. Use --skip-blocked to install only safe entries.")
-    changed = [a for a in actions if a["status"] in {"install", "update"}]
+    changed = [a for a in actions if a["status"] in {"install", "update"}
+               or (a["status"] == "update_adopted" and allow_update_adopted)]
     if not changed:
         return None, actions
 
@@ -288,7 +446,7 @@ def _apply_locked(source: Path, state_dir: Path, targets: dict[str, Path],
             # Recheck immediately before mutating, including changes since plan.
             if action["status"] == "install" and (dest.exists() or dest.is_symlink()):
                 raise SafetyError(f"Destination appeared since planning: {dest}")
-            if action["status"] == "update":
+            if action["status"] in {"update", "update_adopted"}:
                 prior_hash = old_records[str(dest)]["hash"]
                 if not dest.is_dir() or dest.is_symlink() or tree_digest(dest, source=False) != prior_hash:
                     raise SafetyError(f"Managed skill changed since planning: {dest}")
@@ -296,7 +454,7 @@ def _apply_locked(source: Path, state_dir: Path, targets: dict[str, Path],
                 staging = Path(temp) / "skill"
                 copy_skill(source_path, staging, action["source_hash"])
                 backup = backup_dir / str(index)
-                if action["status"] == "update":
+                if action["status"] in {"update", "update_adopted"}:
                     shutil.copytree(dest, backup)
                     if tree_digest(backup, source=False) != old_records[str(dest)]["hash"]:
                         raise SafetyError(f"Backup verification failed: {dest}")
@@ -309,7 +467,7 @@ def _apply_locked(source: Path, state_dir: Path, targets: dict[str, Path],
                         raise
                 else:
                     staging.rename(dest)
-            completed.append({**action, "backup": str(backup) if action["status"] == "update" else None,
+            completed.append({**action, "backup": str(backup) if action["status"] in {"update", "update_adopted"} else None,
                               "previous": old_records[str(dest)]})
 
         # Save recovery journal before publishing the updated manifest.
@@ -317,8 +475,11 @@ def _apply_locked(source: Path, state_dir: Path, targets: dict[str, Path],
                    "actions": completed}
         save_json(state_dir / "transactions" / f"{transaction}.json", journal)
         for a in completed:
-            state["managed"][a["destination"]] = {"source": a["source"],
-                                                      "hash": a["source_hash"]}
+            new_record = {"source": a["source"], "hash": a["source_hash"]}
+            if a["previous"] and a["previous"].get("origin") == "adopted":
+                new_record["origin"] = "adopted"
+                new_record["adopted_transaction"] = a["previous"]["adopted_transaction"]
+            state["managed"][a["destination"]] = new_record
         save_json(state_dir / "state.json", state)
     except Exception:
         for a in reversed(completed):
@@ -350,12 +511,28 @@ def _rollback_locked(state_dir: Path, transaction: str) -> int:
         raise SafetyError("Transaction not found or already rolled back")
     state = state_at(state_dir)
     actions = journal["actions"]
+    if journal.get("kind") == "adopt":
+        for item in actions:
+            record = state["managed"].get(item["destination"], {})
+            if (record.get("origin") != "adopted"
+                    or record.get("adopted_transaction") != transaction
+                    or record.get("hash") != item["source_hash"]):
+                raise SafetyError(f"Cannot untrack a superseded adoption: {item['destination']}")
+        # Undoing adoption only removes manager bookkeeping, never a user's folder.
+        for item in actions:
+            state["managed"].pop(item["destination"], None)
+        save_json(state_dir / "state.json", state)
+        journal["status"] = "rolled_back"
+        save_json(journal_path, journal)
+        return len(actions)
     # Validate the whole transaction first; never delete a user-edited skill.
     for a in actions:
         dest = Path(a["destination"])
         if (dest.is_symlink() or not dest.is_dir()
                 or tree_digest(dest, source=False) != a["source_hash"]
-                or state["managed"].get(str(dest), {}).get("hash") != a["source_hash"]):
+                or state["managed"].get(str(dest), {}).get("hash") != a["source_hash"]
+                or state["managed"].get(str(dest), {}).get("source") != a["source"]
+                or (not a["previous"] and state["managed"].get(str(dest), {}).get("origin") == "adopted")):
             raise SafetyError(f"Cannot roll back; installed skill changed: {dest}")
         if a["backup"] and (not Path(a["backup"]).is_dir()
                             or tree_digest(Path(a["backup"]), source=False) != a["previous"]["hash"]):
@@ -380,6 +557,9 @@ def discover(source: Path, targets: dict[str, Path]) -> None:
     if source.is_dir() and not source.is_symlink():
         skills = sources_at(source)
         print(f"source     {len(skills):4} skills  {source}")
+        for folder in sorted(source.iterdir()):
+            if folder.is_dir() and not folder.is_symlink() and not (folder / "SKILL.md").is_file():
+                print(f"WARNING: source folder ignored (missing SKILL.md): {folder.name}")
     else:
         print(f"source        (not initialized)  {source}")
     for name, root in targets.items():
@@ -394,7 +574,7 @@ def discover(source: Path, targets: dict[str, Path]) -> None:
 def cli(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Safe local skill manager (copy-based, no symlinks)")
     sub = parser.add_subparsers(dest="command", required=True)
-    for command in ("discover", "plan", "apply"):
+    for command in ("discover", "plan", "apply", "adopt"):
         part = sub.add_parser(command)
         part.add_argument("--source", type=Path, default=DEFAULT_SOURCE)
         part.add_argument("--state-dir", type=Path, default=DEFAULT_STATE)
@@ -403,6 +583,11 @@ def cli(argv: list[str] | None = None) -> int:
         if command == "apply":
             part.add_argument("--yes", action="store_true", help="explicitly approve filesystem writes")
             part.add_argument("--skip-blocked", action="store_true")
+            part.add_argument("--allow-update-adopted", action="store_true",
+                              help="explicitly permit replacing a previously adopted exact-match skill")
+        if command == "adopt":
+            part.add_argument("--yes", action="store_true", help="record exact matches in private state")
+            part.add_argument("--diff", action="store_true", help="show local SKILL.md diff for one selected mismatch")
     undo = sub.add_parser("rollback")
     undo.add_argument("--state-dir", type=Path, default=DEFAULT_STATE)
     undo.add_argument("--transaction", required=True)
@@ -426,11 +611,26 @@ def cli(argv: list[str] | None = None) -> int:
         if args.command != "discover" and not targets:
             raise SafetyError("Specify at least one explicit --target NAME=PATH")
         selected = set(args.skill) if args.skill else None
+        if args.command == "adopt":
+            if args.diff and (not selected or len(selected) != 1 or len(targets) != 1):
+                raise SafetyError("For private diffs, select exactly one --skill and one --target")
+            if args.yes:
+                transaction, actions = adopt(source, state_dir, targets, selected)
+                print(f"Adoption transaction: {transaction or '(nothing changed)'}")
+            else:
+                actions = adoption_plan(source, state_dir, targets, selected)
+            for a in actions:
+                print(f"{a['target']:10} {a['status']:18} {a['name']}")
+                if args.diff:
+                    show_adoption_diff(a)
+            print(f"Eligible exact matches: {sum(a['status'] == 'eligible' for a in actions)}")
+            return 0
         actions = plan(source, state_dir, targets, selected)
         if args.command == "apply":
             if not args.yes:
                 raise SafetyError("Apply modifies skill folders; inspect plan first, then use --yes")
-            transaction, actions = apply(source, state_dir, targets, selected, args.skip_blocked)
+            transaction, actions = apply(source, state_dir, targets, selected,
+                                         args.skip_blocked, args.allow_update_adopted)
             print(f"Transaction: {transaction or '(nothing changed)'}")
         for a in actions:
             print(f"{a['target']:10} {a['status']:18} {a['name']}")

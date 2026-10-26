@@ -1,6 +1,7 @@
 """Safety and rollback tests using isolated fake agent stores (stdlib only)."""
 
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -57,6 +58,104 @@ class ManagerTests(unittest.TestCase):
         self.assertIn("not initialized", result.stdout)
         self.assertIn("not found", result.stdout)
         self.assertFalse(self.state.exists())
+
+    def test_discover_warns_about_directories_without_skill_md(self):
+        make_skill(self.source, "writing")
+        (self.source / "common").mkdir()
+        (self.source / "synced").mkdir()
+        result = self.run_cli("discover", "--source", self.source,
+                              "--target", f"claude={self.target}")
+        self.assertIn("WARNING", result.stdout)
+        self.assertIn("common", result.stdout)
+        self.assertIn("synced", result.stdout)
+        self.assertIn("1 skills", result.stdout)
+
+    def test_adopt_exact_match_without_touching_target_files(self):
+        make_skill(self.source, "writing", "same")
+        target_skill = make_skill(self.target, "writing", "same")
+        before = (target_skill / "SKILL.md").stat().st_mtime_ns
+        preview = self.run_cli("adopt", *self.common())
+        self.assertIn("eligible", preview.stdout)
+        self.assertFalse(self.state.exists())
+        result = self.run_cli("adopt", *self.common(), "--yes")
+        transaction = result.stdout.split("Adoption transaction: ", 1)[1].splitlines()[0]
+        self.assertEqual(before, (target_skill / "SKILL.md").stat().st_mtime_ns)
+        self.assertIn("unchanged", self.run_cli("plan", *self.common()).stdout)
+        tracked = json.loads((self.state / "state.json").read_text())["managed"]
+        self.assertEqual(tracked[str(target_skill)]["origin"], "adopted")
+        self.run_cli("rollback", "--state-dir", self.state, "--yes", "--transaction", transaction)
+        self.assertTrue((target_skill / "SKILL.md").is_file())
+        self.assertIn("blocked_unmanaged", self.run_cli("plan", *self.common()).stdout)
+
+    def test_adopt_mismatch_shows_diff_only_when_selected(self):
+        make_skill(self.source, "writing", "source")
+        target_skill = make_skill(self.target, "writing", "local version")
+        self.assertIn("mismatch", self.run_cli("adopt", *self.common()).stdout)
+        self.run_cli("adopt", *self.common(), "--diff", expected=2)
+        result = self.run_cli("adopt", *self.common(), "--skill", "writing", "--diff")
+        self.assertIn("-source", result.stdout)
+        self.assertIn("+local version", result.stdout)
+        self.run_cli("adopt", *self.common(), "--yes")
+        self.assertFalse((self.state / "state.json").exists())
+        self.assertIn("local version", (target_skill / "SKILL.md").read_text())
+
+    def test_undo_adoption_never_deletes_manually_edited_skill(self):
+        make_skill(self.source, "writing", "original")
+        target_skill = make_skill(self.target, "writing", "original")
+        result = self.run_cli("adopt", *self.common(), "--yes")
+        transaction = result.stdout.split("Adoption transaction: ", 1)[1].splitlines()[0]
+        (target_skill / "SKILL.md").write_text("personal edits", encoding="utf-8")
+        self.run_cli("rollback", "--state-dir", self.state, "--yes", "--transaction", transaction)
+        self.assertEqual((target_skill / "SKILL.md").read_text(), "personal edits")
+        self.assertEqual(json.loads((self.state / "state.json").read_text())["managed"], {})
+
+    def test_adopt_multiple_existing_agent_stores_in_one_transaction(self):
+        make_skill(self.source, "writing", "same")
+        make_skill(self.target, "writing", "same")
+        gemini = self.base / "gemini" / "skills"
+        make_skill(gemini, "writing", "same")
+        args = ("--source", self.source, "--state-dir", self.state,
+                "--target", f"claude={self.target}", "--target", f"gemini={gemini}")
+        result = self.run_cli("adopt", *args, "--yes")
+        self.assertEqual(result.stdout.count("eligible"), 2)
+        tracked = json.loads((self.state / "state.json").read_text())["managed"]
+        self.assertEqual(len(tracked), 2)
+        transaction = result.stdout.split("Adoption transaction: ", 1)[1].splitlines()[0]
+        self.run_cli("rollback", "--state-dir", self.state, "--yes", "--transaction", transaction)
+        self.assertTrue((self.target / "writing" / "SKILL.md").is_file())
+        self.assertTrue((gemini / "writing" / "SKILL.md").is_file())
+
+    def test_adopt_refuses_target_with_unmanaged_vendor_files(self):
+        make_skill(self.source, "writing", "same")
+        target_skill = make_skill(self.target, "writing", "same")
+        vendor = target_skill / "node_modules" / "lib"
+        vendor.mkdir(parents=True)
+        (vendor / "dep.js").write_text("user-managed dependency")
+        result = self.run_cli("adopt", *self.common(), "--yes")
+        self.assertIn("unsafe", result.stdout)
+        self.assertTrue((vendor / "dep.js").exists())
+        self.assertFalse((self.state / "state.json").exists())
+
+    def test_adopted_skill_cannot_be_updated_without_extra_consent(self):
+        skill = make_skill(self.source, "writing", "v1")
+        target_skill = make_skill(self.target, "writing", "v1")
+        adopted = self.run_cli("adopt", *self.common(), "--yes")
+        adopt_id = adopted.stdout.split("Adoption transaction: ", 1)[1].splitlines()[0]
+        (skill / "SKILL.md").write_text("v2", encoding="utf-8")
+        self.assertIn("update_adopted", self.run_cli("plan", *self.common()).stdout)
+        self.run_cli("apply", *self.common(), "--yes", expected=2)
+        self.run_cli("apply", *self.common(), "--yes", "--skip-blocked")
+        self.assertEqual((target_skill / "SKILL.md").read_text(), "---\nname: writing\n---\nv1\n")
+        updated = self.run_cli("apply", *self.common(), "--yes", "--allow-update-adopted")
+        update_id = self.transaction(updated.stdout)
+        self.assertEqual((target_skill / "SKILL.md").read_text(), "v2")
+        self.run_cli("rollback", "--state-dir", self.state, "--yes",
+                     "--transaction", adopt_id, expected=2)
+        self.run_cli("rollback", "--state-dir", self.state, "--yes",
+                     "--transaction", update_id)
+        self.run_cli("rollback", "--state-dir", self.state, "--yes",
+                     "--transaction", adopt_id)
+        self.assertTrue(target_skill.is_dir())
 
     def test_install_excludes_vendor_and_rollback(self):
         skill = make_skill(self.source, "writing")
@@ -165,6 +264,23 @@ class ManagerTests(unittest.TestCase):
         self.run_cli("apply", *self.common(), "--yes", expected=2)
         self.assertFalse(self.target.exists())
         self.assertTrue((self.state / "manager.lock").exists())
+
+    def test_dead_pid_lock_is_reclaimed_automatically(self):
+        make_skill(self.source, "writing")
+        self.state.mkdir(parents=True)
+        (self.state / "manager.lock").write_text("99999999", encoding="utf-8")
+        result = self.run_cli("apply", *self.common(), "--yes")
+        self.assertIn("install", result.stdout)
+        self.assertTrue((self.target / "writing" / "SKILL.md").is_file())
+        self.assertFalse((self.state / "manager.lock").exists())
+
+    def test_live_pid_lock_is_never_automatically_removed(self):
+        make_skill(self.source, "writing")
+        self.state.mkdir(parents=True)
+        (self.state / "manager.lock").write_text(str(os.getpid()), encoding="utf-8")
+        self.run_cli("apply", *self.common(), "--yes", expected=2)
+        self.assertEqual((self.state / "manager.lock").read_text(), str(os.getpid()))
+        self.assertFalse(self.target.exists())
 
 
 if __name__ == "__main__":
