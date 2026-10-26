@@ -66,3 +66,55 @@ Trạng thái sau cùng (theo `plan`): claude 177 được quản lý + 4 chưa 
 4. **Journal phục hồi** khi máy tắt đột ngột giữa lúc ghi.
 5. **Shared Brain** qua MCP (xác định chủ sở hữu từng phần cấu hình để không ghi đè nhau), rồi mới tới điều phối đa agent.
 6. Merge PR #1 sau khi review mã và thử trên Windows thật.
+
+## Phân tích drift và thí nghiệm Path Adapter (chỉ đọc, 26/10/2026)
+
+Mục tiêu: biết chính xác các skill `blocked_unmanaged` khác SSOT ở đâu, rồi thử cơ chế template của PR #2 (`path_adapter.py`) trên bản sao. Không sửa SSOT thật, thư mục agent hay `state.json`. Bảng chi tiết nằm ở `.local/reports/drift_analysis.md` (không commit).
+
+### Kết quả phân tích 36 skill lệch
+
+| Kho | Chỉ khác đường dẫn agent | Đường dẫn + từ Claude/Codex | Chỉ khác CRLF/LF | Cần xem lại |
+|---|---|---|---|---|
+| agents (32) | 26 | 1 | 1 | 4 |
+| claude (4) | 0 | 0 | 0 | 4 |
+
+- Nhóm "cần xem lại" khác nội dung thật (SSOT lấy bản mới hơn), có file thừa hoặc thiếu, hoặc `package-lock.json` khác. Không dùng placeholder để giải quyết nhóm này.
+- Một số khác biệt nhỏ không phải đường dẫn (ví dụ đổi tên trường, định dạng số). Đây là thay đổi nội dung thật, không phải template.
+
+### Luật thay đường dẫn quan sát được ở bản của agents
+
+| Trong SSOT | Trong bản cài của agents | Biến template |
+|---|---|---|
+| `.claude/skills/...`, `~/.claude/skills/...` | `.agents/skills/...`, `~/.agents/skills/...` | `SKILLS_DIR` |
+| `.claude/<thư mục khác>/...` | `.Codex/<thư mục khác>/...` (viết hoa chữ C) | `AGENT_CONFIG_DIR` |
+
+Cần ít nhất hai biến. Thứ tự áp dụng: `.claude/skills` trước, rồi mới tới `.claude/` còn lại.
+
+### Thí nghiệm trên 3 skill (bản sao trong `.local/experiments/`)
+
+Trong bản sao, đổi đường dẫn thành `{{SKILLS_DIR}}` và `{{AGENT_CONFIG_DIR}}`, rồi dùng `path_adapter.py` xem trước so với thư mục thật.
+
+| Kho | skill-A | skill-B | skill-C |
+|---|---|---|---|
+| claude | match | match | match |
+| agents | match | drift | drift |
+
+- claude khớp 3/3: bản render lại đúng bản đang cài, nên chuyển SSOT sang template không đổi nội dung của claude.
+- skill-A khớp ở agents: cơ chế đúng với trường hợp đường dẫn thuần túy.
+- skill-B ở agents lệch vì bản cài **chưa được chuyển đổi trọn vẹn**: `SKILL.md` đã đổi sang `.agents/skills`, nhưng một file trong `references/` còn `.claude/skills`. Adapter sẽ sửa được lỗi bỏ sót này.
+- skill-C lệch ở một file script (khoảng dòng 431); chưa xác định là đường dẫn hay thay đổi mã.
+
+### Phát hiện cho thiết kế v0.3b
+
+1. **Lỗi `--diff` trên Windows:** in diff chứa ký tự không phải ASCII gây `UnicodeEncodeError` ở console cp1252 và lệnh dừng. Cần ép đầu ra UTF-8 như `audit_skills.py`.
+2. **Hash trong `state.json` phải đổi:** `state.json` lưu hash của SSOT chưa render. Nếu SSOT chứa placeholder, các bản đã quản lý sẽ bị coi là cần `update`. v0.3b phải băm bản đã render theo từng agent trước khi nối vào `plan` và `apply`, và có đường nâng cấp state cũ.
+3. **CRLF:** `brainstorm` chỉ khác dấu xuống dòng nhưng vẫn bị coi là lệch. Không chuẩn hóa CRLF trong hàm băm chung vì sẽ đổi hash của mọi bản đang quản lý. Xử lý riêng ở bước `adopt`, lưu hash thực của thư mục đích.
+4. **Placeholder lạ:** adapter coi mọi chuỗi `{{CHỮ_HOA}}` trong file không khai báo là lỗi `unsafe`. SSOT có 5 file chứa chuỗi kiểu này (thuộc skill tài liệu SEO và nhóm `synced`), nên cần giới hạn kiểm tra vào file được khai báo hoặc cho phép bỏ qua có cấu hình.
+5. **Bản cài có thể sai sẵn:** bản của agents có file chưa chuyển đổi (xem skill-B). Khi apply qua adapter, phải xem trước và cần xác nhận riêng, vì nó thay đổi nội dung file mà người dùng đã cài.
+
+### Việc kế tiếp
+
+- Sửa `--diff` (UTF-8) và thêm test.
+- Thiết kế render-aware hash trong `plan`/`apply`/state; thử trên bản sao rồi mới nối vào `apply`.
+- Xem lại `skill-C` và 4 skill `needs_review` của agents.
+- Quyết định cách xử lý CRLF ở `adopt`.
