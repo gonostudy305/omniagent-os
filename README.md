@@ -52,7 +52,7 @@ flowchart TD
 
 - **Single Source of Truth (SSOT):** Maintain one canonical copy of skills to eliminate redundant copies across agent directories.
 - **Safe Skill Manager MVP:** Inventory, plan, copy, update, and roll back *managed* skill copies. Existing unmanaged skills are never replaced automatically.
-- **Smart Path Decoupling (planned):** Future per-agent adapters will replace brittle hardcoded paths (`.claude/...`, `.agents/...`) with portable references or generated renderers.
+- **Smart Path Decoupling (v0.3 preview):** The read-only `path_adapter.py` previews explicitly templated references (`{{SKILLS_DIR}}`) and verifies their rendered hashes per agent. Adapter-aware installation is still planned.
 - **Clean Source & Reproducible Dependencies:** Keeps repository source free of committed vendor packages (`node_modules`), with planned hydration scripts for skills requiring local runtime environments.
 - **Preserved System Runtimes:** Safely isolates vendor-specific runtimes (e.g., OpenAI `.system` skills) without polluting cross-agent tool registries.
 - **Audit & Validation Tooling:** Built-in Python scripts to audit, deduplicate, and verify parity across all local agent installations.
@@ -68,6 +68,8 @@ flowchart TD
 ├── audit_skills.py           # Fast SHA-256 hash & line-level unified diff auditor
 ├── generate_report.py        # Generates markdown audit reports
 ├── omniagent.py              # Safe discover / plan / adopt / apply / rollback CLI
+├── path_adapter.py           # Read-only v0.3 per-agent template preview
+├── adapters.example.json     # Public example; private manifest belongs in .local/
 ├── tests/                    # Synthetic audit and Skill Manager safety tests
 ├── SKILLS_AUDIT_REPORT.md    # Case study audit report across 4 skill stores
 └── ssot/                     # Local SSOT directory (managed locally / .gitignored)
@@ -143,6 +145,22 @@ python tests/test_audit.py
 python -m unittest discover -s tests -p test_skill_manager.py -v
 ```
 
+### 4. Preview portable paths (v0.3a, read-only)
+
+Use a **disposable SSOT copy** with explicit placeholders and an opt-in private
+manifest, as described in [the Path Adapter guide](docs/PATH_ADAPTER.md). For
+example, once your private manifest and fixture are ready:
+
+```powershell
+python path_adapter.py --manifest .local/adapters.json `
+  --source .local/adapter-fixtures/skills `
+  --target "agents=$HOME\.agents\skills" --skill demo-skill --diff
+```
+
+This command does **not** write to agent stores or manager state. Do not run
+`omniagent.py apply` against templated SSOT sources until adapter-aware apply
+and rollback are implemented.
+
 ---
 
 ## 📚 Docs
@@ -150,6 +168,7 @@ python -m unittest discover -s tests -p test_skill_manager.py -v
 - [docs/PROJECT_CONTEXT.md](docs/PROJECT_CONTEXT.md): why this project exists, design principles, decisions, roadmap
 - [docs/DEVELOPMENT_LOG.md](docs/DEVELOPMENT_LOG.md): what was done on a real machine, metrics, lessons
 - [docs/USAGE.md](docs/USAGE.md): Skill Manager runbook (discover, adopt, plan, apply, rollback)
+- [docs/PATH_ADAPTER.md](docs/PATH_ADAPTER.md): v0.3a read-only template manifest and rendered-hash preview
 
 ---
 
@@ -159,7 +178,8 @@ python -m unittest discover -s tests -p test_skill_manager.py -v
 - [x] Phase 2: Complete cross-agent skill audit and line-level diff drift analysis.
 - [x] Phase 3: Extraction of canonical SSOT structure (local-first).
 - [x] Phase 4a: Conservative local Skill Manager MVP (discover, plan, adopt exact matches, copy, rollback).
-- [ ] Phase 4b: Drift reconciliation, per-agent path templating, adapters, dependency-aware validation, and crash-safe journal recovery.
+- [x] Phase 4b preview: Read-only, explicit per-agent path template renderer and drift detection (v0.3a).
+- [ ] Phase 4b apply: Safe adapter-aware installation, rollback, drift reconciliation, dependency-aware validation, and crash-safe journal recovery.
 - [ ] Phase 5: Automated dependency hydration for skills with package requirements.
 - [ ] Phase 6: Cross-Agent Memory Integration via MCP (Memorix / Local Knowledge Graph).
 
