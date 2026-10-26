@@ -1,0 +1,25 @@
+name: Python safety tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  unit-tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Audit regression tests
+        run: python tests/test_audit.py
+      - name: Skill Manager safety tests
+        run: python -m unittest discover -s tests -p test_skill_manager.py -v
