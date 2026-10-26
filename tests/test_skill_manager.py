@@ -119,6 +119,17 @@ class ManagerTests(unittest.TestCase):
                      "--target", f"codex_system={protected}", "--yes", expected=2)
         self.assertFalse(protected.exists())
 
+    def test_env_templates_are_allowed_but_real_env_files_are_blocked(self):
+        skill = make_skill(self.source, "api-skill")
+        for name in (".env.example", ".env.sample", ".env.template"):
+            (skill / name).write_text("API_KEY=your-key-here", encoding="utf-8")
+        result = self.run_cli("apply", *self.common(), "--yes")
+        self.assertIn("install", result.stdout)
+        for name in (".env.example", ".env.sample", ".env.template"):
+            self.assertTrue((self.target / "api-skill" / name).is_file())
+        (skill / ".env.local").write_text("API_KEY=real", encoding="utf-8")
+        self.run_cli("plan", *self.common(), expected=2)
+
     def test_unexpected_file_prevents_destructive_rollback(self):
         make_skill(self.source, "writing")
         result = self.run_cli("apply", *self.common(), "--yes")

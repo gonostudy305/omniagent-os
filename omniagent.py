@@ -32,6 +32,7 @@ DEFAULT_TARGETS = {
 EXCLUDED_DIRS = {"node_modules", ".git", "__pycache__", ".local"}
 EXCLUDED_FILES = {".ds_store", "thumbs.db"}
 SECRET_FILES = {"auth.json", ".env", ".claude.json"}
+ENV_TEMPLATES = {".env.example", ".env.sample", ".env.template"}
 SKILL_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 TRANSACTION_ID = re.compile(r"^\d{8}T\d{6}Z-[0-9a-f]{12}$")
 
@@ -96,7 +97,7 @@ def skill_files(skill: Path, *, source: bool = True) -> list[tuple[str, Path]]:
             path = root_path / name
             if source and (name.lower() in EXCLUDED_FILES or name.endswith(".pyc")):
                 continue
-            if (name.lower() in SECRET_FILES or name.lower().startswith(".env.")
+            if (name.lower() in SECRET_FILES or (name.lower().startswith(".env.") and name.lower() not in ENV_TEMPLATES)
                     or path.suffix.lower() in {".pem", ".key", ".token"}):
                 raise SafetyError(f"Potential credentials in source; inspect manually: {path}")
             if path.is_symlink() or not stat.S_ISREG(path.stat().st_mode):
