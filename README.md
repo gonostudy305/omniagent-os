@@ -145,6 +145,14 @@ python -m unittest discover -s tests -p test_skill_manager.py -v
 
 ---
 
+## 📚 Docs
+
+- [docs/PROJECT_CONTEXT.md](docs/PROJECT_CONTEXT.md): why this project exists, design principles, decisions, roadmap
+- [docs/DEVELOPMENT_LOG.md](docs/DEVELOPMENT_LOG.md): what was done on a real machine, metrics, lessons
+- [docs/USAGE.md](docs/USAGE.md): Skill Manager runbook (discover, adopt, plan, apply, rollback)
+
+---
+
 ## 🗺 Roadmap
 
 - [x] Phase 1: Safe multi-agent configuration backup with zero credential leakage.
