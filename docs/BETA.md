@@ -28,9 +28,10 @@ Chưa dùng ở beta:
 Điều kiện: đã backup thư mục skill và `.local/manager/`; dùng thư mục state **riêng** cho buổi thử.
 
 ```powershell
-# Khai báo một lần (sửa đường dẫn <...> cho đúng máy của bạn)
-$Src   = "<thư mục SSOT đã template hóa, ví dụ .local\experiments\templated26\source>"
-$Man   = "<adapters.json đi kèm bản template đó>"
+# Chạy từ thư mục gốc của repo. Hai đường dẫn dưới đây là bản thử nghiệm template hóa
+# đã tạo trong .local\ (không được đưa lên git); máy khác phải tự tạo bản của mình.
+$Src   = ".local\experiments\templated26\source"
+$Man   = ".local\experiments\templated26\adapters.json"
 $State = ".local\trial-state"          # state RIÊNG cho buổi thử, không dùng state mặc định
 $Agents = "$HOME\.agents\skills"
 $Skills = @("--skill","threejs","--skill","ask","--skill","preview")
