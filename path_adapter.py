@@ -213,9 +213,14 @@ def render_aware_plan(source: Path, state_dir: Path, targets: dict[str, Path],
         status = item["status"]
         # Only reinterpret entries already proven managed and unchanged by
         # the v0.2 manager. Never relax blocked/unmanaged/conflict statuses.
-        if (record and status in {"unchanged", "update", "update_adopted", "blocked_vendor"}
+        if (record and status in {"unchanged", "update", "update_adopted", "blocked_vendor", "blocked_rendered"}
                 and installed_hash is not None and installed_hash == record.get("hash")):
-            if installed_hash == render_hash:
+            if status == "blocked_rendered" and (record.get("rendered_for") != agent
+                                                  or name not in manifest["skills"]):
+                # Missing template provenance or wrong target: no implicit
+                # transition back to raw SSOT, even with a manifest present.
+                pass
+            elif installed_hash == render_hash:
                 status = "unchanged"
             else:
                 status = "update_adopted" if record.get("origin") == "adopted" else "update"

@@ -116,8 +116,12 @@ content happens to match the installed bytes. Only *managed and unmodified*
 entries can be reclassified from a false `update` to `unchanged`.
 
 The JSON includes machine-specific paths and potentially private skill names;
-do not upload it to GitHub. For ordinary v0.2 operations without this option,
-`omniagent.py plan`, `adopt`, `apply` and `rollback` behave exactly as before.
+do not upload it to GitHub. Ordinary v0.2 operations remain available, **except**
+that a managed record containing `rendered_for` is deliberately marked
+`blocked_rendered` in a plan without `--adapter-manifest` and cannot be
+overwritten by a plain `apply`. With `--skip-blocked`, it is left untouched
+while unrelated safe actions can proceed. `adopt` and `rollback` retain their
+existing behavior.
 
 ### Experimental v0.3b apply and rollback (disposable targets only)
 
@@ -149,6 +153,13 @@ Unmanaged collisions, manual edits, symlinks, and installed `node_modules`
 block updates. Previously adopted skills require the **additional** flag
 `--allow-update-adopted`; never combine it with `--skip-blocked` unless you
 have inspected all statuses. `adopt` itself is **not** render-aware yet.
+
+**No accidental downgrade to the raw SSOT:** after rendered apply, a later
+`python omniagent.py apply --yes` without the manifest refuses that managed
+skill, even if the source file still contains placeholders. The explicit
+render-aware command may manage it only when the manifest contains that skill
+and the recorded `rendered_for` agrees with the target name. Always inspect
+the adapter-aware plan before applying again.
 
 Crash/power-loss journal recovery, dependency hydration, safe reconciliation
 of the 36 real mismatches, and runtime smoke tests remain unimplemented.

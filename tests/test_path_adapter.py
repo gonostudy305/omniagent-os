@@ -232,6 +232,97 @@ class PathAdapterTests(unittest.TestCase):
         self.assertFalse(installed.exists())
         self.assertEqual(json.loads((self.state / "state.json").read_text())["managed"], {})
 
+    def test_plain_apply_cannot_replace_a_rendered_install_even_with_skip_blocked(self):
+        self.adapter_apply_cli("--allow-rendered-apply")
+        target = self.agents / "demo-skill"
+        before = (target / "SKILL.md").read_bytes()
+        before_state = (self.state / "state.json").read_bytes()
+        before_journals = sorted((self.state / "transactions").iterdir())
+        self.assertNotEqual(before, (self.source_skill / "SKILL.md").read_bytes())
+        self.assertEqual(plan(self.source, self.state, {"agents": self.agents})[0]["status"],
+                         "blocked_rendered")
+
+        cmd = [sys.executable, "-I", str(Path(adapter.__file__).parent / "omniagent.py"),
+               "apply", "--yes", "--source", str(self.source),
+               "--state-dir", str(self.state), "--target", f"agents={self.agents}",
+               "--skill", "demo-skill"]
+        denied = subprocess.run(cmd, text=True, capture_output=True, encoding="utf-8")
+        self.assertEqual(denied.returncode, 2, denied.stderr)
+        self.assertIn("--adapter-manifest", denied.stderr)
+        skipped = subprocess.run([*cmd, "--skip-blocked"], text=True,
+                                 capture_output=True, encoding="utf-8")
+        self.assertEqual(skipped.returncode, 0, skipped.stderr)
+        self.assertIn("nothing changed", skipped.stdout)
+        self.assertEqual((target / "SKILL.md").read_bytes(), before)
+        self.assertEqual((self.state / "state.json").read_bytes(), before_state)
+        self.assertEqual(sorted((self.state / "transactions").iterdir()), before_journals)
+
+        rendered_plan = adapter.render_aware_plan(self.source, self.state,
+                                                    {"agents": self.agents}, self.config)
+        self.assertEqual(rendered_plan[0]["status"], "unchanged")
+        self.assertIn("nothing changed", self.adapter_apply_cli("--allow-rendered-apply").stdout)
+
+    def test_plain_skip_blocked_installs_other_skills_without_touching_rendered(self):
+        self.adapter_apply_cli("--allow-rendered-apply")
+        rendered = self.agents / "demo-skill" / "SKILL.md"
+        before = rendered.read_bytes()
+        plain = self.source / "plain"
+        plain.mkdir()
+        (plain / "SKILL.md").write_text("# Ordinary unrendered skill\n", encoding="utf-8")
+        actions = plan(self.source, self.state, {"agents": self.agents})
+        self.assertEqual({a["name"]: a["status"] for a in actions},
+                         {"demo-skill": "blocked_rendered", "plain": "install"})
+        cmd = [sys.executable, "-I", str(Path(adapter.__file__).parent / "omniagent.py"),
+               "apply", "--yes", "--skip-blocked", "--source", str(self.source),
+               "--state-dir", str(self.state), "--target", f"agents={self.agents}"]
+        cp = subprocess.run(cmd, text=True, capture_output=True, encoding="utf-8")
+        self.assertEqual(cp.returncode, 0, cp.stderr)
+        self.assertEqual(rendered.read_bytes(), before)
+        self.assertEqual((self.agents / "plain" / "SKILL.md").read_text(encoding="utf-8"),
+                         "# Ordinary unrendered skill\n")
+
+    def test_manifest_without_template_cannot_revert_a_rendered_record(self):
+        self.adapter_apply_cli("--allow-rendered-apply")
+        rendered = self.agents / "demo-skill" / "SKILL.md"
+        original = rendered.read_bytes()
+        plain = self.source / "plain"
+        plain.mkdir()
+        (plain / "SKILL.md").write_text("# No adapter placeholders\n", encoding="utf-8")
+        self.config["skills"] = {"plain": {"files": ["SKILL.md"]}}
+        self.save_manifest()
+        actions = adapter.render_aware_plan(self.source, self.state,
+                                             {"agents": self.agents}, self.config)
+        self.assertEqual(next(a for a in actions if a["name"] == "demo-skill")["status"],
+                         "blocked_rendered")
+        cp = self.adapter_apply_cli("--allow-rendered-apply", expected=2)
+        self.assertIn("skip-blocked", cp.stderr)
+        self.assertEqual(rendered.read_bytes(), original)
+
+    def test_rendered_record_for_another_agent_remains_blocked(self):
+        self.adapter_apply_cli("--allow-rendered-apply")
+        rendered = self.agents / "demo-skill" / "SKILL.md"
+        original = rendered.read_bytes()
+        state_path = self.state / "state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["managed"][str(self.agents / "demo-skill")]["rendered_for"] = "claude"
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        actions = adapter.render_aware_plan(self.source, self.state,
+                                             {"agents": self.agents}, self.config)
+        self.assertEqual(actions[0]["status"], "blocked_rendered")
+        cp = self.adapter_apply_cli("--allow-rendered-apply", expected=2)
+        self.assertIn("skip-blocked", cp.stderr)
+        self.assertEqual(rendered.read_bytes(), original)
+
+    def test_manual_change_to_rendered_skill_is_still_a_conflict(self):
+        self.adapter_apply_cli("--allow-rendered-apply")
+        installed = self.agents / "demo-skill" / "SKILL.md"
+        installed.write_text("Manual user change\n", encoding="utf-8")
+        self.assertEqual(plan(self.source, self.state, {"agents": self.agents})[0]["status"],
+                         "conflict")
+        cp = self.adapter_apply_cli("--allow-rendered-apply", expected=2)
+        self.assertIn("skip-blocked", cp.stderr)
+        self.assertEqual(installed.read_text(encoding="utf-8"), "Manual user change\n")
+
     def test_rendered_update_from_v02_record_restores_exact_old_content(self):
         target = self.copy_rendered(self.agents, ".claude/skills")
         old_hash = tree_digest(target, source=False)

@@ -310,6 +310,12 @@ def plan(source: Path, state_dir: Path, targets: dict[str, Path],
                     else:
                         if current != record.get("hash"):
                             status = "conflict"
+                        elif "rendered_for" in record:
+                            # A plain v0.2 apply must never overwrite a skill
+                            # intentionally rendered for a specific agent.
+                            # Only an explicit adapter-aware plan can opt back
+                            # into managing these per-target bytes.
+                            status = "blocked_rendered"
                         elif current == source_hash:
                             status = "unchanged"
                         else:
@@ -339,7 +345,7 @@ def adoption_plan(source: Path, state_dir: Path, targets: dict[str, Path],
                 status = "unsafe"
             else:
                 status = "eligible" if digest == item["source_hash"] else "mismatch"
-        elif status in {"update", "update_adopted", "unchanged"}:
+        elif status in {"update", "update_adopted", "unchanged", "blocked_rendered"}:
             status = "already_managed"
         result.append({**item, "status": status})
     return result
@@ -468,6 +474,9 @@ def _apply_locked(source: Path, state_dir: Path, targets: dict[str, Path],
     blocked = [a for a in actions if a["status"].startswith(("blocked", "conflict"))
                or (a["status"] == "update_adopted" and not allow_update_adopted)]
     if blocked and not skip_blocked:
+        if adapter_manifest is None and any(a["status"] == "blocked_rendered" for a in blocked):
+            raise SafetyError("Rendered skills require --adapter-manifest for apply; "
+                              "nothing applied. Use --skip-blocked to leave them untouched.")
         raise SafetyError(f"{len(blocked)} existing skills are unmanaged or changed; "
                           "nothing applied. Use --skip-blocked to install only safe entries.")
     changed = [a for a in actions if a["status"] in {"install", "update"}
@@ -491,6 +500,8 @@ def _apply_locked(source: Path, state_dir: Path, targets: dict[str, Path],
             if action["status"] == "install" and (dest.exists() or dest.is_symlink()):
                 raise SafetyError(f"Destination appeared since planning: {dest}")
             if action["status"] in {"update", "update_adopted"}:
+                if adapter_manifest is None and "rendered_for" in old_records[str(dest)]:
+                    raise SafetyError(f"Rendered skill requires --adapter-manifest: {dest}")
                 prior_hash = old_records[str(dest)]["hash"]
                 if not dest.is_dir() or dest.is_symlink() or tree_digest(dest, source=False) != prior_hash:
                     raise SafetyError(f"Managed skill changed since planning: {dest}")

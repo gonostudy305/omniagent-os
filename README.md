@@ -52,7 +52,7 @@ flowchart TD
 
 - **Single Source of Truth (SSOT):** Maintain one canonical copy of skills to eliminate redundant copies across agent directories.
 - **Safe Skill Manager MVP:** Inventory, plan, copy, update, and roll back *managed* skill copies. Existing unmanaged skills are never replaced automatically.
-- **Smart Path Decoupling (v0.3 preview):** The read-only `path_adapter.py` previews explicitly templated references (`{{SKILLS_DIR}}`) and verifies their rendered hashes per agent. Adapter-aware installation is still planned.
+- **Smart Path Decoupling (v0.3 Draft):** `path_adapter.py` previews explicitly templated references (`{{SKILLS_DIR}}`) and verifies hashes per agent. A guarded, one-skill/one-target rendered `apply` is available for disposable fixtures only; ordinary `apply` refuses to overwrite managed rendered copies without a manifest.
 - **Clean Source & Reproducible Dependencies:** Keeps repository source free of committed vendor packages (`node_modules`), with planned hydration scripts for skills requiring local runtime environments.
 - **Preserved System Runtimes:** Safely isolates vendor-specific runtimes (e.g., OpenAI `.system` skills) without polluting cross-agent tool registries.
 - **Audit & Validation Tooling:** Built-in Python scripts to audit, deduplicate, and verify parity across all local agent installations.
