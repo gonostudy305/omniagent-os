@@ -179,6 +179,7 @@ existing agent stores yet.
 - [docs/USAGE.md](docs/USAGE.md): Skill Manager runbook (discover, adopt, plan, apply, rollback)
 - [docs/PATH_ADAPTER.md](docs/PATH_ADAPTER.md): v0.3 template preview, guarded fixture apply and rollback
 - [docs/BETA.md](docs/BETA.md): controlled beta guide, release criteria and evidence
+- [docs/DESIGN_v0.4_SECOND_BRAIN.md](docs/DESIGN_v0.4_SECOND_BRAIN.md): draft design of the shared second brain (not implemented)
 - [docs/RELEASE_NOTES_v0.3.0-beta.1.md](docs/RELEASE_NOTES_v0.3.0-beta.1.md): draft release notes
 
 ---
