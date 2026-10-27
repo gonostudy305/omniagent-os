@@ -524,6 +524,93 @@ class PathAdapterTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8", "replace"))
         self.assertNotIn(b"Traceback", result.stderr)
 
+    # --- v0.3c: adapter-aware adopt (state only) ---
+
+    def adopt_cli(self, *extra, expected=0):
+        import subprocess
+        cp = subprocess.run(
+            [sys.executable, "-I", str(Path(adapter.__file__).parent / "omniagent.py"), "adopt",
+             "--source", str(self.source), "--state-dir", str(self.state), *extra],
+            capture_output=True, text=True, encoding="utf-8")
+        self.assertEqual(cp.returncode, expected, cp.stdout + cp.stderr)
+        return cp
+
+    def snapshot(self, root: Path):
+        return {p.relative_to(root).as_posix(): p.read_bytes() for p in root.rglob("*") if p.is_file()}
+
+    def test_adopt_rendered_copy_only_records_state(self):
+        installed = self.copy_rendered(self.agents, ".agents/skills")
+        before = self.snapshot(installed)
+        args = ("--target", f"agents={self.agents}", "--adapter-manifest", str(self.manifest))
+        self.assertIn("eligible_rendered", self.adopt_cli(*args).stdout)
+        self.assertFalse((self.state / "state.json").exists())
+        done = self.adopt_cli(*args, "--yes")
+        self.assertEqual(self.snapshot(installed), before)
+        record = json.loads((self.state / "state.json").read_text(encoding="utf-8"))["managed"][str(installed)]
+        manifest = adapter.load_manifest(self.manifest)
+        expected, _ = adapter.rendered_skill(self.source_skill, ["SKILL.md"], manifest["targets"]["agents"])
+        self.assertEqual(record["hash"], expected)
+        self.assertEqual(record["rendered_for"], "agents")
+        self.assertEqual(record["origin"], "adopted")
+        self.assertNotEqual(record["hash"], record["source_hash"])
+        # A plain v0.2 plan must now refuse to overwrite it; the render-aware plan sees it unchanged.
+        plain = self.adopt_cli("--target", f"agents={self.agents}")
+        self.assertIn("already_managed", plain.stdout)
+        self.assertIn("Adoption transaction", done.stdout)
+        import subprocess
+        rendered_plan = subprocess.run(
+            [sys.executable, "-I", str(Path(adapter.__file__).parent / "omniagent.py"), "plan",
+             "--source", str(self.source), "--state-dir", str(self.state),
+             "--target", f"agents={self.agents}", "--adapter-manifest", str(self.manifest)],
+            capture_output=True, text=True, encoding="utf-8")
+        self.assertEqual(rendered_plan.returncode, 0, rendered_plan.stderr)
+        self.assertIn("unchanged", rendered_plan.stdout)
+        plain_plan = subprocess.run(
+            [sys.executable, "-I", str(Path(adapter.__file__).parent / "omniagent.py"), "plan",
+             "--source", str(self.source), "--state-dir", str(self.state),
+             "--target", f"agents={self.agents}"], capture_output=True, text=True, encoding="utf-8")
+        self.assertIn("blocked_rendered", plain_plan.stdout)
+
+    def test_adopt_rendered_without_manifest_stays_mismatch(self):
+        self.copy_rendered(self.agents, ".agents/skills")
+        out = self.adopt_cli("--target", f"agents={self.agents}", "--yes").stdout
+        self.assertIn("mismatch", out)
+        self.assertFalse((self.state / "state.json").exists())
+
+    def test_adopt_rendered_for_wrong_agent_stays_mismatch(self):
+        self.copy_rendered(self.claude, ".agents/skills")  # claude folder holding agents paths
+        out = self.adopt_cli("--target", f"claude={self.claude}", "--adapter-manifest", str(self.manifest), "--yes").stdout
+        self.assertIn("mismatch", out)
+        self.assertFalse((self.state / "state.json").exists())
+
+    def test_adopt_rendered_rollback_untracks_without_touching_files(self):
+        installed = self.copy_rendered(self.agents, ".agents/skills")
+        before = self.snapshot(installed)
+        args = ("--target", f"agents={self.agents}", "--adapter-manifest", str(self.manifest), "--yes")
+        txn = self.adopt_cli(*args).stdout.split("Adoption transaction: ", 1)[1].splitlines()[0]
+        import subprocess
+        cp = subprocess.run([sys.executable, "-I", str(Path(adapter.__file__).parent / "omniagent.py"),
+                             "rollback", "--state-dir", str(self.state), "--transaction", txn, "--yes"],
+                            capture_output=True, text=True, encoding="utf-8")
+        self.assertEqual(cp.returncode, 0, cp.stdout + cp.stderr)
+        self.assertEqual(self.snapshot(installed), before)
+        state = json.loads((self.state / "state.json").read_text(encoding="utf-8"))
+        self.assertNotIn(str(installed), state["managed"])
+
+    def test_adopt_rendered_edited_copy_is_not_adopted(self):
+        installed = self.copy_rendered(self.agents, ".agents/skills")
+        (installed / "scripts" / "run.py").write_text("print('edited')\n", encoding="utf-8")
+        out = self.adopt_cli("--target", f"agents={self.agents}", "--adapter-manifest", str(self.manifest), "--yes").stdout
+        self.assertIn("mismatch", out)
+        self.assertFalse((self.state / "state.json").exists())
+
+    def test_adopt_with_manifest_missing_target_is_rejected(self):
+        self.copy_rendered(self.agents, ".agents/skills")
+        del self.config["targets"]["agents"]
+        self.save_manifest()
+        self.adopt_cli("--target", f"agents={self.agents}", "--adapter-manifest", str(self.manifest), "--yes", expected=2)
+        self.assertFalse((self.state / "state.json").exists())
+
     def test_diff_requires_one_skill_and_target(self):
         err = io.StringIO()
         with contextlib.redirect_stderr(err):

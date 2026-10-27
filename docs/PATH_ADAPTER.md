@@ -191,3 +191,21 @@ update, so v0.2's `blocked_vendor` guard must remain in place.
    approved for the production `ssot/skills` or agent directories.
 4. Test on disposable stores on both Windows and Linux; then smoke-test the
    behavior of Claude, Codex and Antigravity, one skill at a time.
+
+## Adapter-aware adopt (v0.3c)
+
+`adopt --adapter-manifest MANIFEST --target NAME=PATH` also recognises an installed
+folder that is byte-identical to the per-agent *rendered* skill (status
+`eligible_rendered`). Without `--yes` it is a preview. With `--yes` it writes only
+manager state and the journal; **no skill file is modified**.
+
+The record stores `hash` (the rendered hash that is actually installed),
+`source_hash` (the unrendered SSOT hash), `rendered_for` (the agent) and
+`origin: adopted`. Consequences:
+
+- A plain `plan`/`apply` without the manifest reports `blocked_rendered` and never
+  overwrites it; `plan --adapter-manifest` reports it `unchanged`.
+- Rolling back the adoption only removes the bookkeeping entry.
+- Folders that were edited, rendered for a different agent, or that differ in any
+  way stay `mismatch` and are not adopted. A skill not listed in the manifest keeps
+  the v0.2 behaviour (exact match with the unrendered SSOT).

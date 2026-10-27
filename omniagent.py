@@ -333,8 +333,19 @@ def plan(source: Path, state_dir: Path, targets: dict[str, Path],
 
 
 def adoption_plan(source: Path, state_dir: Path, targets: dict[str, Path],
-                  selected: set[str] | None = None) -> list[dict]:
-    """Inspect existing unmanaged folders, without modifying any skill or state."""
+                  selected: set[str] | None = None, adapter_manifest: dict | None = None,
+                  adapter_module=None) -> list[dict]:
+    """Inspect existing unmanaged folders, without modifying any skill or state.
+
+    With an adapter manifest, a folder that equals the per-agent *rendered* skill
+    is reported as ``eligible_rendered``; it is recorded with its rendered hash.
+    """
+    if adapter_manifest is not None:
+        if adapter_module is None:
+            raise SafetyError("Adapter-aware adoption requires a validated adapter module")
+        for agent in targets:
+            if agent not in adapter_manifest["targets"]:
+                raise SafetyError(f"No adapter variables configured for target: {agent}")
     result = []
     for item in plan(source, state_dir, targets, selected):
         status = item["status"]
@@ -344,7 +355,18 @@ def adoption_plan(source: Path, state_dir: Path, targets: dict[str, Path],
             except (SafetyError, OSError):
                 status = "unsafe"
             else:
-                status = "eligible" if digest == item["source_hash"] else "mismatch"
+                config = adapter_manifest["skills"].get(item["name"]) if adapter_manifest else None
+                render_hash = None
+                if config:
+                    render_hash, _ = adapter_module.rendered_skill(
+                        Path(item["source"]), config["files"],
+                        adapter_manifest["targets"][item["target"]],
+                        config.get("ignore_placeholders"))
+                if render_hash is not None and digest == render_hash and render_hash != item["source_hash"]:
+                    status = "eligible_rendered"
+                    item = {**item, "render_hash": render_hash}
+                else:
+                    status = "eligible" if digest == item["source_hash"] else "mismatch"
         elif status in {"update", "update_adopted", "unchanged", "blocked_rendered"}:
             status = "already_managed"
         result.append({**item, "status": status})
@@ -377,33 +399,40 @@ def show_adoption_diff(item: dict) -> None:
 
 
 def adopt(source: Path, state_dir: Path, targets: dict[str, Path],
-          selected: set[str] | None) -> tuple[str | None, list[dict]]:
+          selected: set[str] | None, adapter_manifest: dict | None = None,
+          adapter_module=None) -> tuple[str | None, list[dict]]:
     """Record exactly matching existing skills as adopted; never touch target files."""
     with manager_lock(state_dir):
-        actions = adoption_plan(source, state_dir, targets, selected)
-        eligible = [a for a in actions if a["status"] == "eligible"]
+        actions = adoption_plan(source, state_dir, targets, selected,
+                                adapter_manifest, adapter_module)
+        eligible = [a for a in actions if a["status"] in {"eligible", "eligible_rendered"}]
         if not eligible:
             return None, actions
         # A second verification under the exclusive manager lock guards against
         # target edits made while discovering candidates.
         for item in eligible:
             dest = Path(item["destination"])
-            if dest.is_symlink() or not dest.is_dir() or tree_digest(dest, source=False) != item["source_hash"]:
+            expected = item["render_hash"] if item["status"] == "eligible_rendered" else item["source_hash"]
+            if dest.is_symlink() or not dest.is_dir() or tree_digest(dest, source=False) != expected:
                 raise SafetyError(f"Skill changed during adoption; no state written: {dest}")
         state = state_at(state_dir)
         if any(item["destination"] in state["managed"] for item in eligible):
             raise SafetyError("Skill became managed during adoption; no state written")
         transaction = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:12]
         journal_path = state_dir / "transactions" / f"{transaction}.json"
+        journal_actions = [{**a, "applied_hash": a["render_hash"]} if a["status"] == "eligible_rendered" else a
+                           for a in eligible]
         journal = {"version": 1, "kind": "adopt", "status": "applied",
-                   "transaction": transaction, "actions": eligible}
+                   "transaction": transaction, "actions": journal_actions}
         save_json(journal_path, journal)
         try:
             for item in eligible:
-                state["managed"][item["destination"]] = {
-                    "source": item["source"], "hash": item["source_hash"],
-                    "origin": "adopted", "adopted_transaction": transaction,
-                }
+                record = {"source": item["source"], "hash": item["source_hash"],
+                          "origin": "adopted", "adopted_transaction": transaction}
+                if item["status"] == "eligible_rendered":
+                    record.update({"hash": item["render_hash"], "source_hash": item["source_hash"],
+                                   "rendered_for": item["target"]})
+                state["managed"][item["destination"]] = record
             save_json(state_dir / "state.json", state)
         except Exception:
             journal["status"] = "failed"
@@ -586,7 +615,7 @@ def _rollback_locked(state_dir: Path, transaction: str) -> int:
             record = state["managed"].get(item["destination"], {})
             if (record.get("origin") != "adopted"
                     or record.get("adopted_transaction") != transaction
-                    or record.get("hash") != item["source_hash"]):
+                    or record.get("hash") != item.get("applied_hash", item["source_hash"])):
                 raise SafetyError(f"Cannot untrack a superseded adoption: {item['destination']}")
         # Undoing adoption only removes manager bookkeeping, never a user's folder.
         for item in actions:
@@ -680,6 +709,8 @@ def cli(argv: list[str] | None = None) -> int:
             part.add_argument("--allow-rendered-apply", action="store_true",
                               help="separate opt-in to modifying a target with rendered skill files")
         if command == "adopt":
+            part.add_argument("--adapter-manifest", type=Path,
+                              help="also recognise folders equal to the per-agent rendered skill")
             part.add_argument("--yes", action="store_true", help="record exact matches in private state")
             part.add_argument("--diff", action="store_true", help="show local SKILL.md diff for one selected mismatch")
     undo = sub.add_parser("rollback")
@@ -708,16 +739,22 @@ def cli(argv: list[str] | None = None) -> int:
         if args.command == "adopt":
             if args.diff and (not selected or len(selected) != 1 or len(targets) != 1):
                 raise SafetyError("For private diffs, select exactly one --skill and one --target")
+            adopt_module = adopt_manifest = None
+            if args.adapter_manifest:
+                adopt_module = load_adapter_module()
+                adopt_manifest = adopt_module.load_manifest(args.adapter_manifest.expanduser().absolute())
             if args.yes:
-                transaction, actions = adopt(source, state_dir, targets, selected)
+                transaction, actions = adopt(source, state_dir, targets, selected,
+                                             adopt_manifest, adopt_module)
                 print(f"Adoption transaction: {transaction or '(nothing changed)'}")
             else:
-                actions = adoption_plan(source, state_dir, targets, selected)
+                actions = adoption_plan(source, state_dir, targets, selected,
+                                        adopt_manifest, adopt_module)
             for a in actions:
                 print(f"{a['target']:10} {a['status']:18} {a['name']}")
                 if args.diff:
                     show_adoption_diff(a)
-            print(f"Eligible exact matches: {sum(a['status'] == 'eligible' for a in actions)}")
+            print(f"Eligible exact matches: {sum(a['status'] in {'eligible', 'eligible_rendered'} for a in actions)}")
             return 0
         adapter_module = None
         adapter_manifest = None
