@@ -1,0 +1,70 @@
+# Hướng dẫn dùng thử beta (v0.3.0-beta.1)
+
+> English summary: a controlled beta on Windows for the v0.3 Skill Manager and Path Adapter. Scope is deliberately small (three pilot skills, state-only adoption, no content changes). This page lists what is verified, what is not, the safe trial session, and how to recover.
+
+## Phạm vi beta
+
+Dùng được:
+- Quản lý skills v0.2: `discover`, `plan`, `adopt`, `apply`, `rollback`.
+- v0.3: Path Adapter chỉ-đọc, `plan --adapter-manifest`, `adopt --adapter-manifest` (chỉ ghi state), `recover` cho giao dịch bị ngắt.
+
+Chưa dùng ở beta:
+- Tự động cập nhật các skill đang lệch hoặc chuyển đổi dở (giữ nguyên, cần duyệt từng diff).
+- Adopt hàng loạt vào state chính; shared memory; điều phối nhiều agent.
+- `apply --adapter-manifest` trên thư mục agent thật (thử nghiệm, chỉ một skill, một target, cần `--allow-rendered-apply`).
+
+## Tiêu chí chốt beta và bằng chứng
+
+| # | Tiêu chí | Trạng thái | Bằng chứng / việc còn lại |
+|---|---|---|---|
+| 1 | PR #2 có CI xanh và đã được review | CI xanh (Windows, Ubuntu, GitGuardian). Đã có review tự động độc lập; **chờ bạn review và quyết định merge** | Kết quả review ghi trong PR |
+| 2 | Test kill tiến trình thật trên thư mục giả | Đạt | `tests/test_kill.py`: 4 kịch bản (kill khi cài, sau khi bản cũ bị dời, trước và sau khi ghi `state.json`), tiến trình con chết bằng `os._exit`, rồi `recover` |
+| 3 | Ba skill pilot hoạt động trong agent thật | **Chưa kiểm chứng** | Hash khớp chỉ chứng minh nội dung nhất quán. Bạn cần mở Codex/Claude thật và gọi thử `threejs`, `ask`, `preview` |
+| 4 | Adopt và rollback không đổi byte nào | Đạt | `tests/test_byte_identity.py` (chu trình đủ bước trên fixture, kể cả thư mục rỗng) và chạy thật trên 3 skill: băm SHA-256 trước và sau, cả thư mục `~/.agents/skills` giữ nguyên số file và thời điểm sửa đổi |
+| 5 | Tài liệu, release notes, hướng dẫn khôi phục | Đạt | Trang này, [RELEASE_NOTES_v0.3.0-beta.1.md](RELEASE_NOTES_v0.3.0-beta.1.md), mục "Phục hồi" trong [USAGE.md](USAGE.md) |
+
+## Buổi dùng thử an toàn (chỉ ghi state thử, không sửa nội dung skill nào)
+
+Điều kiện: đã backup thư mục skill và `.local/manager/`; dùng thư mục state **riêng** cho buổi thử.
+
+```powershell
+# 0. Test
+python -I -m unittest discover -s tests
+
+# 1. Xem trước (chỉ đọc): ba skill nên là eligible_rendered
+python omniagent.py adopt --source <SSOT_template> --state-dir .local\trial-state `
+  --target "agents=$HOME\.agents\skills" --adapter-manifest <adapters.json> `
+  --skill threejs --skill ask --skill preview
+
+# 2. Ghi nhận vào state thử (không sửa file skill)
+python omniagent.py adopt ... --yes
+
+# 3. Kiểm tra: plan thường -> blocked_rendered; plan có manifest -> unchanged
+python omniagent.py plan --source <SSOT_template> --state-dir .local\trial-state `
+  --target "agents=$HOME\.agents\skills" --adapter-manifest <adapters.json> --skill threejs
+
+# 4. Hoàn tác ghi nhận
+python omniagent.py rollback --state-dir .local\trial-state --transaction <ID> --yes
+```
+
+`<SSOT_template>` là bản sao SSOT đã chuyển đường dẫn thành placeholder (ví dụ trong `.local/experiments/`); **không** dùng SSOT thật làm nguồn khi chưa template hóa, vì state chính lưu hash của bản chưa render.
+
+Bước cuối cần làm tay: mở Codex (hoặc Claude) và gọi thử từng skill pilot để xác nhận chúng vẫn chạy.
+
+## Khi có sự cố
+
+1. Công cụ báo "An interrupted transaction exists": chạy `python omniagent.py recover` (xem trước), rồi `--yes`. Xem [USAGE.md](USAGE.md#phục-hồi-giao-dịch-bị-ngắt-giữa-chừng).
+2. `recover` từ chối: có skill bị sửa tay hoặc có `node_modules`. Không có gì bị thay đổi; xử lý tay rồi chạy lại.
+3. Muốn quay về hoàn toàn: khôi phục từ backup trước buổi thử và xóa thư mục state thử.
+4. Báo lỗi: kèm lệnh đã chạy và đầu ra, **không** đính kèm nội dung skill hay state (có thể chứa đường dẫn và tên riêng).
+
+## Giới hạn đã biết
+
+- Kiểm thử kill dùng `os._exit` trên fixture; chưa thử mất điện thật. Ghi file chưa `fsync`, nên mất điện hoặc OS crash có thể để lại journal rỗng (chặn mọi lệnh cho tới khi xử lý tay).
+- `rollback` chưa có journal riêng: nếu bị ngắt giữa chừng, bản sao lưu vẫn còn trong `.local/manager/backups/` nhưng phải khôi phục tay.
+- Thư mục junction của Windows chưa được nhận diện như symlink; không đặt junction trong SSOT hay thư mục target.
+- `recover` có thể từ chối nếu chính nó bị ngắt giữa lúc khôi phục (bản sao lưu vẫn nguyên).
+- Review độc lập (đọc code, không chạy): đã sửa 2 lỗi (ghi nhận hoàn tất trước khi dọn thư mục tạm; bản sao lưu dở không còn chặn `recover`); các điểm trên được ghi lại cho v0.3.x.
+- Số liệu audit (số file, tỷ lệ drift) quan sát trên một máy.
+- 11 skill của bản cài agents chuyển đổi dở: cập nhật về bản render sẽ đổi file thật, chưa được duyệt.
+- Chưa kiểm tra tương thích thực thi trên Antigravity.

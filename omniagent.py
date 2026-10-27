@@ -499,7 +499,13 @@ def recover(state_dir: Path, apply_changes: bool) -> list[dict]:
                 backup = Path(a["backup"]) if a.get("backup") else None
                 if dest.is_symlink() or (dest.exists() and not dest.is_dir()):
                     raise SafetyError(f"Cannot recover; unexpected destination: {dest}")
-                if backup is not None and backup.exists():
+                dest_is_previous = False
+                if dest.is_dir() and previous and not has_vendor(dest):
+                    try:
+                        dest_is_previous = tree_digest(dest, source=False) == previous["hash"]
+                    except SafetyError:
+                        pass
+                if backup is not None and backup.exists() and not dest_is_previous:
                     if tree_digest(backup, source=False) != previous["hash"]:
                         raise SafetyError(f"Cannot recover; backup changed: {backup}")
                 if dest.is_dir():
@@ -671,9 +677,10 @@ def _apply_locked(source: Path, state_dir: Path, targets: dict[str, Path],
                         raise
                 else:
                     staging.rename(dest)
-            completed.append({**action, "applied_hash": applied_hash,
-                              "backup": str(backup) if action["status"] in {"update", "update_adopted"} else None,
-                              "previous": old_records[str(dest)]})
+                # Recorded before the temp dir is cleaned up, so a cleanup failure is still reverted.
+                completed.append({**action, "applied_hash": applied_hash,
+                                  "backup": str(backup) if action["status"] in {"update", "update_adopted"} else None,
+                                  "previous": old_records[str(dest)]})
 
         # Two-phase commit: journal "committing" carries the exact state records, so a
         # crash before or during the state write can be rolled forward by `recover`.

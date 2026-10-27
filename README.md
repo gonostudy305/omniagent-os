@@ -178,6 +178,8 @@ existing agent stores yet.
 - [docs/DEVELOPMENT_LOG.md](docs/DEVELOPMENT_LOG.md): what was done on a real machine, metrics, lessons
 - [docs/USAGE.md](docs/USAGE.md): Skill Manager runbook (discover, adopt, plan, apply, rollback)
 - [docs/PATH_ADAPTER.md](docs/PATH_ADAPTER.md): v0.3 template preview, guarded fixture apply and rollback
+- [docs/BETA.md](docs/BETA.md): controlled beta guide, release criteria and evidence
+- [docs/RELEASE_NOTES_v0.3.0-beta.1.md](docs/RELEASE_NOTES_v0.3.0-beta.1.md): draft release notes
 
 ---
 
@@ -189,9 +191,12 @@ existing agent stores yet.
 - [x] Phase 4a: Conservative local Skill Manager MVP (discover, plan, adopt exact matches, copy, rollback).
 - [x] Phase 4b preview: Read-only, explicit per-agent path template renderer and drift detection (v0.3a).
 - [x] Phase 4b guarded fixture apply: single-skill adapter-aware staging, hash verification and rollback (v0.3b experimental).
-- [ ] Phase 4b production hardening: drift reconciliation, adapter-aware adoption, dependency-aware validation and crash-safe journal recovery.
+- [x] Phase 4b hardening (v0.3 beta candidate): adapter-aware adoption and crash-safe journal recovery (two-phase commit, `recover`).
+- [ ] Phase 4b remaining: drift reconciliation for partially converted installs, dependency-aware validation, execution compatibility checks on Codex/Antigravity.
 - [ ] Phase 5: Automated dependency hydration for skills with package requirements.
 - [ ] Phase 6: Cross-Agent Memory Integration via MCP (Memorix / Local Knowledge Graph).
+- [ ] Phase 7: Multi-agent coordination: handoff, context sharing, permissions and conflict avoidance (git worktrees).
+- [ ] Phase 8: Windows Local Agent OS v1.0: installer/CLI, dependency hydration, health checks, onboarding and release testing.
 
 ---
 
