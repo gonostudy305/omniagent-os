@@ -145,7 +145,7 @@ python tests/test_audit.py
 python -m unittest discover -s tests -p test_skill_manager.py -v
 ```
 
-### 4. Preview portable paths (v0.3a, read-only)
+### 4. Preview portable paths and stage a single rendered skill (v0.3 experimental)
 
 Use a **disposable SSOT copy** with explicit placeholders and an opt-in private
 manifest, as described in [the Path Adapter guide](docs/PATH_ADAPTER.md). For
@@ -162,9 +162,13 @@ python omniagent.py plan --adapter-manifest .local/adapters.json `
   --target "agents=$HOME\.agents\skills" --skill demo-skill --json
 ```
 
-This command does **not** write to agent stores or manager state. Do not run
-`omniagent.py apply` against templated SSOT sources until adapter-aware apply
-and rollback are implemented.
+The two preview commands above do **not** write to agent stores or manager
+state. An experimental, opt-in adapter-aware `apply` is available **only for
+single-skill/single-target tests on disposable stores**. It requires
+`--adapter-manifest`, `--allow-rendered-apply` and `--yes` together; see the
+[Path Adapter guide](docs/PATH_ADAPTER.md) for a controlled apply/rollback
+fixture. Do not use the public examples to mutate your live private SSOT or
+existing agent stores yet.
 
 ---
 
@@ -173,7 +177,7 @@ and rollback are implemented.
 - [docs/PROJECT_CONTEXT.md](docs/PROJECT_CONTEXT.md): why this project exists, design principles, decisions, roadmap
 - [docs/DEVELOPMENT_LOG.md](docs/DEVELOPMENT_LOG.md): what was done on a real machine, metrics, lessons
 - [docs/USAGE.md](docs/USAGE.md): Skill Manager runbook (discover, adopt, plan, apply, rollback)
-- [docs/PATH_ADAPTER.md](docs/PATH_ADAPTER.md): v0.3a read-only template manifest and rendered-hash preview
+- [docs/PATH_ADAPTER.md](docs/PATH_ADAPTER.md): v0.3 template preview, guarded fixture apply and rollback
 
 ---
 
@@ -184,7 +188,8 @@ and rollback are implemented.
 - [x] Phase 3: Extraction of canonical SSOT structure (local-first).
 - [x] Phase 4a: Conservative local Skill Manager MVP (discover, plan, adopt exact matches, copy, rollback).
 - [x] Phase 4b preview: Read-only, explicit per-agent path template renderer and drift detection (v0.3a).
-- [ ] Phase 4b apply: Safe adapter-aware installation, rollback, drift reconciliation, dependency-aware validation, and crash-safe journal recovery.
+- [x] Phase 4b guarded fixture apply: single-skill adapter-aware staging, hash verification and rollback (v0.3b experimental).
+- [ ] Phase 4b production hardening: drift reconciliation, adapter-aware adoption, dependency-aware validation and crash-safe journal recovery.
 - [ ] Phase 5: Automated dependency hydration for skills with package requirements.
 - [ ] Phase 6: Cross-Agent Memory Integration via MCP (Memorix / Local Knowledge Graph).
 

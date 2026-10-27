@@ -1,8 +1,14 @@
-# Path Adapter v0.3a — read-only preview
+# Path Adapter v0.3 — experimental render-aware plan and apply
 
-This is the **first, deliberately read-only** component of v0.3. It does not
-update agent installations, modify the canonical SSOT, adopt existing skills,
-or touch `.local/manager/state.json`.
+The original `path_adapter.py` and `omniagent.py plan --adapter-manifest` remain
+**read-only**. The v0.3b `omniagent.py apply` path can stage rendered files and
+install or update **exactly one selected skill and target** with separate
+consent, a verified backup and a journal that `rollback` can undo.
+
+This is experimental. Use **disposable source/target folders only** until the
+Windows compatibility and power-loss recovery reviews are complete. It never
+edits the canonical SSOT source. The existing v0.2 commands without a manifest
+remain unchanged except for a stricter late vendor-dependency guard.
 
 ## Why explicit templates?
 
@@ -69,7 +75,7 @@ values reject shell metacharacters and parent-directory traversal.
 Use a **copy** of one source skill in a temporary folder under `.local/`,
 manually replace only verified path references with placeholders there, and
 add that skill to a private copy of the manifest. Do **not** modify the live
-`ssot/skills/` yet: the v0.2 manager is not adapter-aware.
+`ssot/skills/` yet: v0.2 tools and adapter-aware adoption are not complete.
 
 ```powershell
 New-Item -ItemType Directory -Force .local | Out-Null
@@ -95,7 +101,7 @@ paste it into a public issue. Omitting `--diff` prints status and a short hash.
 
 ### Three distinct hashes in `omniagent.py plan`
 
-The optional `--adapter-manifest` is accepted by **`plan` only**. It adds:
+The optional `--adapter-manifest` in **`plan`** adds:
 
 - `source_hash`: SHA-256 of the raw canonical SSOT tree (with placeholders).
 - `render_hash`: SHA-256 of the expected tree after per-agent rendering.
@@ -112,7 +118,40 @@ entries can be reclassified from a false `update` to `unchanged`.
 The JSON includes machine-specific paths and potentially private skill names;
 do not upload it to GitHub. For ordinary v0.2 operations without this option,
 `omniagent.py plan`, `adopt`, `apply` and `rollback` behave exactly as before.
-In particular, **`apply --adapter-manifest` is intentionally unsupported**.
+
+### Experimental v0.3b apply and rollback (disposable targets only)
+
+**First**, take a backup and inspect `plan --adapter-manifest --json`. Then
+run **one skill on one disposable target** with both consent flags:
+
+```powershell
+$sandboxTarget = Join-Path $PWD '.local\adapter-fixtures\target-agents'
+python omniagent.py apply --source $fixture `
+  --state-dir .local/adapter-fixtures/manager `
+  --target "agents=$sandboxTarget" --skill demo-skill `
+  --adapter-manifest .local/adapters.json `
+  --allow-rendered-apply --yes
+
+# Capture the transaction ID from the apply output, then undo without a manifest:
+python omniagent.py rollback --state-dir .local/adapter-fixtures/manager `
+  --transaction 'YYYYMMDDTHHMMSSZ-xxxxxxxxxxxx' --yes
+```
+
+It stages the raw skill with source-hash verification, renders only explicitly
+configured UTF-8 files, and verifies the resulting tree against `render_hash`
+before touching the target. Updates retain verified backups. The manager's
+private state continues to use **schema version 1**, retaining `hash` as the
+actual installed-byte digest; new rendered entries also record `source_hash`
+and `rendered_for`. Journals retain `applied_hash` so the original bytes can be
+restored. Old v0.2 journals remain readable.
+
+Unmanaged collisions, manual edits, symlinks, and installed `node_modules`
+block updates. Previously adopted skills require the **additional** flag
+`--allow-update-adopted`; never combine it with `--skip-blocked` unless you
+have inspected all statuses. `adopt` itself is **not** render-aware yet.
+
+Crash/power-loss journal recovery, dependency hydration, safe reconciliation
+of the 36 real mismatches, and runtime smoke tests remain unimplemented.
 
 ## Status meanings
 
@@ -136,10 +175,8 @@ update, so v0.2's `blocked_vendor` guard must remain in place.
    secrets. Do not publish private samples.
 2. Make portable copies of only the verified cases and confirm `match` with
    `path_adapter.py` against the existing agent installation.
-3. Build adapter-aware `apply`/`adopt`/`rollback` with transaction journals,
-   backups, explicit opt-in and target revalidation. The manager's read-only
-   `plan --adapter-manifest` is available, but **do not run `omniagent.py apply`
-   against a templated canonical SSOT**: it still copies template source
-   literally.
+3. Finish adapter-aware `adopt` and state migration review. The guarded
+   `apply` and rollback paths work with synthetic fixtures but are not yet
+   approved for the production `ssot/skills` or agent directories.
 4. Test on disposable stores on both Windows and Linux; then smoke-test the
    behavior of Claude, Codex and Antigravity, one skill at a time.

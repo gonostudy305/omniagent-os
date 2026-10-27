@@ -418,6 +418,25 @@ def copy_skill(source: Path, destination: Path, expected_hash: str) -> None:
         raise SafetyError(f"Source changed while copying: {source}")
 
 
+def copy_rendered_skill(source: Path, destination: Path, source_hash: str,
+                        rendered_hash: str, name: str, target: str,
+                        adapter_manifest: dict, adapter_module) -> None:
+    """Stage a complete, verified per-target rendered tree; never edit SSOT."""
+    copy_skill(source, destination, source_hash)
+    config = adapter_manifest["skills"].get(name)
+    if config:
+        expected_hash, rendered = adapter_module.rendered_skill(
+            source, config["files"], adapter_manifest["targets"][target],
+            config.get("ignore_placeholders"),
+        )
+        if expected_hash != rendered_hash:
+            raise SafetyError(f"Template or manifest changed while staging: {name}")
+        for relative, body in rendered.items():
+            (destination / relative).write_bytes(body)
+    if tree_digest(destination, source=False) != rendered_hash:
+        raise SafetyError(f"Rendered staging hash mismatch: {name} ({target})")
+
+
 def remove_managed(path: Path) -> None:
     if path.is_symlink() or not path.is_dir():
         raise SafetyError(f"Refusing to remove unexpected destination: {path}")
@@ -426,15 +445,26 @@ def remove_managed(path: Path) -> None:
 
 def apply(source: Path, state_dir: Path, targets: dict[str, Path],
           selected: set[str] | None, skip_blocked: bool,
-          allow_update_adopted: bool = False) -> tuple[str | None, list[dict]]:
+          allow_update_adopted: bool = False, adapter_manifest: dict | None = None,
+          adapter_module=None) -> tuple[str | None, list[dict]]:
+    if adapter_manifest is not None and (selected is None or len(selected) != 1 or len(targets) != 1):
+        raise SafetyError("Experimental rendered apply permits exactly one skill and target")
     with manager_lock(state_dir):
-        return _apply_locked(source, state_dir, targets, selected, skip_blocked, allow_update_adopted)
+        return _apply_locked(source, state_dir, targets, selected, skip_blocked,
+                             allow_update_adopted, adapter_manifest, adapter_module)
 
 
 def _apply_locked(source: Path, state_dir: Path, targets: dict[str, Path],
                   selected: set[str] | None, skip_blocked: bool,
-                  allow_update_adopted: bool) -> tuple[str | None, list[dict]]:
-    actions = plan(source, state_dir, targets, selected)
+                  allow_update_adopted: bool, adapter_manifest: dict | None = None,
+                  adapter_module=None) -> tuple[str | None, list[dict]]:
+    if adapter_manifest is not None:
+        if adapter_module is None:
+            raise SafetyError("Rendered apply requires a validated adapter module")
+        actions = adapter_module.render_aware_plan(source, state_dir, targets,
+                                                   adapter_manifest, selected)
+    else:
+        actions = plan(source, state_dir, targets, selected)
     blocked = [a for a in actions if a["status"].startswith(("blocked", "conflict"))
                or (a["status"] == "update_adopted" and not allow_update_adopted)]
     if blocked and not skip_blocked:
@@ -464,9 +494,19 @@ def _apply_locked(source: Path, state_dir: Path, targets: dict[str, Path],
                 prior_hash = old_records[str(dest)]["hash"]
                 if not dest.is_dir() or dest.is_symlink() or tree_digest(dest, source=False) != prior_hash:
                     raise SafetyError(f"Managed skill changed since planning: {dest}")
+                # Runtime files are ignored by hashes. Recheck immediately
+                # before replacement so late-added vendor data is never lost.
+                if has_vendor(dest):
+                    raise SafetyError(f"Installed vendor dependencies block update: {dest}")
             with tempfile.TemporaryDirectory(prefix=".omniagent-stage-", dir=dest.parent) as temp:
                 staging = Path(temp) / "skill"
-                copy_skill(source_path, staging, action["source_hash"])
+                applied_hash = action.get("render_hash", action["source_hash"])
+                if adapter_manifest is not None:
+                    copy_rendered_skill(source_path, staging, action["source_hash"],
+                                        applied_hash, action["name"], action["target"],
+                                        adapter_manifest, adapter_module)
+                else:
+                    copy_skill(source_path, staging, action["source_hash"])
                 backup = backup_dir / str(index)
                 if action["status"] in {"update", "update_adopted"}:
                     shutil.copytree(dest, backup)
@@ -481,7 +521,8 @@ def _apply_locked(source: Path, state_dir: Path, targets: dict[str, Path],
                         raise
                 else:
                     staging.rename(dest)
-            completed.append({**action, "backup": str(backup) if action["status"] in {"update", "update_adopted"} else None,
+            completed.append({**action, "applied_hash": applied_hash,
+                              "backup": str(backup) if action["status"] in {"update", "update_adopted"} else None,
                               "previous": old_records[str(dest)]})
 
         # Save recovery journal before publishing the updated manifest.
@@ -489,7 +530,10 @@ def _apply_locked(source: Path, state_dir: Path, targets: dict[str, Path],
                    "actions": completed}
         save_json(state_dir / "transactions" / f"{transaction}.json", journal)
         for a in completed:
-            new_record = {"source": a["source"], "hash": a["source_hash"]}
+            new_record = {"source": a["source"], "hash": a["applied_hash"]}
+            if adapter_manifest is not None:
+                new_record["source_hash"] = a["source_hash"]
+                new_record["rendered_for"] = a["target"]
             if a["previous"] and a["previous"].get("origin") == "adopted":
                 new_record["origin"] = "adopted"
                 new_record["adopted_transaction"] = a["previous"]["adopted_transaction"]
@@ -498,7 +542,8 @@ def _apply_locked(source: Path, state_dir: Path, targets: dict[str, Path],
     except Exception:
         for a in reversed(completed):
             dest = Path(a["destination"])
-            if dest.is_dir() and not dest.is_symlink() and tree_digest(dest, source=False) == a["source_hash"]:
+            if (dest.is_dir() and not dest.is_symlink()
+                    and tree_digest(dest, source=False) == a.get("applied_hash", a["source_hash"])):
                 remove_managed(dest)
                 if a["backup"]:
                     shutil.copytree(a["backup"], dest)
@@ -542,9 +587,10 @@ def _rollback_locked(state_dir: Path, transaction: str) -> int:
     # Validate the whole transaction first; never delete a user-edited skill.
     for a in actions:
         dest = Path(a["destination"])
+        applied_hash = a.get("applied_hash", a["source_hash"])
         if (dest.is_symlink() or not dest.is_dir() or has_vendor(dest)
-                or tree_digest(dest, source=False) != a["source_hash"]
-                or state["managed"].get(str(dest), {}).get("hash") != a["source_hash"]
+                or tree_digest(dest, source=False) != applied_hash
+                or state["managed"].get(str(dest), {}).get("hash") != applied_hash
                 or state["managed"].get(str(dest), {}).get("source") != a["source"]
                 or (not a["previous"] and state["managed"].get(str(dest), {}).get("origin") == "adopted")):
             raise SafetyError(f"Cannot roll back; installed skill changed: {dest}")
@@ -585,6 +631,20 @@ def discover(source: Path, targets: dict[str, Path]) -> None:
             print(f"{name:10}      (not found)  {root}")
 
 
+def load_adapter_module():
+    """Load the adjacent adapter safely even when Python runs with -I."""
+    sys.modules.setdefault("omniagent", sys.modules[__name__])
+    adapter_file = REPO_ROOT / "path_adapter.py"
+    if not adapter_file.is_file():
+        raise SafetyError("Path Adapter module not installed next to omniagent.py")
+    spec = importlib.util.spec_from_file_location("_omniagent_adapter", adapter_file)
+    if spec is None or spec.loader is None:
+        raise SafetyError("Unable to load Path Adapter module")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def cli(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Safe local skill manager (copy-based, no symlinks)")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -604,6 +664,10 @@ def cli(argv: list[str] | None = None) -> int:
             part.add_argument("--skip-blocked", action="store_true")
             part.add_argument("--allow-update-adopted", action="store_true",
                               help="explicitly permit replacing a previously adopted exact-match skill")
+            part.add_argument("--adapter-manifest", type=Path,
+                              help="per-agent rendered apply: experimental, one skill/target only")
+            part.add_argument("--allow-rendered-apply", action="store_true",
+                              help="separate opt-in to modifying a target with rendered skill files")
         if command == "adopt":
             part.add_argument("--yes", action="store_true", help="record exact matches in private state")
             part.add_argument("--diff", action="store_true", help="show local SKILL.md diff for one selected mismatch")
@@ -644,19 +708,12 @@ def cli(argv: list[str] | None = None) -> int:
                     show_adoption_diff(a)
             print(f"Eligible exact matches: {sum(a['status'] == 'eligible' for a in actions)}")
             return 0
-        if args.command == "plan" and args.adapter_manifest:
-            # When this file is launched as __main__, share its module with the
-            # adapter so both sides use the same SafetyError and manager logic.
-            sys.modules.setdefault("omniagent", sys.modules[__name__])
-            adapter_file = REPO_ROOT / "path_adapter.py"
-            if not adapter_file.is_file():
-                raise SafetyError("Path Adapter module not installed next to omniagent.py")
-            spec = importlib.util.spec_from_file_location("_omniagent_adapter", adapter_file)
-            if spec is None or spec.loader is None:
-                raise SafetyError("Unable to load Path Adapter module")
-            adapter_module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(adapter_module)
+        adapter_module = None
+        adapter_manifest = None
+        if args.adapter_manifest:
+            adapter_module = load_adapter_module()
             adapter_manifest = adapter_module.load_manifest(args.adapter_manifest.expanduser().absolute())
+        if args.command == "plan" and adapter_manifest is not None:
             actions = adapter_module.render_aware_plan(source, state_dir, targets,
                                                        adapter_manifest, selected)
         else:
@@ -664,8 +721,16 @@ def cli(argv: list[str] | None = None) -> int:
         if args.command == "apply":
             if not args.yes:
                 raise SafetyError("Apply modifies skill folders; inspect plan first, then use --yes")
+            if adapter_manifest is not None:
+                if not args.allow_rendered_apply:
+                    raise SafetyError("Rendered apply needs separate --allow-rendered-apply consent")
+                if selected is None or len(selected) != 1 or len(targets) != 1:
+                    raise SafetyError("Rendered apply is limited to one --skill and one --target")
+            elif args.allow_rendered_apply:
+                raise SafetyError("--allow-rendered-apply requires --adapter-manifest")
             transaction, actions = apply(source, state_dir, targets, selected,
-                                         args.skip_blocked, args.allow_update_adopted)
+                                         args.skip_blocked, args.allow_update_adopted,
+                                         adapter_manifest, adapter_module)
             print(f"Transaction: {transaction or '(nothing changed)'}")
         if args.command == "plan" and args.json:
             print(json.dumps(actions, indent=2, ensure_ascii=True))

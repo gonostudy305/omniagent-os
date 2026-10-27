@@ -8,9 +8,11 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import path_adapter as adapter
+import omniagent
 from omniagent import SafetyError, plan, tree_digest
 
 
@@ -57,6 +59,7 @@ class PathAdapterTests(unittest.TestCase):
         record = {"source": str(self.source_skill.resolve()), "hash": digest}
         if adopted:
             record["origin"] = "adopted"
+            record["adopted_transaction"] = "20261026T010000Z-aaaaaaaaaaaa"
         self.state.mkdir(parents=True, exist_ok=True)
         (self.state / "state.json").write_text(json.dumps({
             "version": 1, "managed": {str(root / "demo-skill"): record}
@@ -171,13 +174,162 @@ class PathAdapterTests(unittest.TestCase):
         self.assertEqual(result["installed_hash"], result["render_hash"])
         self.assertEqual((self.state / "state.json").read_bytes(), state_before)
 
-    def test_apply_cannot_use_adapter_manifest(self):
+    def adapter_apply_cli(self, *extra, expected=0, target=None):
+        target_root = target or self.agents
         cmd = [sys.executable, "-I", str(Path(adapter.__file__).parent / "omniagent.py"),
                "apply", "--adapter-manifest", str(self.manifest), "--yes",
-               "--source", str(self.source), "--target", f"agents={self.agents}"]
+               "--source", str(self.source), "--state-dir", str(self.state),
+               "--target", f"agents={target_root}", "--skill", "demo-skill", *extra]
+        cp = subprocess.run(cmd, text=True, capture_output=True, encoding="utf-8")
+        self.assertEqual(cp.returncode, expected, cp.stdout + cp.stderr)
+        return cp
+
+    def rollback_cli(self, transaction: str, *, expected=0):
+        cmd = [sys.executable, "-I", str(Path(adapter.__file__).parent / "omniagent.py"),
+               "rollback", "--state-dir", str(self.state), "--transaction", transaction,
+               "--yes"]
+        cp = subprocess.run(cmd, text=True, capture_output=True, encoding="utf-8")
+        self.assertEqual(cp.returncode, expected, cp.stdout + cp.stderr)
+        return cp
+
+    def test_apply_requires_separate_consent_and_one_skill(self):
+        cp = self.adapter_apply_cli(expected=2)
+        self.assertIn("--allow-rendered-apply", cp.stderr)
+        self.assertFalse(self.agents.exists())
+        cmd = [sys.executable, "-I", str(Path(adapter.__file__).parent / "omniagent.py"),
+               "apply", "--adapter-manifest", str(self.manifest), "--yes",
+               "--allow-rendered-apply", "--source", str(self.source),
+               "--state-dir", str(self.state), "--target", f"agents={self.agents}"]
+        cp = subprocess.run(cmd, text=True, capture_output=True, encoding="utf-8")
+        self.assertEqual(cp.returncode, 2)
+        self.assertIn("one --skill", cp.stderr)
+        self.assertFalse(self.agents.exists())
+
+    def test_rendered_apply_internal_api_also_rejects_multiple_targets(self):
+        with self.assertRaisesRegex(SafetyError, "exactly one skill and target"):
+            omniagent.apply(self.source, self.state,
+                            {"agents": self.agents, "claude": self.claude},
+                            {"demo-skill"}, False,
+                            adapter_manifest=self.config, adapter_module=adapter)
+        self.assertFalse(self.agents.exists())
+        self.assertFalse(self.claude.exists())
+
+    def test_rendered_install_then_rollback_without_manifest(self):
+        original_source = (self.source_skill / "SKILL.md").read_bytes()
+        cp = self.adapter_apply_cli("--allow-rendered-apply")
+        txn = cp.stdout.split("Transaction: ", 1)[1].splitlines()[0]
+        installed = self.agents / "demo-skill"
+        self.assertIn(b".agents/skills", (installed / "SKILL.md").read_bytes())
+        self.assertNotIn(b"{{", (installed / "SKILL.md").read_bytes())
+        self.assertEqual((self.source_skill / "SKILL.md").read_bytes(), original_source)
+        state = json.loads((self.state / "state.json").read_text())["managed"][str(installed)]
+        self.assertEqual(state["hash"], tree_digest(installed, source=False))
+        self.assertEqual(state["source_hash"], tree_digest(self.source_skill))
+        self.assertEqual(state["rendered_for"], "agents")
+        journal = json.loads((self.state / "transactions" / f"{txn}.json").read_text())
+        self.assertEqual(journal["actions"][0]["applied_hash"], state["hash"])
+        self.rollback_cli(txn)
+        self.assertFalse(installed.exists())
+        self.assertEqual(json.loads((self.state / "state.json").read_text())["managed"], {})
+
+    def test_rendered_update_from_v02_record_restores_exact_old_content(self):
+        target = self.copy_rendered(self.agents, ".claude/skills")
+        old_hash = tree_digest(target, source=False)
+        old_content = (target / "SKILL.md").read_bytes()
+        self.record_managed(self.agents, old_hash)
+        cp = self.adapter_apply_cli("--allow-rendered-apply")
+        txn = cp.stdout.split("Transaction: ", 1)[1].splitlines()[0]
+        self.assertIn(b".agents/skills", (target / "SKILL.md").read_bytes())
+        self.assertNotEqual(tree_digest(target, source=False), old_hash)
+        self.rollback_cli(txn)
+        self.assertEqual((target / "SKILL.md").read_bytes(), old_content)
+        record = json.loads((self.state / "state.json").read_text())["managed"][str(target)]
+        self.assertEqual(record["hash"], old_hash)
+        self.assertNotIn("rendered_for", record)
+
+    def test_adopted_update_requires_both_opt_ins(self):
+        target = self.copy_rendered(self.agents, ".claude/skills")
+        self.record_managed(self.agents, tree_digest(target, source=False), adopted=True)
+        cp = self.adapter_apply_cli("--allow-rendered-apply", expected=2)
+        self.assertIn("skip-blocked", cp.stderr)
+        self.assertIn(b".claude/skills", (target / "SKILL.md").read_bytes())
+        # Once explicitly permitted, the installed rendered copy is reversible.
+        cp = self.adapter_apply_cli("--allow-rendered-apply", "--allow-update-adopted")
+        txn = cp.stdout.split("Transaction: ", 1)[1].splitlines()[0]
+        self.assertIn(b".agents/skills", (target / "SKILL.md").read_bytes())
+        self.rollback_cli(txn)
+        self.assertIn(b".claude/skills", (target / "SKILL.md").read_bytes())
+
+    def test_rendered_apply_blocks_unmanaged_and_vendor(self):
+        target = self.copy_rendered(self.agents, ".claude/skills")
+        original = (target / "SKILL.md").read_bytes()
+        cp = self.adapter_apply_cli("--allow-rendered-apply", expected=2)
+        self.assertIn("unmanaged", cp.stderr)
+        self.assertEqual((target / "SKILL.md").read_bytes(), original)
+        self.record_managed(self.agents, tree_digest(target, source=False))
+        (target / "node_modules").mkdir()
+        (target / "node_modules" / "dep.js").write_text("vendor", encoding="utf-8")
+        cp = self.adapter_apply_cli("--allow-rendered-apply", expected=2)
+        self.assertIn("skip-blocked", cp.stderr)
+        self.assertTrue((target / "node_modules" / "dep.js").exists())
+        self.assertEqual((target / "SKILL.md").read_bytes(), original)
+
+    def test_vendor_appearing_after_plan_blocks_rendered_update(self):
+        target = self.copy_rendered(self.agents, ".claude/skills")
+        self.record_managed(self.agents, tree_digest(target, source=False))
+        old_content = (target / "SKILL.md").read_bytes()
+        real_has_vendor = omniagent.has_vendor
+        calls = 0
+
+        def late_vendor_check(path):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                (target / "node_modules").mkdir()
+                (target / "node_modules" / "dependency.js").write_text("keep", encoding="utf-8")
+            return real_has_vendor(path)
+
+        with mock.patch.object(omniagent, "has_vendor", side_effect=late_vendor_check):
+            with self.assertRaisesRegex(SafetyError, "vendor dependencies"):
+                omniagent.apply(self.source, self.state, {"agents": self.agents},
+                                {"demo-skill"}, False,
+                                adapter_manifest=self.config, adapter_module=adapter)
+        self.assertEqual((target / "SKILL.md").read_bytes(), old_content)
+        self.assertEqual((target / "node_modules" / "dependency.js").read_text(), "keep")
+
+    def test_rendered_rollback_refuses_late_vendor_files(self):
+        cp = self.adapter_apply_cli("--allow-rendered-apply")
+        txn = cp.stdout.split("Transaction: ", 1)[1].splitlines()[0]
+        target = self.agents / "demo-skill"
+        (target / "node_modules").mkdir()
+        (target / "node_modules" / "dependency.js").write_text("keep", encoding="utf-8")
+        cp = self.rollback_cli(txn, expected=2)
+        self.assertIn("changed", cp.stderr)
+        self.assertTrue((target / "node_modules" / "dependency.js").exists())
+
+    def test_rendered_rollback_rejects_manual_edits(self):
+        cp = self.adapter_apply_cli("--allow-rendered-apply")
+        txn = cp.stdout.split("Transaction: ", 1)[1].splitlines()[0]
+        skill_file = self.agents / "demo-skill" / "SKILL.md"
+        skill_file.write_text("User-owned edits", encoding="utf-8")
+        cp = self.rollback_cli(txn, expected=2)
+        self.assertIn("changed", cp.stderr)
+        self.assertEqual(skill_file.read_text(encoding="utf-8"), "User-owned edits")
+
+    def test_rendered_apply_fails_safely_for_unknown_placeholder(self):
+        (self.source_skill / "SKILL.md").write_text("Use {{SECRET_DIR}}/key", encoding="utf-8")
+        cp = self.adapter_apply_cli("--allow-rendered-apply", expected=2)
+        self.assertIn("Unresolved placeholder", cp.stderr)
+        self.assertFalse(self.agents.exists())
+
+    def test_v02_apply_rejects_rendered_flag_without_manifest(self):
+        cmd = [sys.executable, "-I", str(Path(adapter.__file__).parent / "omniagent.py"),
+               "apply", "--allow-rendered-apply", "--yes",
+               "--source", str(self.source), "--state-dir", str(self.state),
+               "--target", f"agents={self.agents}"]
         cp = subprocess.run(cmd, text=True, capture_output=True, encoding="utf-8")
         self.assertNotEqual(cp.returncode, 0)
-        self.assertIn("unrecognized arguments", cp.stderr)
+        self.assertIn("requires --adapter-manifest", cp.stderr)
         self.assertFalse(self.agents.exists())
 
     def test_plan_is_read_only_and_classifies_targets(self):
