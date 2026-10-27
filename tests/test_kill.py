@@ -52,6 +52,30 @@ elif mode == "partial_backup":
             die()
         return real_tree(src, dst, *a, **k)
     shutil.copytree = fake
+elif mode == "rb_after_moved_aside":
+    def fake(self, target):
+        calls["n"] += 1
+        if calls["n"] == 1 and "backups" not in str(self):
+            real_rename(self, target)
+            die()
+        return real_rename(self, target)
+    Path.rename = fake
+elif mode == "rb_partial_copy":
+    import shutil
+    real_tree = shutil.copytree
+    def fake(src, dst, *a, **k):
+        if "backups" in Path(src).parts:
+            Path(dst).mkdir(parents=True)
+            (Path(dst) / "half.txt").write_text("partial")
+            die()
+        return real_tree(src, dst, *a, **k)
+    shutil.copytree = fake
+elif mode == "rb_before_state":
+    def fake(path, data):
+        if Path(path).name == "state.json":
+            die()
+        return real_save(path, data)
+    omniagent.save_json = fake
 elif mode == "before_state":
     def fake(path, data):
         if Path(path).name == "state.json":
@@ -100,6 +124,62 @@ class KillTests(unittest.TestCase):
         result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", env=env)
         self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
         return result
+
+    def rollback(self, txn, kill=None, expected=0):
+        args = ["rollback", "--state-dir", str(self.state), "--transaction", txn, "--yes"]
+        if kill:
+            cmd = [sys.executable, "-I", "-c", CHILD.format(root=str(ROOT)), *args]
+            env = {**os.environ, "KILL_MODE": kill}
+        else:
+            cmd = [sys.executable, "-I", str(SCRIPT), *args]
+            env = None
+        result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", env=env)
+        self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+        return result
+
+    def last_transaction(self):
+        files = sorted((self.state / "transactions").glob("*.json"), key=lambda f: f.stat().st_mtime_ns)
+        return json.loads(files[-1].read_text(encoding="utf-8"))["transaction"]
+
+    def updated_skill(self):
+        skill = make_skill(self.source, "alpha", "v1")
+        self.cli("apply", "--yes")
+        (skill / "SKILL.md").write_text("---\nname: alpha\n---\nv2\n", encoding="utf-8")
+        self.cli("apply", "--yes")
+        return self.last_transaction()
+
+    def test_rollback_killed_after_skill_moved_aside_is_finished_by_recover(self):
+        txn = self.updated_skill()
+        self.rollback(txn, kill="rb_after_moved_aside", expected=137)
+        self.assertFalse((self.target / "alpha").exists())
+        self.cli("apply", "--yes", expected=2)  # blocked until recovered
+        self.recover("--yes")
+        self.assertIn("v1", (self.target / "alpha" / "SKILL.md").read_text(encoding="utf-8"))
+        self.assertEqual(self.status()["alpha"], "update")
+
+    def test_rollback_killed_during_restore_copy_never_leaves_a_partial_skill(self):
+        txn = self.updated_skill()
+        self.rollback(txn, kill="rb_partial_copy", expected=137)
+        self.recover("--yes")
+        self.assertIn("v1", (self.target / "alpha" / "SKILL.md").read_text(encoding="utf-8"))
+        self.assertFalse((self.target / "alpha" / "half.txt").exists())
+        self.assertEqual(self.status()["alpha"], "update")
+
+    def test_rollback_killed_before_state_write_is_finished_by_recover(self):
+        txn = self.updated_skill()
+        self.rollback(txn, kill="rb_before_state", expected=137)
+        self.recover("--yes")
+        self.assertEqual(self.status()["alpha"], "update")  # state hash matches the restored v1 files
+        self.assertIn("v1", (self.target / "alpha" / "SKILL.md").read_text(encoding="utf-8"))
+
+    def test_rollback_of_a_fresh_install_killed_midway_is_finished(self):
+        make_skill(self.source, "beta", "b")
+        self.cli("apply", "--yes")
+        txn = self.last_transaction()
+        self.rollback(txn, kill="rb_after_moved_aside", expected=137)
+        self.recover("--yes")
+        self.assertFalse((self.target / "beta").exists())
+        self.assertEqual(self.managed(), {})
 
     def recover(self, *extra, expected=0):
         result = subprocess.run([sys.executable, "-I", str(SCRIPT), "recover", "--state-dir", str(self.state), *extra],

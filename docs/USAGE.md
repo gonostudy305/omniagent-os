@@ -83,3 +83,10 @@ dừng ở giữa, `recover` **hoàn tất** (roll forward) bằng cách ghi cá
 kiểm tra từng skill vẫn đúng nội dung mới; nếu một skill đã bị sửa tay thì từ chối. Cả
 `in_progress` (revert) và `committing` (hoàn tất) đều chặn `apply`/`adopt`/`rollback` cho
 tới khi chạy `recover`.
+
+`rollback` cũng ghi journal `rolling_back` trước khi đụng vào bất kỳ skill nào. Từng
+skill được dựng lại từ backup ở thư mục tạm rồi đổi tên vào chỗ, nên một lần dừng giữa
+chừng chỉ để skill ở một trong ba trạng thái: nguyên như cũ, vắng mặt, hoặc đã khôi phục
+đầy đủ, không bao giờ nửa vời. `recover` hoàn tất rollback đó (hiển thị
+`rollback-restore`, `rollback-remove` hoặc `rollback-done` cho từng skill) rồi mới cập
+nhật `state.json`; nó từ chối nếu một skill đã bị sửa tay hoặc backup không còn khớp.

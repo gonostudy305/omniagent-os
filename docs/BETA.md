@@ -28,9 +28,10 @@ Chưa dùng ở beta:
 Điều kiện: đã backup thư mục skill và `.local/manager/`; dùng thư mục state **riêng** cho buổi thử.
 
 ```powershell
-# Khai báo một lần (sửa đường dẫn <...> cho đúng máy của bạn)
-$Src   = "<thư mục SSOT đã template hóa, ví dụ .local\experiments\templated26\source>"
-$Man   = "<adapters.json đi kèm bản template đó>"
+# Chạy từ thư mục gốc của repo. Hai đường dẫn dưới đây là bản thử nghiệm template hóa
+# đã tạo trong .local\ (không được đưa lên git); máy khác phải tự tạo bản của mình.
+$Src   = ".local\experiments\templated26\source"
+$Man   = ".local\experiments\templated26\adapters.json"
 $State = ".local\trial-state"          # state RIÊNG cho buổi thử, không dùng state mặc định
 $Agents = "$HOME\.agents\skills"
 $Skills = @("--skill","threejs","--skill","ask","--skill","preview")
@@ -55,7 +56,15 @@ python omniagent.py rollback --state-dir $State --transaction <ID> --yes
 
 `$Src` là bản sao SSOT đã chuyển đường dẫn thành placeholder (ví dụ trong `.local/experiments/`); **không** dùng SSOT thật làm nguồn khi chưa template hóa, vì state chính lưu hash của bản chưa render.
 
-Bước cuối cần làm tay: mở Codex (hoặc Claude) và gọi thử từng skill pilot để xác nhận chúng vẫn chạy.
+Bước cuối cần làm tay (tiêu chí 3): mở Codex (hoặc Claude) và gọi thử từng skill pilot để xác nhận chúng vẫn chạy.
+
+Kiểm tra chỉ-đọc đã làm trước (27/10/2026, không thay cho việc gọi skill thật): với `threejs`, `ask`, `preview` trong `~/.agents/skills` và `~/.claude/skills`, `SKILL.md` có frontmatter hợp lệ (`name`, `description`), không còn placeholder `{{...}}`, mọi file tham chiếu của `threejs` tồn tại. `preview` không chứa `scripts/server.cjs` của chính nó mà gọi script của skill `markdown-novel-viewer`, nên skill đó phải được cài; beta không quản lý `markdown-novel-viewer`. Bộ skill này chưa có trong `~/.gemini/skills`.
+
+Danh sách thử tay, đánh dấu từng dòng:
+- [ ] `threejs`: yêu cầu agent dựng một cảnh Three.js tối thiểu, agent nạp skill và dùng đúng file tham chiếu.
+- [ ] `ask`: đặt một câu hỏi kiến trúc ngắn, agent nạp skill và trả lời theo định dạng của skill.
+- [ ] `preview`: yêu cầu xem trước một file Markdown, server của `markdown-novel-viewer` khởi động và mở được trang.
+- [ ] Sau cả ba lần thử, `plan --adapter-manifest` vẫn báo `unchanged` (agent không sửa file skill).
 
 ## Khi có sự cố
 
@@ -66,9 +75,9 @@ Bước cuối cần làm tay: mở Codex (hoặc Claude) và gọi thử từng
 
 ## Giới hạn đã biết
 
-- Kiểm thử kill dùng `os._exit` trên fixture; chưa thử mất điện thật. Ghi file chưa `fsync`, nên mất điện hoặc OS crash có thể để lại journal rỗng (chặn mọi lệnh cho tới khi xử lý tay).
-- `rollback` chưa có journal riêng: nếu bị ngắt giữa chừng, bản sao lưu vẫn còn trong `.local/manager/backups/` nhưng phải khôi phục tay.
-- Thư mục junction của Windows chưa được nhận diện như symlink; không đặt junction trong SSOT hay thư mục target.
+- Kiểm thử kill dùng `os._exit` trên fixture; chưa thử mất điện thật. Nhánh `feat/v03-hardening` đã thêm `fsync` khi ghi journal và state, nhưng chưa có trong beta.1 và chưa thử mất điện thật.
+- `rollback` chưa có journal riêng ở beta.1: nếu bị ngắt giữa chừng, bản sao lưu vẫn còn trong `.local/manager/backups/` nhưng phải khôi phục tay. Nhánh `feat/v03-rollback-journal` đã thêm journal `rolling_back` và cho `recover` hoàn tất, chưa có trong beta.1.
+- Junction của Windows chỉ được nhận diện trên nhánh `feat/v03-hardening`; ở beta.1 đừng đặt junction trong SSOT hay thư mục target.
 - `recover` có thể từ chối nếu chính nó bị ngắt giữa lúc khôi phục (bản sao lưu vẫn nguyên).
 - Review độc lập (đọc code, không chạy): đã sửa 2 lỗi (ghi nhận hoàn tất trước khi dọn thư mục tạm; bản sao lưu dở không còn chặn `recover`); các điểm trên được ghi lại cho v0.3.x.
 - Số liệu audit (số file, tỷ lệ drift) quan sát trên một máy.
