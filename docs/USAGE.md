@@ -77,6 +77,9 @@ Nó **từ chối toàn bộ** nếu một skill không phải bản mới cũng
 (ví dụ đã bị sửa tay), hoặc đang có `node_modules`. Thư mục tạm `.omniagent-stage-*`
 còn sót lại chỉ được liệt kê, cần tự kiểm tra rồi xóa.
 
-Nếu máy tắt đúng giữa lúc journal chuyển sang `applied` và lúc ghi `state.json`, các skill
-đã cài đúng nội dung nhưng chưa được ghi nhận quản lý; chúng sẽ xuất hiện là
-`blocked_unmanaged`/`eligible` và có thể `adopt` lại.
+Giai đoạn cuối của `apply` là hai pha: journal chuyển sang `committing` (kèm đúng các
+bản ghi sẽ vào `state.json`), rồi ghi `state.json`, rồi journal thành `applied`. Nếu
+dừng ở giữa, `recover` **hoàn tất** (roll forward) bằng cách ghi các bản ghi đó, sau khi
+kiểm tra từng skill vẫn đúng nội dung mới; nếu một skill đã bị sửa tay thì từ chối. Cả
+`in_progress` (revert) và `committing` (hoàn tất) đều chặn `apply`/`adopt`/`rollback` cho
+tới khi chạy `recover`.

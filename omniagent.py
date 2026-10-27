@@ -452,7 +452,7 @@ def interrupted_transactions(state_dir: Path) -> list[tuple[Path, dict]]:
                 journal = json.loads(path.read_text(encoding="utf-8"))
             except ValueError as exc:
                 raise SafetyError(f"Unreadable transaction journal: {path}") from exc
-            if isinstance(journal, dict) and journal.get("status") == "in_progress":
+            if isinstance(journal, dict) and journal.get("status") in {"in_progress", "committing"}:
                 found.append((path, journal))
     return found
 
@@ -471,6 +471,27 @@ def recover(state_dir: Path, apply_changes: bool) -> list[dict]:
     with manager_lock(state_dir):
         steps: list[dict] = []
         for journal_path, journal in interrupted_transactions(state_dir):
+            if journal["status"] == "committing":
+                # Files were all replaced and verified; only the bookkeeping may lag.
+                for a in journal["actions"]:
+                    dest = Path(a["destination"])
+                    if dest.is_symlink() or not dest.is_dir():
+                        raise SafetyError(f"Cannot finish commit; destination missing: {dest}")
+                    try:
+                        digest = tree_digest(dest, source=False)
+                    except SafetyError as exc:
+                        raise SafetyError(f"Cannot finish commit; destination was changed: {dest}") from exc
+                    if digest != a["applied_hash"]:
+                        raise SafetyError(f"Cannot finish commit; destination was changed: {dest}")
+                    steps.append({"transaction": journal["transaction"], "destination": str(dest),
+                                  "action": "commit", "stage_leftovers": []})
+                if apply_changes:
+                    state = state_at(state_dir)
+                    state["managed"].update(journal["records"])
+                    save_json(state_dir / "state.json", state)
+                    journal["status"] = "applied"
+                    save_json(journal_path, journal)
+                continue
             planned = []
             for a in journal.get("actions", []):
                 dest = Path(a["destination"])
@@ -654,10 +675,9 @@ def _apply_locked(source: Path, state_dir: Path, targets: dict[str, Path],
                               "backup": str(backup) if action["status"] in {"update", "update_adopted"} else None,
                               "previous": old_records[str(dest)]})
 
-        # Save recovery journal before publishing the updated manifest.
-        journal = {"version": 1, "status": "applied", "transaction": transaction,
-                   "actions": completed}
-        save_json(state_dir / "transactions" / f"{transaction}.json", journal)
+        # Two-phase commit: journal "committing" carries the exact state records, so a
+        # crash before or during the state write can be rolled forward by `recover`.
+        records = {}
         for a in completed:
             new_record = {"source": a["source"], "hash": a["applied_hash"]}
             if adapter_manifest is not None:
@@ -666,7 +686,11 @@ def _apply_locked(source: Path, state_dir: Path, targets: dict[str, Path],
             if a["previous"] and a["previous"].get("origin") == "adopted":
                 new_record["origin"] = "adopted"
                 new_record["adopted_transaction"] = a["previous"]["adopted_transaction"]
-            state["managed"][a["destination"]] = new_record
+            records[a["destination"]] = new_record
+        journal = {"version": 1, "status": "committing", "transaction": transaction,
+                   "actions": completed, "records": records}
+        save_json(state_dir / "transactions" / f"{transaction}.json", journal)
+        state["managed"].update(records)
         save_json(state_dir / "state.json", state)
     except Exception:
         for a in reversed(completed):
@@ -682,6 +706,9 @@ def _apply_locked(source: Path, state_dir: Path, targets: dict[str, Path],
             saved["status"] = "failed_reverted"
             save_json(journal_path, saved)
         raise
+    # State is published; a failure here must not revert files. `recover` finishes it.
+    journal["status"] = "applied"
+    save_json(state_dir / "transactions" / f"{transaction}.json", journal)
     return transaction, actions
 
 

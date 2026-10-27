@@ -172,6 +172,70 @@ class RecoveryTests(unittest.TestCase):
         with self.assertRaises(SafetyError):
             omniagent.rollback(self.state, "20261026T000000Z-aaaaaaaaaaaa")
 
+    def crash_on_save(self, match):
+        real = omniagent.save_json
+
+        def fake(path, data):
+            if match(Path(path), data):
+                raise Crash()
+            return real(path, data)
+
+        return mock.patch.object(omniagent, "save_json", fake)
+
+    def test_crash_before_state_write_is_rolled_forward_for_install(self):
+        make_skill(self.source, "alpha", "a")
+        with self.crash_on_save(lambda p, d: p.name == "state.json"):
+            with self.assertRaises(Crash):
+                self.apply()
+        self.assertEqual(self.journal()["status"], "committing")
+        self.assertEqual(self.managed(), {})
+        steps = omniagent.recover(self.state, False)
+        self.assertEqual([s["action"] for s in steps], ["commit"])
+        self.assertEqual(self.managed(), {})  # preview writes nothing
+        omniagent.recover(self.state, True)
+        self.assertIn(str(self.target / "alpha"), self.managed())
+        self.assertEqual(self.journal()["status"], "applied")
+        status = {a["name"]: a["status"] for a in omniagent.plan(self.source, self.state, self.targets)}
+        self.assertEqual(status["alpha"], "unchanged")
+
+    def test_crash_before_state_write_is_rolled_forward_for_update(self):
+        skill = make_skill(self.source, "alpha", "v1")
+        self.apply()
+        (skill / "SKILL.md").write_text("---\nname: alpha\n---\nv2\n", encoding="utf-8")
+        with self.crash_on_save(lambda p, d: p.name == "state.json"):
+            with self.assertRaises(Crash):
+                self.apply()
+        # Files are v2 but state still says v1: without recovery this reads as a conflict.
+        self.assertEqual({a["name"]: a["status"] for a in omniagent.plan(self.source, self.state, self.targets)}["alpha"], "conflict")
+        omniagent.recover(self.state, True)
+        self.assertEqual({a["name"]: a["status"] for a in omniagent.plan(self.source, self.state, self.targets)}["alpha"], "unchanged")
+        self.assertEqual(omniagent.rollback(self.state, self.journal()["transaction"]), 1)
+        self.assertIn("v1", (self.target / "alpha" / "SKILL.md").read_text(encoding="utf-8"))
+
+    def test_crash_after_state_write_before_journal_applied_is_finished(self):
+        make_skill(self.source, "alpha", "a")
+        with self.crash_on_save(lambda p, d: p.parent.name == "transactions" and d.get("status") == "applied"):
+            with self.assertRaises(Crash):
+                self.apply()
+        self.assertIn(str(self.target / "alpha"), self.managed())
+        self.assertEqual(self.journal()["status"], "committing")
+        with self.assertRaises(SafetyError):
+            self.apply()
+        omniagent.recover(self.state, True)
+        self.assertEqual(self.journal()["status"], "applied")
+        self.assertEqual(omniagent.interrupted_transactions(self.state), [])
+
+    def test_commit_recovery_refuses_when_installed_copy_was_edited(self):
+        make_skill(self.source, "alpha", "a")
+        with self.crash_on_save(lambda p, d: p.name == "state.json"):
+            with self.assertRaises(Crash):
+                self.apply()
+        (self.target / "alpha" / "SKILL.md").write_text("my edit", encoding="utf-8")
+        with self.assertRaises(SafetyError):
+            omniagent.recover(self.state, True)
+        self.assertEqual(self.managed(), {})
+        self.assertEqual(self.journal()["status"], "committing")
+
     def test_successful_apply_never_leaves_in_progress_journal(self):
         make_skill(self.source, "alpha", "a")
         self.apply()
