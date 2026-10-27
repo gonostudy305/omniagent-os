@@ -55,7 +55,15 @@ python omniagent.py rollback --state-dir $State --transaction <ID> --yes
 
 `$Src` là bản sao SSOT đã chuyển đường dẫn thành placeholder (ví dụ trong `.local/experiments/`); **không** dùng SSOT thật làm nguồn khi chưa template hóa, vì state chính lưu hash của bản chưa render.
 
-Bước cuối cần làm tay: mở Codex (hoặc Claude) và gọi thử từng skill pilot để xác nhận chúng vẫn chạy.
+Bước cuối cần làm tay (tiêu chí 3): mở Codex (hoặc Claude) và gọi thử từng skill pilot để xác nhận chúng vẫn chạy.
+
+Kiểm tra chỉ-đọc đã làm trước (27/10/2026, không thay cho việc gọi skill thật): với `threejs`, `ask`, `preview` trong `~/.agents/skills` và `~/.claude/skills`, `SKILL.md` có frontmatter hợp lệ (`name`, `description`), không còn placeholder `{{...}}`, mọi file tham chiếu của `threejs` tồn tại. `preview` không chứa `scripts/server.cjs` của chính nó mà gọi script của skill `markdown-novel-viewer`, nên skill đó phải được cài; beta không quản lý `markdown-novel-viewer`. Bộ skill này chưa có trong `~/.gemini/skills`.
+
+Danh sách thử tay, đánh dấu từng dòng:
+- [ ] `threejs`: yêu cầu agent dựng một cảnh Three.js tối thiểu, agent nạp skill và dùng đúng file tham chiếu.
+- [ ] `ask`: đặt một câu hỏi kiến trúc ngắn, agent nạp skill và trả lời theo định dạng của skill.
+- [ ] `preview`: yêu cầu xem trước một file Markdown, server của `markdown-novel-viewer` khởi động và mở được trang.
+- [ ] Sau cả ba lần thử, `plan --adapter-manifest` vẫn báo `unchanged` (agent không sửa file skill).
 
 ## Khi có sự cố
 
