@@ -1,6 +1,6 @@
-# Release notes: v0.3.0-beta.1 (dự thảo, chưa phát hành)
+# Release notes: v0.3.0-beta.1
 
-Bản beta có kiểm soát cho Windows. Chưa merge PR #2 và chưa tạo tag; xem [BETA.md](BETA.md) cho tiêu chí và việc còn lại.
+Bản beta có kiểm soát cho Windows. Xem [BETA.md](BETA.md) cho tiêu chí, bằng chứng và giới hạn.
 
 ## Mới so với v0.2.0
 
@@ -16,20 +16,23 @@ Bản beta có kiểm soát cho Windows. Chưa merge PR #2 và chưa tạo tag; 
 **Độ bền giao dịch**
 - `apply` ghi journal `in_progress` trước khi đổi thư mục, rồi `committing` (kèm đúng các bản ghi state), ghi `state.json`, rồi `applied`.
 - `recover` (xem trước, `--yes`): revert giao dịch dở, hoặc hoàn tất giao dịch `committing`; từ chối nếu có bản sửa tay hay `node_modules`.
+- `rollback` ghi journal `rolling_back` và dựng lại skill từ backup ở thư mục tạm rồi đổi tên vào chỗ; `recover` hoàn tất rollback bị ngắt.
+- `fsync` journal và state trước khi đổi tên file; nhận diện junction của Windows; tên thư mục `node_modules`, `.git`, `__pycache__` không phân biệt hoa thường.
 - `apply`, `adopt`, `rollback` bị chặn cho tới khi xử lý giao dịch dở.
 
 **Khác**
 - Bỏ qua `__pycache__`, `.pyc` và `node_modules` khi đọc bản đã cài (cập nhật và rollback vẫn bị chặn nếu có `node_modules`); cho phép `.env.example/.sample/.template`.
-- 86 test (stdlib `unittest`), gồm test kill tiến trình thật và test byte-identity; CI trên Windows và Ubuntu.
+- 95 test (stdlib `unittest`), gồm test kill tiến trình thật và test byte-identity; CI trên Windows và Ubuntu.
 
 ## Kiểm chứng
 
 - Chạy thật trên 3 skill của một máy Windows (adopt vào state thử, `plan`, `rollback`): không byte nào của thư mục skill đổi.
-- Chưa kiểm chứng: skill chạy được trong Codex/Claude/Antigravity, mất điện thật, nhiều máy.
+- Chủ dự án xác nhận cả 3 skill pilot (`threejs`, `ask`, `preview`) chạy tốt trong agent thật (27/10/2026, tự báo, chưa có log).
+- Chưa kiểm chứng: Antigravity, mất điện thật, nhiều máy.
 
 ## Giới hạn và việc chưa làm
 
 - Path Adapter cần SSOT được chuyển thành template trước; SSOT hiện tại vẫn chứa đường dẫn viết cứng.
-- Độ bền khi mất điện (`fsync`), journal cho `rollback`, nhận diện junction, so khớp tên thư mục không phân biệt hoa thường: chưa làm (xem [BETA.md](BETA.md)).
+- `fsync` và journal đã có nhưng chưa thử bằng mất điện thật; `recover` bị ngắt giữa lúc khôi phục có thể cần xử lý tay (xem [BETA.md](BETA.md)).
 - 11 skill chuyển đổi dở, CRLF khi adopt, dependency hydration, shared memory và điều phối đa agent: chưa làm.
 - Skill của bên thứ ba cần rà nguồn và giấy phép trước khi công khai bất kỳ bộ skill nào.

@@ -17,9 +17,9 @@ Chưa dùng ở beta:
 
 | # | Tiêu chí | Trạng thái | Bằng chứng / việc còn lại |
 |---|---|---|---|
-| 1 | PR #2 có CI xanh và đã được review | CI xanh (Windows, Ubuntu, GitGuardian). Đã có review tự động độc lập; **chờ bạn review và quyết định merge** | Kết quả review ghi trong PR |
+| 1 | PR #2 có CI xanh và đã được review | CI xanh (Windows, Ubuntu, GitGuardian) trên cả chuỗi PR #2, #4, #5. Review độc lập là review tự động bằng đọc code (đăng trên PR #2), không phải review của người | Chủ dự án duyệt và merge |
 | 2 | Test kill tiến trình thật trên thư mục giả | Đạt | `tests/test_kill.py`: 4 kịch bản (kill khi cài, sau khi bản cũ bị dời, trước và sau khi ghi `state.json`), tiến trình con chết bằng `os._exit`, rồi `recover` |
-| 3 | Ba skill pilot hoạt động trong agent thật | **Chưa kiểm chứng** | Hash khớp chỉ chứng minh nội dung nhất quán. Bạn cần mở Codex/Claude thật và gọi thử `threejs`, `ask`, `preview` |
+| 3 | Ba skill pilot hoạt động trong agent thật | Đạt, do chủ dự án tự xác nhận (27/10/2026) | Chủ dự án báo cả 3 skill chạy tốt trong agent thật. Chưa có log hay ghi lại agent nào đã dùng; hash khớp một mình không chứng minh skill chạy |
 | 4 | Adopt và rollback không đổi byte nào | Đạt | `tests/test_byte_identity.py` (chu trình đủ bước trên fixture, kể cả thư mục rỗng) và chạy thật trên 3 skill: băm SHA-256 trước và sau, cả thư mục `~/.agents/skills` giữ nguyên số file và thời điểm sửa đổi |
 | 5 | Tài liệu, release notes, hướng dẫn khôi phục | Đạt | Trang này, [RELEASE_NOTES_v0.3.0-beta.1.md](RELEASE_NOTES_v0.3.0-beta.1.md), mục "Phục hồi" trong [USAGE.md](USAGE.md) |
 
@@ -75,11 +75,11 @@ Danh sách thử tay, đánh dấu từng dòng:
 
 ## Giới hạn đã biết
 
-- Kiểm thử kill dùng `os._exit` trên fixture; chưa thử mất điện thật. Nhánh `feat/v03-hardening` đã thêm `fsync` khi ghi journal và state, nhưng chưa có trong beta.1 và chưa thử mất điện thật.
-- `rollback` chưa có journal riêng ở beta.1: nếu bị ngắt giữa chừng, bản sao lưu vẫn còn trong `.local/manager/backups/` nhưng phải khôi phục tay. Nhánh `feat/v03-rollback-journal` đã thêm journal `rolling_back` và cho `recover` hoàn tất, chưa có trong beta.1.
-- Junction của Windows chỉ được nhận diện trên nhánh `feat/v03-hardening`; ở beta.1 đừng đặt junction trong SSOT hay thư mục target.
+- Kiểm thử kill dùng `os._exit` trên fixture; chưa thử mất điện thật. Journal và state được `fsync` trước khi đổi tên file, nhưng chưa thử mất điện thật.
+- `rollback` ghi journal `rolling_back`; nếu bị ngắt giữa chừng, `recover` hoàn tất. Đã kiểm bằng test kill tiến trình thật, chưa kiểm bằng mất điện thật.
+- Junction của Windows được nhận diện như symlink và bị từ chối trong skill.
 - `recover` có thể từ chối nếu chính nó bị ngắt giữa lúc khôi phục (bản sao lưu vẫn nguyên).
-- Review độc lập (đọc code, không chạy): đã sửa 2 lỗi (ghi nhận hoàn tất trước khi dọn thư mục tạm; bản sao lưu dở không còn chặn `recover`); các điểm trên được ghi lại cho v0.3.x.
+- Review độc lập (đọc code, không chạy): đã sửa các điểm: ghi nhận hoàn tất trước khi dọn thư mục tạm, bản sao lưu dở không chặn `recover`, `fsync`, journal cho `rollback`, junction, tên thư mục không phân biệt hoa thường. Còn lại: `recover` bị ngắt giữa lúc khôi phục có thể cần xử lý tay; danh sách tên runtime vẫn bỏ qua mọi `*.pyc` và nội dung `__pycache__`.
 - Số liệu audit (số file, tỷ lệ drift) quan sát trên một máy.
 - 11 skill của bản cài agents chuyển đổi dở: cập nhật về bản render sẽ đổi file thật, chưa được duyệt.
 - Chưa kiểm tra tương thích thực thi trên Antigravity.
