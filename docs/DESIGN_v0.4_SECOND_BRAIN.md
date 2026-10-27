@@ -70,8 +70,8 @@ Mỗi agent đăng ký MCP ở một nơi khác nhau (đã khảo sát chỉ-đ�
 | Agent | Nơi cấu hình MCP | Nơi bộ nhớ riêng |
 |---|---|---|
 | Claude Code | `~/.claude.json` (mục `mcpServers`) | `~/.claude/projects/<dự án>/memory/` (Markdown) |
-| Codex | `~/.codex/config.toml` (mục `mcp_servers`) | `~/.codex/memories_1.sqlite` (lược đồ chưa khảo sát) |
-| Antigravity/Gemini | `~/.gemini/config/mcp_config.json` | chưa xác định |
+| Codex | `~/.codex/config.toml` (mục `mcp_servers`) | `~/.codex/memories_1.sqlite` (đã khảo sát, hiện trống, xem [M0_MEMORY_SURVEY.md](M0_MEMORY_SURVEY.md)) |
+| Antigravity/Gemini | `~/.gemini/config/mcp_config.json` | `~/.gemini/antigravity*/brain/` là tạo phẩm theo từng hội thoại, không phải kiến thức đã chắt lọc; `knowledge/` trống |
 
 Đăng ký dùng chính bộ máy `plan`/`apply`/`rollback`/`recover` của v0.3: sao lưu file cấu hình trước, chỉ thêm đúng một mục, hoàn tác được. Không bao giờ in giá trị của các mục khác trong file cấu hình (chúng có thể chứa token).
 
@@ -79,7 +79,7 @@ Mỗi agent đăng ký MCP ở một nơi khác nhau (đã khảo sát chỉ-đ�
 
 | Mốc | Nội dung | Ghi vào thư mục agent thật? |
 |---|---|---|
-| M0 | Khảo sát chỉ-đọc: mỗi agent đang lưu gì, bao nhiêu, định dạng nào | Không |
+| M0 | Khảo sát chỉ-đọc: mỗi agent đang lưu gì, bao nhiêu, định dạng nào (**đã xong**, xem [M0_MEMORY_SURVEY.md](M0_MEMORY_SURVEY.md)) | Không |
 | M1 | Kho ghi chú, CLI (`propose`, `list`, `verify`), quét bí mật, test | Không |
 | M2 | Máy chủ MCP stdio dùng kho M1, test bằng client MCP giả | Không |
 | M3 | Đăng ký MCP vào từng agent qua plan/apply/rollback | Có, cần bạn duyệt từng lần |
@@ -94,6 +94,6 @@ Mỗi agent đăng ký MCP ở một nơi khác nhau (đã khảo sát chỉ-đ�
 
 ## 9. Rủi ro đã biết
 
-- Lược đồ `memories_1.sqlite` của Codex và vị trí bộ nhớ của Antigravity chưa được khảo sát; M0 phải làm trước khi cam kết nhập liệu.
+- Chỉ bộ nhớ của Claude Code là kiến thức đã chắt lọc; của Codex đang trống và của Antigravity là tạo phẩm hội thoại rất lớn có thể chứa bí mật. Giá trị ban đầu của kho chung là làm cho bộ nhớ Claude được các agent khác thấy và kiểm chứng, không phải gộp ba kho cùng cỡ.
 - Kiểm chứng tự động chỉ làm được cho bằng chứng loại file và lệnh; ghi chú dạng quyết định hay thông tin ngoài máy cần người xác nhận.
 - Một máy chủ MCP chạy cho cả ba agent là điểm lỗi chung; cần chế độ chỉ-đọc khi kho hỏng.
