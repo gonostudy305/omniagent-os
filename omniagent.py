@@ -466,7 +466,7 @@ def interrupted_transactions(state_dir: Path) -> list[tuple[Path, dict]]:
                 journal = json.loads(path.read_text(encoding="utf-8"))
             except ValueError as exc:
                 raise SafetyError(f"Unreadable transaction journal: {path}") from exc
-            if isinstance(journal, dict) and journal.get("status") in {"in_progress", "committing"}:
+            if isinstance(journal, dict) and journal.get("status") in {"in_progress", "committing", "rolling_back"}:
                 found.append((path, journal))
     return found
 
@@ -474,6 +474,78 @@ def interrupted_transactions(state_dir: Path) -> list[tuple[Path, dict]]:
 def ensure_no_interrupted(state_dir: Path) -> None:
     if interrupted_transactions(state_dir):
         raise SafetyError("An interrupted transaction exists; inspect it with 'recover' first")
+
+
+def swap_skill(dest: Path, backup: Path | None, previous_hash: str | None) -> None:
+    """Replace `dest` with a verified copy of `backup` (or just remove it).
+
+    The copy is built and verified aside, then swapped in by rename, so a kill at any
+    point leaves `dest` either as it was, missing, or complete - never half-copied.
+    """
+    stage = Path(tempfile.mkdtemp(prefix=".omniagent-stage-", dir=dest.parent))
+    try:
+        fresh = stage / "skill"
+        if backup is not None:
+            shutil.copytree(backup, fresh)
+            if tree_digest(fresh, source=False) != previous_hash:
+                raise SafetyError(f"Restore verification failed: {dest}")
+        if dest.exists():
+            dest.rename(stage / "old")
+        if backup is not None:
+            fresh.rename(dest)
+    except Exception:
+        if dest.exists():
+            shutil.rmtree(stage, ignore_errors=True)
+        raise
+    shutil.rmtree(stage, ignore_errors=True)
+
+
+def finish_rollback(state_dir: Path, journal_path: Path, journal: dict, todos: list) -> None:
+    """Carry out a rollback whose intent is journaled as `rolling_back` (idempotent)."""
+    state = state_at(state_dir)
+    for a, dest, backup, todo in reversed(todos):
+        if todo != "done":
+            swap_skill(dest, backup if todo == "restore" else None,
+                       a["previous"]["hash"] if backup is not None else None)
+    for a, dest, _, _ in todos:
+        if a["previous"]:
+            state["managed"][str(dest)] = a["previous"]
+        else:
+            state["managed"].pop(str(dest), None)
+    save_json(state_dir / "state.json", state)
+    journal["status"] = "rolled_back"
+    save_json(journal_path, journal)
+
+
+def plan_rollback_recovery(journal: dict) -> list:
+    """Classify each action of an interrupted rollback; refuse on anything unexpected."""
+    todos = []
+    for a in journal["actions"]:
+        dest = Path(a["destination"])
+        backup = Path(a["backup"]) if a.get("backup") else None
+        applied_hash = a.get("applied_hash", a["source_hash"])
+        if is_link(dest) or (dest.exists() and not dest.is_dir()):
+            raise SafetyError(f"Cannot recover; unexpected destination: {dest}")
+        if backup is not None and (not backup.is_dir()
+                                   or tree_digest(backup, source=False) != a["previous"]["hash"]):
+            raise SafetyError(f"Cannot recover; backup missing or changed: {backup}")
+        if dest.is_dir():
+            if has_vendor(dest):
+                raise SafetyError(f"Cannot recover; vendor dependencies present: {dest}")
+            try:
+                digest = tree_digest(dest, source=False)
+            except SafetyError as exc:
+                raise SafetyError(f"Cannot recover; destination was changed: {dest}") from exc
+            if digest == applied_hash:
+                todo = "restore" if backup is not None else "remove"
+            elif a["previous"] and digest == a["previous"]["hash"]:
+                todo = "done"
+            else:
+                raise SafetyError(f"Cannot recover; destination was changed: {dest}")
+        else:
+            todo = "restore" if backup is not None else "done"
+        todos.append((a, dest, backup, todo))
+    return todos
 
 
 def recover(state_dir: Path, apply_changes: bool) -> list[dict]:
@@ -505,6 +577,16 @@ def recover(state_dir: Path, apply_changes: bool) -> list[dict]:
                     save_json(state_dir / "state.json", state)
                     journal["status"] = "applied"
                     save_json(journal_path, journal)
+                continue
+            if journal["status"] == "rolling_back":
+                todos = plan_rollback_recovery(journal)
+                for a, dest, backup, todo in todos:
+                    steps.append({"transaction": journal["transaction"], "destination": str(dest),
+                                  "action": f"rollback-{todo}",
+                                  "stage_leftovers": sorted(str(x) for x in dest.parent.glob(".omniagent-stage-*"))
+                                  if dest.parent.is_dir() else []})
+                if apply_changes:
+                    finish_rollback(state_dir, journal_path, journal, todos)
                 continue
             planned = []
             for a in journal.get("actions", []):
@@ -775,18 +857,12 @@ def _rollback_locked(state_dir: Path, transaction: str) -> int:
         if a["backup"] and (not Path(a["backup"]).is_dir()
                             or tree_digest(Path(a["backup"]), source=False) != a["previous"]["hash"]):
             raise SafetyError(f"Cannot roll back; backup missing or changed: {a['backup']}")
-    for a in reversed(actions):
-        dest = Path(a["destination"])
-        remove_managed(dest)
-        if a["backup"]:
-            shutil.copytree(a["backup"], dest)
-        if a["previous"]:
-            state["managed"][str(dest)] = a["previous"]
-        else:
-            state["managed"].pop(str(dest), None)
-    save_json(state_dir / "state.json", state)
-    journal["status"] = "rolled_back"
+    # Journal the intent before touching any skill; `recover` finishes it after a crash.
+    journal["status"] = "rolling_back"
     save_json(journal_path, journal)
+    todos = [(a, Path(a["destination"]), Path(a["backup"]) if a["backup"] else None,
+              "restore" if a["backup"] else "remove") for a in actions]
+    finish_rollback(state_dir, journal_path, journal, todos)
     return len(actions)
 
 
