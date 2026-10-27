@@ -403,6 +403,7 @@ def adopt(source: Path, state_dir: Path, targets: dict[str, Path],
           adapter_module=None) -> tuple[str | None, list[dict]]:
     """Record exactly matching existing skills as adopted; never touch target files."""
     with manager_lock(state_dir):
+        ensure_no_interrupted(state_dir)
         actions = adoption_plan(source, state_dir, targets, selected,
                                 adapter_manifest, adapter_module)
         eligible = [a for a in actions if a["status"] in {"eligible", "eligible_rendered"}]
@@ -439,6 +440,86 @@ def adopt(source: Path, state_dir: Path, targets: dict[str, Path],
             save_json(journal_path, journal)
             raise
         return transaction, actions
+
+
+def interrupted_transactions(state_dir: Path) -> list[tuple[Path, dict]]:
+    """Journals left in_progress by a crashed or killed apply."""
+    found = []
+    directory = state_dir / "transactions"
+    if directory.is_dir():
+        for path in sorted(directory.glob("*.json")):
+            try:
+                journal = json.loads(path.read_text(encoding="utf-8"))
+            except ValueError as exc:
+                raise SafetyError(f"Unreadable transaction journal: {path}") from exc
+            if isinstance(journal, dict) and journal.get("status") == "in_progress":
+                found.append((path, journal))
+    return found
+
+
+def ensure_no_interrupted(state_dir: Path) -> None:
+    if interrupted_transactions(state_dir):
+        raise SafetyError("An interrupted transaction exists; inspect it with 'recover' first")
+
+
+def recover(state_dir: Path, apply_changes: bool) -> list[dict]:
+    """Return interrupted applies to their pre-transaction state, or preview doing so.
+
+    Fails closed: if any skill is neither the new content nor the recorded
+    previous content (for example edited by hand), nothing is changed.
+    """
+    with manager_lock(state_dir):
+        steps: list[dict] = []
+        for journal_path, journal in interrupted_transactions(state_dir):
+            planned = []
+            for a in journal.get("actions", []):
+                dest = Path(a["destination"])
+                previous = a.get("previous")
+                backup = Path(a["backup"]) if a.get("backup") else None
+                if dest.is_symlink() or (dest.exists() and not dest.is_dir()):
+                    raise SafetyError(f"Cannot recover; unexpected destination: {dest}")
+                if backup is not None and backup.exists():
+                    if tree_digest(backup, source=False) != previous["hash"]:
+                        raise SafetyError(f"Cannot recover; backup changed: {backup}")
+                if dest.is_dir():
+                    if has_vendor(dest):
+                        raise SafetyError(f"Cannot recover; vendor dependencies present: {dest}")
+                    try:
+                        digest = tree_digest(dest, source=False)
+                    except SafetyError as exc:
+                        raise SafetyError(f"Cannot recover; destination was changed: {dest}") from exc
+                    if digest == a["applied_hash"]:
+                        if backup is not None and not backup.is_dir():
+                            raise SafetyError(f"Cannot recover; backup missing: {backup}")
+                        action = "revert"
+                    elif previous and digest == previous["hash"]:
+                        action = "untouched"
+                    else:
+                        raise SafetyError(f"Cannot recover; destination was changed: {dest}")
+                elif backup is not None:
+                    if not backup.is_dir():
+                        raise SafetyError(f"Cannot recover; backup missing: {backup}")
+                    action = "restore"
+                else:
+                    action = "untouched"
+                planned.append((a, dest, backup, action))
+            for a, dest, backup, action in planned:
+                steps.append({"transaction": journal["transaction"], "destination": str(dest),
+                              "action": action,
+                              "stage_leftovers": sorted(str(p) for p in dest.parent.glob(".omniagent-stage-*"))
+                              if dest.parent.is_dir() else []})
+            if not apply_changes:
+                continue
+            for a, dest, backup, action in planned:
+                if action == "revert":
+                    remove_managed(dest)
+                if action in {"revert", "restore"} and backup is not None:
+                    shutil.copytree(backup, dest)
+                    if tree_digest(dest, source=False) != a["previous"]["hash"]:
+                        raise SafetyError(f"Restore verification failed: {dest}")
+            journal["status"] = "recovered_reverted"
+            save_json(journal_path, journal)
+        return steps
 
 
 def copy_skill(source: Path, destination: Path, expected_hash: str) -> None:
@@ -493,6 +574,7 @@ def _apply_locked(source: Path, state_dir: Path, targets: dict[str, Path],
                   selected: set[str] | None, skip_blocked: bool,
                   allow_update_adopted: bool, adapter_manifest: dict | None = None,
                   adapter_module=None) -> tuple[str | None, list[dict]]:
+    ensure_no_interrupted(state_dir)
     if adapter_manifest is not None:
         if adapter_module is None:
             raise SafetyError("Rendered apply requires a validated adapter module")
@@ -519,6 +601,13 @@ def _apply_locked(source: Path, state_dir: Path, targets: dict[str, Path],
     transaction = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:12]
     backup_dir = state_dir / "backups" / transaction
     backup_dir.mkdir(parents=True, exist_ok=False)
+    # Intent journal first: a crash mid-apply leaves status "in_progress" for `recover`.
+    planned = [{"destination": a["destination"], "name": a["name"], "target": a["target"],
+                "status": a["status"], "applied_hash": a.get("render_hash", a["source_hash"]),
+                "backup": str(backup_dir / str(index)) if a["status"] in {"update", "update_adopted"} else None,
+                "previous": old_records[a["destination"]]} for index, a in enumerate(changed)]
+    save_json(state_dir / "transactions" / f"{transaction}.json",
+              {"version": 1, "status": "in_progress", "transaction": transaction, "actions": planned})
     completed = []
     try:
         for index, action in enumerate(changed):
@@ -604,6 +693,7 @@ def rollback(state_dir: Path, transaction: str) -> int:
 def _rollback_locked(state_dir: Path, transaction: str) -> int:
     if not TRANSACTION_ID.fullmatch(transaction):
         raise SafetyError("Invalid transaction ID")
+    ensure_no_interrupted(state_dir)
     journal_path = state_dir / "transactions" / f"{transaction}.json"
     journal = read_json(journal_path, {})
     if journal.get("status") != "applied" or journal.get("transaction") != transaction:
@@ -713,12 +803,23 @@ def cli(argv: list[str] | None = None) -> int:
                               help="also recognise folders equal to the per-agent rendered skill")
             part.add_argument("--yes", action="store_true", help="record exact matches in private state")
             part.add_argument("--diff", action="store_true", help="show local SKILL.md diff for one selected mismatch")
+    fix = sub.add_parser("recover", help="revert an apply that was interrupted (preview unless --yes)")
+    fix.add_argument("--state-dir", type=Path, default=DEFAULT_STATE)
+    fix.add_argument("--yes", action="store_true", help="perform the reversion")
     undo = sub.add_parser("rollback")
     undo.add_argument("--state-dir", type=Path, default=DEFAULT_STATE)
     undo.add_argument("--transaction", required=True)
     undo.add_argument("--yes", action="store_true")
     args = parser.parse_args(argv)
     try:
+        if args.command == "recover":
+            steps = recover(args.state_dir.expanduser().absolute(), args.yes)
+            for s in steps:
+                print(f"{s['transaction']}  {s['action']:10} {s['destination']}")
+                for leftover in s["stage_leftovers"]:
+                    print(f"  leftover staging folder (inspect, then delete manually): {leftover}")
+            print(f"{len(steps)} step(s) " + ("reverted" if args.yes else "previewed; rerun with --yes to apply"))
+            return 0
         if args.command == "rollback":
             if not args.yes:
                 raise SafetyError("Rollback modifies skill folders; rerun with --yes")

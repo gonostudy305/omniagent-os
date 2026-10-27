@@ -66,3 +66,22 @@ Trạng thái sau cùng (theo `plan`): claude 177 được quản lý + 4 chưa 
 4. **Journal phục hồi** khi máy tắt đột ngột giữa lúc ghi.
 5. **Shared Brain** qua MCP (xác định chủ sở hữu từng phần cấu hình để không ghi đè nhau), rồi mới tới điều phối đa agent.
 6. Merge PR #1 sau khi review mã và thử trên Windows thật.
+
+## Template hóa nhóm 26 skill chỉ khác đường dẫn (sandbox, chỉ đọc)
+
+Trong bản sao `.local/experiments/` (không đụng SSOT thật), áp dụng hai luật thay
+(`.claude/skills` thành `{{SKILLS_DIR}}`, rồi `.claude/` còn lại thành
+`{{AGENT_CONFIG_DIR}}`), sau đó render và so với thư mục thật bằng Path Adapter:
+
+| Kho | match | drift |
+|---|---|---|
+| claude | 26 | 0 |
+| agents | 15 | 11 |
+
+- claude 26/26: bản render đúng bằng bản đang cài, nên việc template hóa không làm đổi nội dung bên claude.
+- agents 15/26 khớp từng byte, nên đủ điều kiện `adopt --adapter-manifest` (chỉ ghi state).
+- 11 skill còn lại lệch vì **bản cài của agents chuyển đổi chưa nhất quán**: một số file đã đổi sang `.agents/...`/`.Codex/...`, một số file khác trong cùng skill vẫn còn `.claude/...`. Bản render là bản nhất quán, nên đưa 11 skill này về bản render là một `update` làm thay đổi file thật, cần xác nhận riêng, không phải `adopt`.
+
+## Phục hồi giao dịch bị ngắt (v0.3d)
+
+`apply` ghi journal `in_progress` trước khi đổi thư mục; lệnh `recover` (xem trước, `--yes` để thực hiện) đưa về trạng thái trước giao dịch và từ chối nếu có bản sửa tay hay `node_modules`. `apply`/`adopt`/`rollback` bị chặn khi còn giao dịch dở. 7 test mô phỏng crash (cài, thay thế sau khi bản cũ đã bị dời, trước khi thay, bị sửa tay, có `node_modules`, chặn lệnh khác, giao dịch thành công không để lại journal dở). Chưa kiểm thử với kill tiến trình thật hay mất điện thật.

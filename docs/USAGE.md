@@ -58,3 +58,25 @@ Kết quả chứa đường dẫn máy và tên skill thật, nên nằm trong 
 ```powershell
 python -I -m unittest discover -s tests
 ```
+
+## Phục hồi giao dịch bị ngắt giữa chừng
+
+Trước khi `apply` thay đổi bất kỳ thư mục nào, nó ghi một journal ở trạng thái
+`in_progress` trong `.local/manager/transactions/`. Nếu máy tắt hoặc tiến trình bị
+dừng giữa chừng, journal này còn lại. Khi đó `apply`, `adopt` và `rollback` đều từ
+chối chạy cho tới khi xử lý xong:
+
+```powershell
+python omniagent.py recover            # xem trước, không ghi gì
+python omniagent.py recover --yes      # đưa về trạng thái trước giao dịch
+```
+
+Với mỗi skill, `recover` phân loại: `revert` (đã cài bản mới, xóa và khôi phục từ
+backup), `restore` (bản cũ đã bị dời đi, khôi phục từ backup), `untouched` (chưa đổi).
+Nó **từ chối toàn bộ** nếu một skill không phải bản mới cũng không phải bản trước đó
+(ví dụ đã bị sửa tay), hoặc đang có `node_modules`. Thư mục tạm `.omniagent-stage-*`
+còn sót lại chỉ được liệt kê, cần tự kiểm tra rồi xóa.
+
+Nếu máy tắt đúng giữa lúc journal chuyển sang `applied` và lúc ghi `state.json`, các skill
+đã cài đúng nội dung nhưng chưa được ghi nhận quản lý; chúng sẽ xuất hiện là
+`blocked_unmanaged`/`eligible` và có thể `adopt` lại.
