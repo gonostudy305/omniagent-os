@@ -16,6 +16,7 @@ import sys
 from pathlib import Path, PurePosixPath
 
 from omniagent import (
+    is_link,
     DEFAULT_SOURCE,
     DEFAULT_STATE,
     SKILL_NAME,
@@ -52,7 +53,7 @@ def _check_relpath(value: str) -> None:
 
 
 def load_manifest(path: Path) -> dict:
-    if path.is_symlink() or not path.is_file():
+    if is_link(path) or not path.is_file():
         raise SafetyError(f"Missing or linked adapter manifest: {path}")
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
@@ -151,13 +152,13 @@ def adapter_plan(source: Path, state_dir: Path, targets: dict[str, Path], manife
         if selected is not None and name not in selected:
             continue
         skill_dir = source / name
-        if skill_dir.is_symlink() or not skill_dir.is_dir():
+        if is_link(skill_dir) or not skill_dir.is_dir():
             raise SafetyError(f"Missing canonical skill: {skill_dir}")
         for agent, root in targets.items():
             digest, rendered = rendered_skill(skill_dir, config["files"], manifest["targets"][agent],
                                         config.get("ignore_placeholders"))
             dest = root / name
-            if dest.is_symlink() or (dest.exists() and not dest.is_dir()):
+            if is_link(dest) or (dest.exists() and not dest.is_dir()):
                 status = "unsafe"
             elif not dest.exists():
                 status = "missing"
@@ -185,7 +186,7 @@ def render_aware_plan(source: Path, state_dir: Path, targets: dict[str, Path],
         if agent not in manifest["targets"]:
             raise SafetyError(f"No adapter variables configured for target: {agent}")
     for skill in manifest["skills"]:
-        if not (source / skill / "SKILL.md").is_file() or (source / skill).is_symlink():
+        if not (source / skill / "SKILL.md").is_file() or is_link((source / skill)):
             raise SafetyError(f"Missing canonical templated skill: {source / skill}")
 
     managed = state_at(state_dir)["managed"]
@@ -204,7 +205,7 @@ def render_aware_plan(source: Path, state_dir: Path, targets: dict[str, Path],
 
         dest = Path(item["destination"])
         installed_hash = None
-        if dest.is_dir() and not dest.is_symlink():
+        if dest.is_dir() and not is_link(dest):
             try:
                 installed_hash = tree_digest(dest, source=False)
             except (SafetyError, OSError):
@@ -243,7 +244,7 @@ def show_diff(entry: dict) -> None:
     dest = Path(entry["destination"])
     for relative, expected in entry["rendered_files"].items():
         actual_file = dest / relative
-        if (not actual_file.is_file() or actual_file.is_symlink() or
+        if (not actual_file.is_file() or is_link(actual_file) or
                 actual_file.stat().st_size > MAX_DIFF_BYTES or len(expected) > MAX_DIFF_BYTES):
             print(f"{relative}: missing, linked, or too large; inspect manually")
             continue

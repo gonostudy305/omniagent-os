@@ -45,16 +45,28 @@ class SafetyError(Exception):
     """Refuse to modify files when the operation cannot be proven safe."""
 
 
+def is_link(path: Path) -> bool:
+    """Symlink or Windows junction/reparse point; both can point outside the tree."""
+    if path.is_symlink():
+        return True
+    if os.name == "nt":
+        try:
+            return bool(os.lstat(path).st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT)
+        except OSError:
+            return False
+    return False
+
+
 def within(path: Path, parent: Path) -> bool:
     return path == parent or parent in path.parents
 
 
 def validate_layout(source: Path, state_dir: Path, targets: dict[str, Path]) -> None:
-    if not source.is_dir() or source.is_symlink():
+    if not source.is_dir() or is_link(source):
         raise SafetyError(f"Source directory is missing or is a symlink: {source}")
     source_abs, state_abs = source.resolve(), state_dir.resolve()
     for name, root in targets.items():
-        if root.is_symlink():
+        if is_link(root):
             raise SafetyError(f"Target root is a symlink: {root}")
         target_abs = root.resolve()
         if (within(source_abs, target_abs) or within(target_abs, source_abs)
@@ -84,20 +96,20 @@ def parse_targets(values: list[str] | None) -> dict[str, Path]:
 
 
 def skill_files(skill: Path, *, source: bool = True) -> list[tuple[str, Path]]:
-    if skill.is_symlink() or not skill.is_dir() or not (skill / "SKILL.md").is_file():
+    if is_link(skill) or not skill.is_dir() or not (skill / "SKILL.md").is_file():
         raise SafetyError(f"Invalid skill directory: {skill}")
     files: list[tuple[str, Path]] = []
     for root, dirs, names in os.walk(skill, followlinks=False):
         root_path = Path(root)
         for dirname in list(dirs):
             subdir = root_path / dirname
-            if dirname in EXCLUDED_DIRS and source:
+            if dirname.lower() in EXCLUDED_DIRS and source:
                 dirs.remove(dirname)
-            elif not source and dirname in RUNTIME_DIRS:
+            elif not source and dirname.lower() in RUNTIME_DIRS:
                 dirs.remove(dirname)
-            elif subdir.is_symlink():
+            elif is_link(subdir):
                 raise SafetyError(f"Symlink in skill source is not allowed: {subdir}")
-            elif dirname in EXCLUDED_DIRS:
+            elif dirname.lower() in EXCLUDED_DIRS:
                 raise SafetyError(f"Extra directory in managed copy: {subdir}")
         for name in names:
             path = root_path / name
@@ -106,7 +118,7 @@ def skill_files(skill: Path, *, source: bool = True) -> list[tuple[str, Path]]:
             if (name.lower() in SECRET_FILES or (name.lower().startswith(".env.") and name.lower() not in ENV_TEMPLATES)
                     or path.suffix.lower() in {".pem", ".key", ".token"}):
                 raise SafetyError(f"Potential credentials in source; inspect manually: {path}")
-            if path.is_symlink() or not stat.S_ISREG(path.stat().st_mode):
+            if is_link(path) or not stat.S_ISREG(path.stat().st_mode):
                 raise SafetyError(f"Non-regular file in skill: {path}")
             files.append((path.relative_to(skill).as_posix(), path))
     return sorted(files, key=lambda item: item[0])
@@ -119,11 +131,11 @@ def skill_directories(skill: Path, *, source: bool = True) -> list[str]:
         root_path = Path(root)
         for name in list(dirs):
             path = root_path / name
-            if name in EXCLUDED_DIRS and source:
+            if name.lower() in EXCLUDED_DIRS and source:
                 dirs.remove(name)
-            elif not source and name in RUNTIME_DIRS:
+            elif not source and name.lower() in RUNTIME_DIRS:
                 dirs.remove(name)
-            elif path.is_symlink() or name in EXCLUDED_DIRS:
+            elif is_link(path) or name.lower() in EXCLUDED_DIRS:
                 raise SafetyError(f"Unexpected directory or symlink: {path}")
             else:
                 result.append(path.relative_to(skill).as_posix())
@@ -148,14 +160,14 @@ def tree_digest(skill: Path, *, source: bool = True) -> str:
 
 def has_vendor(skill: Path) -> bool:
     """True if an installed copy holds node_modules, which update/rollback would delete."""
-    return any("node_modules" in dirs for _, dirs, _ in os.walk(skill, followlinks=False))
+    return any(d.lower() == "node_modules" for _, dirs, _ in os.walk(skill, followlinks=False) for d in dirs)
 
 
 def sources_at(source: Path) -> dict[str, tuple[Path, str]]:
     result = {}
     names_lower = set()
     for path in sorted(source.iterdir()):
-        if path.is_symlink():
+        if is_link(path):
             raise SafetyError(f"Symlink at source root is not allowed: {path}")
         if not path.is_dir() or not (path / "SKILL.md").exists():
             continue
@@ -182,6 +194,8 @@ def save_json(path: Path, data: dict) -> None:
         temp_path = Path(handle.name)
         json.dump(data, handle, indent=2, ensure_ascii=False)
         handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())  # a power cut must not leave an empty journal behind
     os.replace(temp_path, path)
 
 
@@ -297,7 +311,7 @@ def plan(source: Path, state_dir: Path, targets: dict[str, Path],
             dest = root / name
             key = str(dest)
             record = manifest.get(key)
-            if dest.is_symlink() or (dest.exists() and not dest.is_dir()):
+            if is_link(dest) or (dest.exists() and not dest.is_dir()):
                 status = "blocked"
             elif dest.exists():
                 if not record or record.get("source") != str(skill_dir.resolve()):
@@ -379,8 +393,8 @@ def show_adoption_diff(item: dict) -> None:
         return
     source = Path(item["source"]) / "SKILL.md"
     target = Path(item["destination"]) / "SKILL.md"
-    if (not source.is_file() or source.is_symlink() or not target.is_file()
-            or target.is_symlink() or source.stat().st_size > 1_000_000
+    if (not source.is_file() or is_link(source) or not target.is_file()
+            or is_link(target) or source.stat().st_size > 1_000_000
             or target.stat().st_size > 1_000_000):
         print("SKILL.md missing, linked, or too large; inspect manually")
         return
@@ -414,7 +428,7 @@ def adopt(source: Path, state_dir: Path, targets: dict[str, Path],
         for item in eligible:
             dest = Path(item["destination"])
             expected = item["render_hash"] if item["status"] == "eligible_rendered" else item["source_hash"]
-            if dest.is_symlink() or not dest.is_dir() or tree_digest(dest, source=False) != expected:
+            if is_link(dest) or not dest.is_dir() or tree_digest(dest, source=False) != expected:
                 raise SafetyError(f"Skill changed during adoption; no state written: {dest}")
         state = state_at(state_dir)
         if any(item["destination"] in state["managed"] for item in eligible):
@@ -475,7 +489,7 @@ def recover(state_dir: Path, apply_changes: bool) -> list[dict]:
                 # Files were all replaced and verified; only the bookkeeping may lag.
                 for a in journal["actions"]:
                     dest = Path(a["destination"])
-                    if dest.is_symlink() or not dest.is_dir():
+                    if is_link(dest) or not dest.is_dir():
                         raise SafetyError(f"Cannot finish commit; destination missing: {dest}")
                     try:
                         digest = tree_digest(dest, source=False)
@@ -497,7 +511,7 @@ def recover(state_dir: Path, apply_changes: bool) -> list[dict]:
                 dest = Path(a["destination"])
                 previous = a.get("previous")
                 backup = Path(a["backup"]) if a.get("backup") else None
-                if dest.is_symlink() or (dest.exists() and not dest.is_dir()):
+                if is_link(dest) or (dest.exists() and not dest.is_dir()):
                     raise SafetyError(f"Cannot recover; unexpected destination: {dest}")
                 dest_is_previous = False
                 if dest.is_dir() and previous and not has_vendor(dest):
@@ -581,7 +595,7 @@ def copy_rendered_skill(source: Path, destination: Path, source_hash: str,
 
 
 def remove_managed(path: Path) -> None:
-    if path.is_symlink() or not path.is_dir():
+    if is_link(path) or not path.is_dir():
         raise SafetyError(f"Refusing to remove unexpected destination: {path}")
     shutil.rmtree(path)
 
@@ -642,13 +656,13 @@ def _apply_locked(source: Path, state_dir: Path, targets: dict[str, Path],
             source_path = Path(action["source"])
             dest.parent.mkdir(parents=True, exist_ok=True)
             # Recheck immediately before mutating, including changes since plan.
-            if action["status"] == "install" and (dest.exists() or dest.is_symlink()):
+            if action["status"] == "install" and (dest.exists() or is_link(dest)):
                 raise SafetyError(f"Destination appeared since planning: {dest}")
             if action["status"] in {"update", "update_adopted"}:
                 if adapter_manifest is None and "rendered_for" in old_records[str(dest)]:
                     raise SafetyError(f"Rendered skill requires --adapter-manifest: {dest}")
                 prior_hash = old_records[str(dest)]["hash"]
-                if not dest.is_dir() or dest.is_symlink() or tree_digest(dest, source=False) != prior_hash:
+                if not dest.is_dir() or is_link(dest) or tree_digest(dest, source=False) != prior_hash:
                     raise SafetyError(f"Managed skill changed since planning: {dest}")
                 # Runtime files are ignored by hashes. Recheck immediately
                 # before replacement so late-added vendor data is never lost.
@@ -702,7 +716,7 @@ def _apply_locked(source: Path, state_dir: Path, targets: dict[str, Path],
     except Exception:
         for a in reversed(completed):
             dest = Path(a["destination"])
-            if (dest.is_dir() and not dest.is_symlink()
+            if (dest.is_dir() and not is_link(dest)
                     and tree_digest(dest, source=False) == a.get("applied_hash", a["source_hash"])):
                 remove_managed(dest)
                 if a["backup"]:
@@ -752,7 +766,7 @@ def _rollback_locked(state_dir: Path, transaction: str) -> int:
     for a in actions:
         dest = Path(a["destination"])
         applied_hash = a.get("applied_hash", a["source_hash"])
-        if (dest.is_symlink() or not dest.is_dir() or has_vendor(dest)
+        if (is_link(dest) or not dest.is_dir() or has_vendor(dest)
                 or tree_digest(dest, source=False) != applied_hash
                 or state["managed"].get(str(dest), {}).get("hash") != applied_hash
                 or state["managed"].get(str(dest), {}).get("source") != a["source"]
@@ -778,11 +792,11 @@ def _rollback_locked(state_dir: Path, transaction: str) -> int:
 
 def discover(source: Path, targets: dict[str, Path]) -> None:
     """Read-only inventory; works on a fresh clone with no SSOT yet."""
-    if source.is_dir() and not source.is_symlink():
+    if source.is_dir() and not is_link(source):
         skills = sources_at(source)
         print(f"source     {len(skills):4} skills  {source}")
         for folder in sorted(source.iterdir()):
-            if folder.is_dir() and not folder.is_symlink() and not (folder / "SKILL.md").is_file():
+            if folder.is_dir() and not is_link(folder) and not (folder / "SKILL.md").is_file():
                 print(f"WARNING: source folder ignored (missing SKILL.md): {folder.name}")
     else:
         print(f"source        (not initialized)  {source}")

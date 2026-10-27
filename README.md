@@ -198,6 +198,17 @@ existing agent stores yet.
 - [ ] Phase 7: Multi-agent coordination: handoff, context sharing, permissions and conflict avoidance (git worktrees).
 - [ ] Phase 8: Windows Local Agent OS v1.0: installer/CLI, dependency hydration, health checks, onboarding and release testing.
 
+### Phase và phiên bản
+
+| Phiên bản | Phase trong lộ trình | Nội dung | Trạng thái |
+|---|---|---|---|
+| v0.2.0 | 4a | Skill Manager MVP | Đã phát hành (tag `v0.2.0`) |
+| v0.3.0-beta.1 | 4b | Path Adapter, adopt theo adapter, phục hồi giao dịch | PR #2 (Draft), chờ pilot trong agent thật |
+| v0.3.x | 4b còn lại, 5 | Hòa giải skill lệch, hydration dependency | Chưa bắt đầu |
+| v0.4 | 6 | Shared Second Brain qua MCP | Chưa bắt đầu |
+| v0.5 | 7 | Điều phối nhiều agent | Chưa bắt đầu |
+| v1.0 | 8 | Windows Local Agent OS | Chưa bắt đầu |
+
 ---
 
 ## 📄 License

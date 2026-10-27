@@ -75,9 +75,9 @@ Danh sách thử tay, đánh dấu từng dòng:
 
 ## Giới hạn đã biết
 
-- Kiểm thử kill dùng `os._exit` trên fixture; chưa thử mất điện thật. Ghi file chưa `fsync`, nên mất điện hoặc OS crash có thể để lại journal rỗng (chặn mọi lệnh cho tới khi xử lý tay).
+- Kiểm thử kill dùng `os._exit` trên fixture; chưa thử mất điện thật. Nhánh `feat/v03-hardening` đã thêm `fsync` khi ghi journal và state, nhưng chưa có trong beta.1 và chưa thử mất điện thật.
 - `rollback` chưa có journal riêng: nếu bị ngắt giữa chừng, bản sao lưu vẫn còn trong `.local/manager/backups/` nhưng phải khôi phục tay.
-- Thư mục junction của Windows chưa được nhận diện như symlink; không đặt junction trong SSOT hay thư mục target.
+- Junction của Windows chỉ được nhận diện trên nhánh `feat/v03-hardening`; ở beta.1 đừng đặt junction trong SSOT hay thư mục target.
 - `recover` có thể từ chối nếu chính nó bị ngắt giữa lúc khôi phục (bản sao lưu vẫn nguyên).
 - Review độc lập (đọc code, không chạy): đã sửa 2 lỗi (ghi nhận hoàn tất trước khi dọn thư mục tạm; bản sao lưu dở không còn chặn `recover`); các điểm trên được ghi lại cho v0.3.x.
 - Số liệu audit (số file, tỷ lệ drift) quan sát trên một máy.
