@@ -28,32 +28,38 @@ Chưa dùng ở beta:
 Điều kiện: đã backup thư mục skill và `.local/manager/`; dùng thư mục state **riêng** cho buổi thử.
 
 ```powershell
+# Khai báo một lần (sửa đường dẫn <...> cho đúng máy của bạn)
+$Src   = "<thư mục SSOT đã template hóa, ví dụ .local\experiments\templated26\source>"
+$Man   = "<adapters.json đi kèm bản template đó>"
+$State = ".local\trial-state"          # state RIÊNG cho buổi thử, không dùng state mặc định
+$Agents = "$HOME\.agents\skills"
+$Skills = @("--skill","threejs","--skill","ask","--skill","preview")
+
 # 0. Test
 python -I -m unittest discover -s tests
 
 # 1. Xem trước (chỉ đọc): ba skill nên là eligible_rendered
-python omniagent.py adopt --source <SSOT_template> --state-dir .local\trial-state `
-  --target "agents=$HOME\.agents\skills" --adapter-manifest <adapters.json> `
-  --skill threejs --skill ask --skill preview
+python omniagent.py adopt --source $Src --state-dir $State --target "agents=$Agents" --adapter-manifest $Man @Skills
 
 # 2. Ghi nhận vào state thử (không sửa file skill)
-python omniagent.py adopt ... --yes
+python omniagent.py adopt --source $Src --state-dir $State --target "agents=$Agents" --adapter-manifest $Man @Skills --yes
+# Ghi lại mã giao dịch in ra ("Adoption transaction: <ID>")
 
-# 3. Kiểm tra: plan thường -> blocked_rendered; plan có manifest -> unchanged
-python omniagent.py plan --source <SSOT_template> --state-dir .local\trial-state `
-  --target "agents=$HOME\.agents\skills" --adapter-manifest <adapters.json> --skill threejs
+# 3. Kiểm tra: plan có manifest -> unchanged; plan thường -> blocked_rendered
+python omniagent.py plan --source $Src --state-dir $State --target "agents=$Agents" --adapter-manifest $Man @Skills
+python omniagent.py plan --source $Src --state-dir $State --target "agents=$Agents" @Skills
 
-# 4. Hoàn tác ghi nhận
-python omniagent.py rollback --state-dir .local\trial-state --transaction <ID> --yes
+# 4. Hoàn tác ghi nhận (thay <ID> bằng mã ở bước 2)
+python omniagent.py rollback --state-dir $State --transaction <ID> --yes
 ```
 
-`<SSOT_template>` là bản sao SSOT đã chuyển đường dẫn thành placeholder (ví dụ trong `.local/experiments/`); **không** dùng SSOT thật làm nguồn khi chưa template hóa, vì state chính lưu hash của bản chưa render.
+`$Src` là bản sao SSOT đã chuyển đường dẫn thành placeholder (ví dụ trong `.local/experiments/`); **không** dùng SSOT thật làm nguồn khi chưa template hóa, vì state chính lưu hash của bản chưa render.
 
 Bước cuối cần làm tay: mở Codex (hoặc Claude) và gọi thử từng skill pilot để xác nhận chúng vẫn chạy.
 
 ## Khi có sự cố
 
-1. Công cụ báo "An interrupted transaction exists": chạy `python omniagent.py recover` (xem trước), rồi `--yes`. Xem [USAGE.md](USAGE.md#phục-hồi-giao-dịch-bị-ngắt-giữa-chừng).
+1. Công cụ báo "An interrupted transaction exists": chạy `python omniagent.py recover --state-dir .local\trial-state` (chỉ xem trước; nhớ chỉ rõ state đang dùng, nếu không lệnh sẽ nhìn vào state mặc định). Kiểm tra kết quả và bản sao lưu, rồi mới thêm `--yes`. Xem [USAGE.md](USAGE.md#phục-hồi-giao-dịch-bị-ngắt-giữa-chừng).
 2. `recover` từ chối: có skill bị sửa tay hoặc có `node_modules`. Không có gì bị thay đổi; xử lý tay rồi chạy lại.
 3. Muốn quay về hoàn toàn: khôi phục từ backup trước buổi thử và xóa thư mục state thử.
 4. Báo lỗi: kèm lệnh đã chạy và đầu ra, **không** đính kèm nội dung skill hay state (có thể chứa đường dẫn và tên riêng).
