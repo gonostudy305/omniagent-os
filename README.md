@@ -52,7 +52,7 @@ flowchart TD
 
 - **Single Source of Truth (SSOT):** Maintain one canonical copy of skills to eliminate redundant copies across agent directories.
 - **Safe Skill Manager MVP:** Inventory, plan, copy, update, and roll back *managed* skill copies. Existing unmanaged skills are never replaced automatically.
-- **Smart Path Decoupling (planned):** Future per-agent adapters will replace brittle hardcoded paths (`.claude/...`, `.agents/...`) with portable references or generated renderers.
+- **Smart Path Decoupling (v0.3 Draft):** `path_adapter.py` previews explicitly templated references (`{{SKILLS_DIR}}`) and verifies hashes per agent. A guarded, one-skill/one-target rendered `apply` is available for disposable fixtures only; ordinary `apply` refuses to overwrite managed rendered copies without a manifest.
 - **Clean Source & Reproducible Dependencies:** Keeps repository source free of committed vendor packages (`node_modules`), with planned hydration scripts for skills requiring local runtime environments.
 - **Preserved System Runtimes:** Safely isolates vendor-specific runtimes (e.g., OpenAI `.system` skills) without polluting cross-agent tool registries.
 - **Audit & Validation Tooling:** Built-in Python scripts to audit, deduplicate, and verify parity across all local agent installations.
@@ -68,6 +68,8 @@ flowchart TD
 ├── audit_skills.py           # Fast SHA-256 hash & line-level unified diff auditor
 ├── generate_report.py        # Generates markdown audit reports
 ├── omniagent.py              # Safe discover / plan / adopt / apply / rollback CLI
+├── path_adapter.py           # Read-only v0.3 per-agent template preview
+├── adapters.example.json     # Public example; private manifest belongs in .local/
 ├── tests/                    # Synthetic audit and Skill Manager safety tests
 ├── SKILLS_AUDIT_REPORT.md    # Case study audit report across 4 skill stores
 └── ssot/                     # Local SSOT directory (managed locally / .gitignored)
@@ -143,6 +145,31 @@ python tests/test_audit.py
 python -m unittest discover -s tests -p test_skill_manager.py -v
 ```
 
+### 4. Preview portable paths and stage a single rendered skill (v0.3 experimental)
+
+Use a **disposable SSOT copy** with explicit placeholders and an opt-in private
+manifest, as described in [the Path Adapter guide](docs/PATH_ADAPTER.md). For
+example, once your private manifest and fixture are ready:
+
+```powershell
+python path_adapter.py --manifest .local/adapters.json `
+  --source .local/adapter-fixtures/skills `
+  --target "agents=$HOME\.agents\skills" --skill demo-skill --diff
+
+# Compare source_hash, render_hash and installed_hash without changing state:
+python omniagent.py plan --adapter-manifest .local/adapters.json `
+  --source .local/adapter-fixtures/skills `
+  --target "agents=$HOME\.agents\skills" --skill demo-skill --json
+```
+
+The two preview commands above do **not** write to agent stores or manager
+state. An experimental, opt-in adapter-aware `apply` is available **only for
+single-skill/single-target tests on disposable stores**. It requires
+`--adapter-manifest`, `--allow-rendered-apply` and `--yes` together; see the
+[Path Adapter guide](docs/PATH_ADAPTER.md) for a controlled apply/rollback
+fixture. Do not use the public examples to mutate your live private SSOT or
+existing agent stores yet.
+
 ---
 
 ## 📚 Docs
@@ -150,6 +177,9 @@ python -m unittest discover -s tests -p test_skill_manager.py -v
 - [docs/PROJECT_CONTEXT.md](docs/PROJECT_CONTEXT.md): why this project exists, design principles, decisions, roadmap
 - [docs/DEVELOPMENT_LOG.md](docs/DEVELOPMENT_LOG.md): what was done on a real machine, metrics, lessons
 - [docs/USAGE.md](docs/USAGE.md): Skill Manager runbook (discover, adopt, plan, apply, rollback)
+- [docs/PATH_ADAPTER.md](docs/PATH_ADAPTER.md): v0.3 template preview, guarded fixture apply and rollback
+- [docs/BETA.md](docs/BETA.md): controlled beta guide, release criteria and evidence
+- [docs/RELEASE_NOTES_v0.3.0-beta.1.md](docs/RELEASE_NOTES_v0.3.0-beta.1.md): draft release notes
 
 ---
 
@@ -159,9 +189,25 @@ python -m unittest discover -s tests -p test_skill_manager.py -v
 - [x] Phase 2: Complete cross-agent skill audit and line-level diff drift analysis.
 - [x] Phase 3: Extraction of canonical SSOT structure (local-first).
 - [x] Phase 4a: Conservative local Skill Manager MVP (discover, plan, adopt exact matches, copy, rollback).
-- [ ] Phase 4b: Drift reconciliation, per-agent path templating, adapters, dependency-aware validation, and crash-safe journal recovery.
+- [x] Phase 4b preview: Read-only, explicit per-agent path template renderer and drift detection (v0.3a).
+- [x] Phase 4b guarded fixture apply: single-skill adapter-aware staging, hash verification and rollback (v0.3b experimental).
+- [x] Phase 4b hardening (v0.3 beta candidate): adapter-aware adoption and crash-safe journal recovery (two-phase commit, `recover`).
+- [ ] Phase 4b remaining: drift reconciliation for partially converted installs, dependency-aware validation, execution compatibility checks on Codex/Antigravity.
 - [ ] Phase 5: Automated dependency hydration for skills with package requirements.
 - [ ] Phase 6: Cross-Agent Memory Integration via MCP (Memorix / Local Knowledge Graph).
+- [ ] Phase 7: Multi-agent coordination: handoff, context sharing, permissions and conflict avoidance (git worktrees).
+- [ ] Phase 8: Windows Local Agent OS v1.0: installer/CLI, dependency hydration, health checks, onboarding and release testing.
+
+### Phase và phiên bản
+
+| Phiên bản | Phase trong lộ trình | Nội dung | Trạng thái |
+|---|---|---|---|
+| v0.2.0 | 4a | Skill Manager MVP | Đã phát hành (tag `v0.2.0`) |
+| v0.3.0-beta.1 | 4b | Path Adapter, adopt theo adapter, phục hồi giao dịch | PR #2 (Draft), chờ pilot trong agent thật |
+| v0.3.x | 4b còn lại, 5 | Hòa giải skill lệch, hydration dependency | Chưa bắt đầu |
+| v0.4 | 6 | Shared Second Brain qua MCP | Chưa bắt đầu |
+| v0.5 | 7 | Điều phối nhiều agent | Chưa bắt đầu |
+| v1.0 | 8 | Windows Local Agent OS | Chưa bắt đầu |
 
 ---
 

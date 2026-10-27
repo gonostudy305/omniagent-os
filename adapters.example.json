@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "targets": {
+    "claude": { "SKILLS_DIR": ".claude/skills" },
+    "agents": { "SKILLS_DIR": ".agents/skills" },
+    "gemini": { "SKILLS_DIR": ".gemini/config/skills" }
+  },
+  "skills": {
+    "demo-skill": { "files": ["SKILL.md"] }
+  }
+}

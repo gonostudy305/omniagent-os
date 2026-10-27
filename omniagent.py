@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import difflib
 import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -44,16 +45,28 @@ class SafetyError(Exception):
     """Refuse to modify files when the operation cannot be proven safe."""
 
 
+def is_link(path: Path) -> bool:
+    """Symlink or Windows junction/reparse point; both can point outside the tree."""
+    if path.is_symlink():
+        return True
+    if os.name == "nt":
+        try:
+            return bool(os.lstat(path).st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT)
+        except OSError:
+            return False
+    return False
+
+
 def within(path: Path, parent: Path) -> bool:
     return path == parent or parent in path.parents
 
 
 def validate_layout(source: Path, state_dir: Path, targets: dict[str, Path]) -> None:
-    if not source.is_dir() or source.is_symlink():
+    if not source.is_dir() or is_link(source):
         raise SafetyError(f"Source directory is missing or is a symlink: {source}")
     source_abs, state_abs = source.resolve(), state_dir.resolve()
     for name, root in targets.items():
-        if root.is_symlink():
+        if is_link(root):
             raise SafetyError(f"Target root is a symlink: {root}")
         target_abs = root.resolve()
         if (within(source_abs, target_abs) or within(target_abs, source_abs)
@@ -83,20 +96,20 @@ def parse_targets(values: list[str] | None) -> dict[str, Path]:
 
 
 def skill_files(skill: Path, *, source: bool = True) -> list[tuple[str, Path]]:
-    if skill.is_symlink() or not skill.is_dir() or not (skill / "SKILL.md").is_file():
+    if is_link(skill) or not skill.is_dir() or not (skill / "SKILL.md").is_file():
         raise SafetyError(f"Invalid skill directory: {skill}")
     files: list[tuple[str, Path]] = []
     for root, dirs, names in os.walk(skill, followlinks=False):
         root_path = Path(root)
         for dirname in list(dirs):
             subdir = root_path / dirname
-            if dirname in EXCLUDED_DIRS and source:
+            if dirname.lower() in EXCLUDED_DIRS and source:
                 dirs.remove(dirname)
-            elif not source and dirname in RUNTIME_DIRS:
+            elif not source and dirname.lower() in RUNTIME_DIRS:
                 dirs.remove(dirname)
-            elif subdir.is_symlink():
+            elif is_link(subdir):
                 raise SafetyError(f"Symlink in skill source is not allowed: {subdir}")
-            elif dirname in EXCLUDED_DIRS:
+            elif dirname.lower() in EXCLUDED_DIRS:
                 raise SafetyError(f"Extra directory in managed copy: {subdir}")
         for name in names:
             path = root_path / name
@@ -105,7 +118,7 @@ def skill_files(skill: Path, *, source: bool = True) -> list[tuple[str, Path]]:
             if (name.lower() in SECRET_FILES or (name.lower().startswith(".env.") and name.lower() not in ENV_TEMPLATES)
                     or path.suffix.lower() in {".pem", ".key", ".token"}):
                 raise SafetyError(f"Potential credentials in source; inspect manually: {path}")
-            if path.is_symlink() or not stat.S_ISREG(path.stat().st_mode):
+            if is_link(path) or not stat.S_ISREG(path.stat().st_mode):
                 raise SafetyError(f"Non-regular file in skill: {path}")
             files.append((path.relative_to(skill).as_posix(), path))
     return sorted(files, key=lambda item: item[0])
@@ -118,11 +131,11 @@ def skill_directories(skill: Path, *, source: bool = True) -> list[str]:
         root_path = Path(root)
         for name in list(dirs):
             path = root_path / name
-            if name in EXCLUDED_DIRS and source:
+            if name.lower() in EXCLUDED_DIRS and source:
                 dirs.remove(name)
-            elif not source and name in RUNTIME_DIRS:
+            elif not source and name.lower() in RUNTIME_DIRS:
                 dirs.remove(name)
-            elif path.is_symlink() or name in EXCLUDED_DIRS:
+            elif is_link(path) or name.lower() in EXCLUDED_DIRS:
                 raise SafetyError(f"Unexpected directory or symlink: {path}")
             else:
                 result.append(path.relative_to(skill).as_posix())
@@ -147,14 +160,14 @@ def tree_digest(skill: Path, *, source: bool = True) -> str:
 
 def has_vendor(skill: Path) -> bool:
     """True if an installed copy holds node_modules, which update/rollback would delete."""
-    return any("node_modules" in dirs for _, dirs, _ in os.walk(skill, followlinks=False))
+    return any(d.lower() == "node_modules" for _, dirs, _ in os.walk(skill, followlinks=False) for d in dirs)
 
 
 def sources_at(source: Path) -> dict[str, tuple[Path, str]]:
     result = {}
     names_lower = set()
     for path in sorted(source.iterdir()):
-        if path.is_symlink():
+        if is_link(path):
             raise SafetyError(f"Symlink at source root is not allowed: {path}")
         if not path.is_dir() or not (path / "SKILL.md").exists():
             continue
@@ -181,6 +194,8 @@ def save_json(path: Path, data: dict) -> None:
         temp_path = Path(handle.name)
         json.dump(data, handle, indent=2, ensure_ascii=False)
         handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())  # a power cut must not leave an empty journal behind
     os.replace(temp_path, path)
 
 
@@ -296,7 +311,7 @@ def plan(source: Path, state_dir: Path, targets: dict[str, Path],
             dest = root / name
             key = str(dest)
             record = manifest.get(key)
-            if dest.is_symlink() or (dest.exists() and not dest.is_dir()):
+            if is_link(dest) or (dest.exists() and not dest.is_dir()):
                 status = "blocked"
             elif dest.exists():
                 if not record or record.get("source") != str(skill_dir.resolve()):
@@ -309,6 +324,12 @@ def plan(source: Path, state_dir: Path, targets: dict[str, Path],
                     else:
                         if current != record.get("hash"):
                             status = "conflict"
+                        elif "rendered_for" in record:
+                            # A plain v0.2 apply must never overwrite a skill
+                            # intentionally rendered for a specific agent.
+                            # Only an explicit adapter-aware plan can opt back
+                            # into managing these per-target bytes.
+                            status = "blocked_rendered"
                         elif current == source_hash:
                             status = "unchanged"
                         else:
@@ -326,8 +347,19 @@ def plan(source: Path, state_dir: Path, targets: dict[str, Path],
 
 
 def adoption_plan(source: Path, state_dir: Path, targets: dict[str, Path],
-                  selected: set[str] | None = None) -> list[dict]:
-    """Inspect existing unmanaged folders, without modifying any skill or state."""
+                  selected: set[str] | None = None, adapter_manifest: dict | None = None,
+                  adapter_module=None) -> list[dict]:
+    """Inspect existing unmanaged folders, without modifying any skill or state.
+
+    With an adapter manifest, a folder that equals the per-agent *rendered* skill
+    is reported as ``eligible_rendered``; it is recorded with its rendered hash.
+    """
+    if adapter_manifest is not None:
+        if adapter_module is None:
+            raise SafetyError("Adapter-aware adoption requires a validated adapter module")
+        for agent in targets:
+            if agent not in adapter_manifest["targets"]:
+                raise SafetyError(f"No adapter variables configured for target: {agent}")
     result = []
     for item in plan(source, state_dir, targets, selected):
         status = item["status"]
@@ -337,8 +369,19 @@ def adoption_plan(source: Path, state_dir: Path, targets: dict[str, Path],
             except (SafetyError, OSError):
                 status = "unsafe"
             else:
-                status = "eligible" if digest == item["source_hash"] else "mismatch"
-        elif status in {"update", "update_adopted", "unchanged"}:
+                config = adapter_manifest["skills"].get(item["name"]) if adapter_manifest else None
+                render_hash = None
+                if config:
+                    render_hash, _ = adapter_module.rendered_skill(
+                        Path(item["source"]), config["files"],
+                        adapter_manifest["targets"][item["target"]],
+                        config.get("ignore_placeholders"))
+                if render_hash is not None and digest == render_hash and render_hash != item["source_hash"]:
+                    status = "eligible_rendered"
+                    item = {**item, "render_hash": render_hash}
+                else:
+                    status = "eligible" if digest == item["source_hash"] else "mismatch"
+        elif status in {"update", "update_adopted", "unchanged", "blocked_rendered"}:
             status = "already_managed"
         result.append({**item, "status": status})
     return result
@@ -350,8 +393,8 @@ def show_adoption_diff(item: dict) -> None:
         return
     source = Path(item["source"]) / "SKILL.md"
     target = Path(item["destination"]) / "SKILL.md"
-    if (not source.is_file() or source.is_symlink() or not target.is_file()
-            or target.is_symlink() or source.stat().st_size > 1_000_000
+    if (not source.is_file() or is_link(source) or not target.is_file()
+            or is_link(target) or source.stat().st_size > 1_000_000
             or target.stat().st_size > 1_000_000):
         print("SKILL.md missing, linked, or too large; inspect manually")
         return
@@ -370,39 +413,236 @@ def show_adoption_diff(item: dict) -> None:
 
 
 def adopt(source: Path, state_dir: Path, targets: dict[str, Path],
-          selected: set[str] | None) -> tuple[str | None, list[dict]]:
+          selected: set[str] | None, adapter_manifest: dict | None = None,
+          adapter_module=None) -> tuple[str | None, list[dict]]:
     """Record exactly matching existing skills as adopted; never touch target files."""
     with manager_lock(state_dir):
-        actions = adoption_plan(source, state_dir, targets, selected)
-        eligible = [a for a in actions if a["status"] == "eligible"]
+        ensure_no_interrupted(state_dir)
+        actions = adoption_plan(source, state_dir, targets, selected,
+                                adapter_manifest, adapter_module)
+        eligible = [a for a in actions if a["status"] in {"eligible", "eligible_rendered"}]
         if not eligible:
             return None, actions
         # A second verification under the exclusive manager lock guards against
         # target edits made while discovering candidates.
         for item in eligible:
             dest = Path(item["destination"])
-            if dest.is_symlink() or not dest.is_dir() or tree_digest(dest, source=False) != item["source_hash"]:
+            expected = item["render_hash"] if item["status"] == "eligible_rendered" else item["source_hash"]
+            if is_link(dest) or not dest.is_dir() or tree_digest(dest, source=False) != expected:
                 raise SafetyError(f"Skill changed during adoption; no state written: {dest}")
         state = state_at(state_dir)
         if any(item["destination"] in state["managed"] for item in eligible):
             raise SafetyError("Skill became managed during adoption; no state written")
         transaction = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:12]
         journal_path = state_dir / "transactions" / f"{transaction}.json"
+        journal_actions = [{**a, "applied_hash": a["render_hash"]} if a["status"] == "eligible_rendered" else a
+                           for a in eligible]
         journal = {"version": 1, "kind": "adopt", "status": "applied",
-                   "transaction": transaction, "actions": eligible}
+                   "transaction": transaction, "actions": journal_actions}
         save_json(journal_path, journal)
         try:
             for item in eligible:
-                state["managed"][item["destination"]] = {
-                    "source": item["source"], "hash": item["source_hash"],
-                    "origin": "adopted", "adopted_transaction": transaction,
-                }
+                record = {"source": item["source"], "hash": item["source_hash"],
+                          "origin": "adopted", "adopted_transaction": transaction}
+                if item["status"] == "eligible_rendered":
+                    record.update({"hash": item["render_hash"], "source_hash": item["source_hash"],
+                                   "rendered_for": item["target"]})
+                state["managed"][item["destination"]] = record
             save_json(state_dir / "state.json", state)
         except Exception:
             journal["status"] = "failed"
             save_json(journal_path, journal)
             raise
         return transaction, actions
+
+
+def interrupted_transactions(state_dir: Path) -> list[tuple[Path, dict]]:
+    """Journals left in_progress by a crashed or killed apply."""
+    found = []
+    directory = state_dir / "transactions"
+    if directory.is_dir():
+        for path in sorted(directory.glob("*.json")):
+            try:
+                journal = json.loads(path.read_text(encoding="utf-8"))
+            except ValueError as exc:
+                raise SafetyError(f"Unreadable transaction journal: {path}") from exc
+            if isinstance(journal, dict) and journal.get("status") in {"in_progress", "committing", "rolling_back"}:
+                found.append((path, journal))
+    return found
+
+
+def ensure_no_interrupted(state_dir: Path) -> None:
+    if interrupted_transactions(state_dir):
+        raise SafetyError("An interrupted transaction exists; inspect it with 'recover' first")
+
+
+def swap_skill(dest: Path, backup: Path | None, previous_hash: str | None) -> None:
+    """Replace `dest` with a verified copy of `backup` (or just remove it).
+
+    The copy is built and verified aside, then swapped in by rename, so a kill at any
+    point leaves `dest` either as it was, missing, or complete - never half-copied.
+    """
+    stage = Path(tempfile.mkdtemp(prefix=".omniagent-stage-", dir=dest.parent))
+    try:
+        fresh = stage / "skill"
+        if backup is not None:
+            shutil.copytree(backup, fresh)
+            if tree_digest(fresh, source=False) != previous_hash:
+                raise SafetyError(f"Restore verification failed: {dest}")
+        if dest.exists():
+            dest.rename(stage / "old")
+        if backup is not None:
+            fresh.rename(dest)
+    except Exception:
+        if dest.exists():
+            shutil.rmtree(stage, ignore_errors=True)
+        raise
+    shutil.rmtree(stage, ignore_errors=True)
+
+
+def finish_rollback(state_dir: Path, journal_path: Path, journal: dict, todos: list) -> None:
+    """Carry out a rollback whose intent is journaled as `rolling_back` (idempotent)."""
+    state = state_at(state_dir)
+    for a, dest, backup, todo in reversed(todos):
+        if todo != "done":
+            swap_skill(dest, backup if todo == "restore" else None,
+                       a["previous"]["hash"] if backup is not None else None)
+    for a, dest, _, _ in todos:
+        if a["previous"]:
+            state["managed"][str(dest)] = a["previous"]
+        else:
+            state["managed"].pop(str(dest), None)
+    save_json(state_dir / "state.json", state)
+    journal["status"] = "rolled_back"
+    save_json(journal_path, journal)
+
+
+def plan_rollback_recovery(journal: dict) -> list:
+    """Classify each action of an interrupted rollback; refuse on anything unexpected."""
+    todos = []
+    for a in journal["actions"]:
+        dest = Path(a["destination"])
+        backup = Path(a["backup"]) if a.get("backup") else None
+        applied_hash = a.get("applied_hash", a["source_hash"])
+        if is_link(dest) or (dest.exists() and not dest.is_dir()):
+            raise SafetyError(f"Cannot recover; unexpected destination: {dest}")
+        if backup is not None and (not backup.is_dir()
+                                   or tree_digest(backup, source=False) != a["previous"]["hash"]):
+            raise SafetyError(f"Cannot recover; backup missing or changed: {backup}")
+        if dest.is_dir():
+            if has_vendor(dest):
+                raise SafetyError(f"Cannot recover; vendor dependencies present: {dest}")
+            try:
+                digest = tree_digest(dest, source=False)
+            except SafetyError as exc:
+                raise SafetyError(f"Cannot recover; destination was changed: {dest}") from exc
+            if digest == applied_hash:
+                todo = "restore" if backup is not None else "remove"
+            elif a["previous"] and digest == a["previous"]["hash"]:
+                todo = "done"
+            else:
+                raise SafetyError(f"Cannot recover; destination was changed: {dest}")
+        else:
+            todo = "restore" if backup is not None else "done"
+        todos.append((a, dest, backup, todo))
+    return todos
+
+
+def recover(state_dir: Path, apply_changes: bool) -> list[dict]:
+    """Return interrupted applies to their pre-transaction state, or preview doing so.
+
+    Fails closed: if any skill is neither the new content nor the recorded
+    previous content (for example edited by hand), nothing is changed.
+    """
+    with manager_lock(state_dir):
+        steps: list[dict] = []
+        for journal_path, journal in interrupted_transactions(state_dir):
+            if journal["status"] == "committing":
+                # Files were all replaced and verified; only the bookkeeping may lag.
+                for a in journal["actions"]:
+                    dest = Path(a["destination"])
+                    if is_link(dest) or not dest.is_dir():
+                        raise SafetyError(f"Cannot finish commit; destination missing: {dest}")
+                    try:
+                        digest = tree_digest(dest, source=False)
+                    except SafetyError as exc:
+                        raise SafetyError(f"Cannot finish commit; destination was changed: {dest}") from exc
+                    if digest != a["applied_hash"]:
+                        raise SafetyError(f"Cannot finish commit; destination was changed: {dest}")
+                    steps.append({"transaction": journal["transaction"], "destination": str(dest),
+                                  "action": "commit", "stage_leftovers": []})
+                if apply_changes:
+                    state = state_at(state_dir)
+                    state["managed"].update(journal["records"])
+                    save_json(state_dir / "state.json", state)
+                    journal["status"] = "applied"
+                    save_json(journal_path, journal)
+                continue
+            if journal["status"] == "rolling_back":
+                todos = plan_rollback_recovery(journal)
+                for a, dest, backup, todo in todos:
+                    steps.append({"transaction": journal["transaction"], "destination": str(dest),
+                                  "action": f"rollback-{todo}",
+                                  "stage_leftovers": sorted(str(x) for x in dest.parent.glob(".omniagent-stage-*"))
+                                  if dest.parent.is_dir() else []})
+                if apply_changes:
+                    finish_rollback(state_dir, journal_path, journal, todos)
+                continue
+            planned = []
+            for a in journal.get("actions", []):
+                dest = Path(a["destination"])
+                previous = a.get("previous")
+                backup = Path(a["backup"]) if a.get("backup") else None
+                if is_link(dest) or (dest.exists() and not dest.is_dir()):
+                    raise SafetyError(f"Cannot recover; unexpected destination: {dest}")
+                dest_is_previous = False
+                if dest.is_dir() and previous and not has_vendor(dest):
+                    try:
+                        dest_is_previous = tree_digest(dest, source=False) == previous["hash"]
+                    except SafetyError:
+                        pass
+                if backup is not None and backup.exists() and not dest_is_previous:
+                    if tree_digest(backup, source=False) != previous["hash"]:
+                        raise SafetyError(f"Cannot recover; backup changed: {backup}")
+                if dest.is_dir():
+                    if has_vendor(dest):
+                        raise SafetyError(f"Cannot recover; vendor dependencies present: {dest}")
+                    try:
+                        digest = tree_digest(dest, source=False)
+                    except SafetyError as exc:
+                        raise SafetyError(f"Cannot recover; destination was changed: {dest}") from exc
+                    if digest == a["applied_hash"]:
+                        if backup is not None and not backup.is_dir():
+                            raise SafetyError(f"Cannot recover; backup missing: {backup}")
+                        action = "revert"
+                    elif previous and digest == previous["hash"]:
+                        action = "untouched"
+                    else:
+                        raise SafetyError(f"Cannot recover; destination was changed: {dest}")
+                elif backup is not None:
+                    if not backup.is_dir():
+                        raise SafetyError(f"Cannot recover; backup missing: {backup}")
+                    action = "restore"
+                else:
+                    action = "untouched"
+                planned.append((a, dest, backup, action))
+            for a, dest, backup, action in planned:
+                steps.append({"transaction": journal["transaction"], "destination": str(dest),
+                              "action": action,
+                              "stage_leftovers": sorted(str(p) for p in dest.parent.glob(".omniagent-stage-*"))
+                              if dest.parent.is_dir() else []})
+            if not apply_changes:
+                continue
+            for a, dest, backup, action in planned:
+                if action == "revert":
+                    remove_managed(dest)
+                if action in {"revert", "restore"} and backup is not None:
+                    shutil.copytree(backup, dest)
+                    if tree_digest(dest, source=False) != a["previous"]["hash"]:
+                        raise SafetyError(f"Restore verification failed: {dest}")
+            journal["status"] = "recovered_reverted"
+            save_json(journal_path, journal)
+        return steps
 
 
 def copy_skill(source: Path, destination: Path, expected_hash: str) -> None:
@@ -417,26 +657,60 @@ def copy_skill(source: Path, destination: Path, expected_hash: str) -> None:
         raise SafetyError(f"Source changed while copying: {source}")
 
 
+def copy_rendered_skill(source: Path, destination: Path, source_hash: str,
+                        rendered_hash: str, name: str, target: str,
+                        adapter_manifest: dict, adapter_module) -> None:
+    """Stage a complete, verified per-target rendered tree; never edit SSOT."""
+    copy_skill(source, destination, source_hash)
+    config = adapter_manifest["skills"].get(name)
+    if config:
+        expected_hash, rendered = adapter_module.rendered_skill(
+            source, config["files"], adapter_manifest["targets"][target],
+            config.get("ignore_placeholders"),
+        )
+        if expected_hash != rendered_hash:
+            raise SafetyError(f"Template or manifest changed while staging: {name}")
+        for relative, body in rendered.items():
+            (destination / relative).write_bytes(body)
+    if tree_digest(destination, source=False) != rendered_hash:
+        raise SafetyError(f"Rendered staging hash mismatch: {name} ({target})")
+
+
 def remove_managed(path: Path) -> None:
-    if path.is_symlink() or not path.is_dir():
+    if is_link(path) or not path.is_dir():
         raise SafetyError(f"Refusing to remove unexpected destination: {path}")
     shutil.rmtree(path)
 
 
 def apply(source: Path, state_dir: Path, targets: dict[str, Path],
           selected: set[str] | None, skip_blocked: bool,
-          allow_update_adopted: bool = False) -> tuple[str | None, list[dict]]:
+          allow_update_adopted: bool = False, adapter_manifest: dict | None = None,
+          adapter_module=None) -> tuple[str | None, list[dict]]:
+    if adapter_manifest is not None and (selected is None or len(selected) != 1 or len(targets) != 1):
+        raise SafetyError("Experimental rendered apply permits exactly one skill and target")
     with manager_lock(state_dir):
-        return _apply_locked(source, state_dir, targets, selected, skip_blocked, allow_update_adopted)
+        return _apply_locked(source, state_dir, targets, selected, skip_blocked,
+                             allow_update_adopted, adapter_manifest, adapter_module)
 
 
 def _apply_locked(source: Path, state_dir: Path, targets: dict[str, Path],
                   selected: set[str] | None, skip_blocked: bool,
-                  allow_update_adopted: bool) -> tuple[str | None, list[dict]]:
-    actions = plan(source, state_dir, targets, selected)
+                  allow_update_adopted: bool, adapter_manifest: dict | None = None,
+                  adapter_module=None) -> tuple[str | None, list[dict]]:
+    ensure_no_interrupted(state_dir)
+    if adapter_manifest is not None:
+        if adapter_module is None:
+            raise SafetyError("Rendered apply requires a validated adapter module")
+        actions = adapter_module.render_aware_plan(source, state_dir, targets,
+                                                   adapter_manifest, selected)
+    else:
+        actions = plan(source, state_dir, targets, selected)
     blocked = [a for a in actions if a["status"].startswith(("blocked", "conflict"))
                or (a["status"] == "update_adopted" and not allow_update_adopted)]
     if blocked and not skip_blocked:
+        if adapter_manifest is None and any(a["status"] == "blocked_rendered" for a in blocked):
+            raise SafetyError("Rendered skills require --adapter-manifest for apply; "
+                              "nothing applied. Use --skip-blocked to leave them untouched.")
         raise SafetyError(f"{len(blocked)} existing skills are unmanaged or changed; "
                           "nothing applied. Use --skip-blocked to install only safe entries.")
     changed = [a for a in actions if a["status"] in {"install", "update"}
@@ -450,6 +724,13 @@ def _apply_locked(source: Path, state_dir: Path, targets: dict[str, Path],
     transaction = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:12]
     backup_dir = state_dir / "backups" / transaction
     backup_dir.mkdir(parents=True, exist_ok=False)
+    # Intent journal first: a crash mid-apply leaves status "in_progress" for `recover`.
+    planned = [{"destination": a["destination"], "name": a["name"], "target": a["target"],
+                "status": a["status"], "applied_hash": a.get("render_hash", a["source_hash"]),
+                "backup": str(backup_dir / str(index)) if a["status"] in {"update", "update_adopted"} else None,
+                "previous": old_records[a["destination"]]} for index, a in enumerate(changed)]
+    save_json(state_dir / "transactions" / f"{transaction}.json",
+              {"version": 1, "status": "in_progress", "transaction": transaction, "actions": planned})
     completed = []
     try:
         for index, action in enumerate(changed):
@@ -457,15 +738,27 @@ def _apply_locked(source: Path, state_dir: Path, targets: dict[str, Path],
             source_path = Path(action["source"])
             dest.parent.mkdir(parents=True, exist_ok=True)
             # Recheck immediately before mutating, including changes since plan.
-            if action["status"] == "install" and (dest.exists() or dest.is_symlink()):
+            if action["status"] == "install" and (dest.exists() or is_link(dest)):
                 raise SafetyError(f"Destination appeared since planning: {dest}")
             if action["status"] in {"update", "update_adopted"}:
+                if adapter_manifest is None and "rendered_for" in old_records[str(dest)]:
+                    raise SafetyError(f"Rendered skill requires --adapter-manifest: {dest}")
                 prior_hash = old_records[str(dest)]["hash"]
-                if not dest.is_dir() or dest.is_symlink() or tree_digest(dest, source=False) != prior_hash:
+                if not dest.is_dir() or is_link(dest) or tree_digest(dest, source=False) != prior_hash:
                     raise SafetyError(f"Managed skill changed since planning: {dest}")
+                # Runtime files are ignored by hashes. Recheck immediately
+                # before replacement so late-added vendor data is never lost.
+                if has_vendor(dest):
+                    raise SafetyError(f"Installed vendor dependencies block update: {dest}")
             with tempfile.TemporaryDirectory(prefix=".omniagent-stage-", dir=dest.parent) as temp:
                 staging = Path(temp) / "skill"
-                copy_skill(source_path, staging, action["source_hash"])
+                applied_hash = action.get("render_hash", action["source_hash"])
+                if adapter_manifest is not None:
+                    copy_rendered_skill(source_path, staging, action["source_hash"],
+                                        applied_hash, action["name"], action["target"],
+                                        adapter_manifest, adapter_module)
+                else:
+                    copy_skill(source_path, staging, action["source_hash"])
                 backup = backup_dir / str(index)
                 if action["status"] in {"update", "update_adopted"}:
                     shutil.copytree(dest, backup)
@@ -480,24 +773,33 @@ def _apply_locked(source: Path, state_dir: Path, targets: dict[str, Path],
                         raise
                 else:
                     staging.rename(dest)
-            completed.append({**action, "backup": str(backup) if action["status"] in {"update", "update_adopted"} else None,
-                              "previous": old_records[str(dest)]})
+                # Recorded before the temp dir is cleaned up, so a cleanup failure is still reverted.
+                completed.append({**action, "applied_hash": applied_hash,
+                                  "backup": str(backup) if action["status"] in {"update", "update_adopted"} else None,
+                                  "previous": old_records[str(dest)]})
 
-        # Save recovery journal before publishing the updated manifest.
-        journal = {"version": 1, "status": "applied", "transaction": transaction,
-                   "actions": completed}
-        save_json(state_dir / "transactions" / f"{transaction}.json", journal)
+        # Two-phase commit: journal "committing" carries the exact state records, so a
+        # crash before or during the state write can be rolled forward by `recover`.
+        records = {}
         for a in completed:
-            new_record = {"source": a["source"], "hash": a["source_hash"]}
+            new_record = {"source": a["source"], "hash": a["applied_hash"]}
+            if adapter_manifest is not None:
+                new_record["source_hash"] = a["source_hash"]
+                new_record["rendered_for"] = a["target"]
             if a["previous"] and a["previous"].get("origin") == "adopted":
                 new_record["origin"] = "adopted"
                 new_record["adopted_transaction"] = a["previous"]["adopted_transaction"]
-            state["managed"][a["destination"]] = new_record
+            records[a["destination"]] = new_record
+        journal = {"version": 1, "status": "committing", "transaction": transaction,
+                   "actions": completed, "records": records}
+        save_json(state_dir / "transactions" / f"{transaction}.json", journal)
+        state["managed"].update(records)
         save_json(state_dir / "state.json", state)
     except Exception:
         for a in reversed(completed):
             dest = Path(a["destination"])
-            if dest.is_dir() and not dest.is_symlink() and tree_digest(dest, source=False) == a["source_hash"]:
+            if (dest.is_dir() and not is_link(dest)
+                    and tree_digest(dest, source=False) == a.get("applied_hash", a["source_hash"])):
                 remove_managed(dest)
                 if a["backup"]:
                     shutil.copytree(a["backup"], dest)
@@ -507,6 +809,9 @@ def _apply_locked(source: Path, state_dir: Path, targets: dict[str, Path],
             saved["status"] = "failed_reverted"
             save_json(journal_path, saved)
         raise
+    # State is published; a failure here must not revert files. `recover` finishes it.
+    journal["status"] = "applied"
+    save_json(state_dir / "transactions" / f"{transaction}.json", journal)
     return transaction, actions
 
 
@@ -518,6 +823,7 @@ def rollback(state_dir: Path, transaction: str) -> int:
 def _rollback_locked(state_dir: Path, transaction: str) -> int:
     if not TRANSACTION_ID.fullmatch(transaction):
         raise SafetyError("Invalid transaction ID")
+    ensure_no_interrupted(state_dir)
     journal_path = state_dir / "transactions" / f"{transaction}.json"
     journal = read_json(journal_path, {})
     if journal.get("status") != "applied" or journal.get("transaction") != transaction:
@@ -529,7 +835,7 @@ def _rollback_locked(state_dir: Path, transaction: str) -> int:
             record = state["managed"].get(item["destination"], {})
             if (record.get("origin") != "adopted"
                     or record.get("adopted_transaction") != transaction
-                    or record.get("hash") != item["source_hash"]):
+                    or record.get("hash") != item.get("applied_hash", item["source_hash"])):
                 raise SafetyError(f"Cannot untrack a superseded adoption: {item['destination']}")
         # Undoing adoption only removes manager bookkeeping, never a user's folder.
         for item in actions:
@@ -541,37 +847,32 @@ def _rollback_locked(state_dir: Path, transaction: str) -> int:
     # Validate the whole transaction first; never delete a user-edited skill.
     for a in actions:
         dest = Path(a["destination"])
-        if (dest.is_symlink() or not dest.is_dir() or has_vendor(dest)
-                or tree_digest(dest, source=False) != a["source_hash"]
-                or state["managed"].get(str(dest), {}).get("hash") != a["source_hash"]
+        applied_hash = a.get("applied_hash", a["source_hash"])
+        if (is_link(dest) or not dest.is_dir() or has_vendor(dest)
+                or tree_digest(dest, source=False) != applied_hash
+                or state["managed"].get(str(dest), {}).get("hash") != applied_hash
                 or state["managed"].get(str(dest), {}).get("source") != a["source"]
                 or (not a["previous"] and state["managed"].get(str(dest), {}).get("origin") == "adopted")):
             raise SafetyError(f"Cannot roll back; installed skill changed: {dest}")
         if a["backup"] and (not Path(a["backup"]).is_dir()
                             or tree_digest(Path(a["backup"]), source=False) != a["previous"]["hash"]):
             raise SafetyError(f"Cannot roll back; backup missing or changed: {a['backup']}")
-    for a in reversed(actions):
-        dest = Path(a["destination"])
-        remove_managed(dest)
-        if a["backup"]:
-            shutil.copytree(a["backup"], dest)
-        if a["previous"]:
-            state["managed"][str(dest)] = a["previous"]
-        else:
-            state["managed"].pop(str(dest), None)
-    save_json(state_dir / "state.json", state)
-    journal["status"] = "rolled_back"
+    # Journal the intent before touching any skill; `recover` finishes it after a crash.
+    journal["status"] = "rolling_back"
     save_json(journal_path, journal)
+    todos = [(a, Path(a["destination"]), Path(a["backup"]) if a["backup"] else None,
+              "restore" if a["backup"] else "remove") for a in actions]
+    finish_rollback(state_dir, journal_path, journal, todos)
     return len(actions)
 
 
 def discover(source: Path, targets: dict[str, Path]) -> None:
     """Read-only inventory; works on a fresh clone with no SSOT yet."""
-    if source.is_dir() and not source.is_symlink():
+    if source.is_dir() and not is_link(source):
         skills = sources_at(source)
         print(f"source     {len(skills):4} skills  {source}")
         for folder in sorted(source.iterdir()):
-            if folder.is_dir() and not folder.is_symlink() and not (folder / "SKILL.md").is_file():
+            if folder.is_dir() and not is_link(folder) and not (folder / "SKILL.md").is_file():
                 print(f"WARNING: source folder ignored (missing SKILL.md): {folder.name}")
     else:
         print(f"source        (not initialized)  {source}")
@@ -584,6 +885,20 @@ def discover(source: Path, targets: dict[str, Path]) -> None:
             print(f"{name:10}      (not found)  {root}")
 
 
+def load_adapter_module():
+    """Load the adjacent adapter safely even when Python runs with -I."""
+    sys.modules.setdefault("omniagent", sys.modules[__name__])
+    adapter_file = REPO_ROOT / "path_adapter.py"
+    if not adapter_file.is_file():
+        raise SafetyError("Path Adapter module not installed next to omniagent.py")
+    spec = importlib.util.spec_from_file_location("_omniagent_adapter", adapter_file)
+    if spec is None or spec.loader is None:
+        raise SafetyError("Unable to load Path Adapter module")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def cli(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Safe local skill manager (copy-based, no symlinks)")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -593,20 +908,42 @@ def cli(argv: list[str] | None = None) -> int:
         part.add_argument("--state-dir", type=Path, default=DEFAULT_STATE)
         part.add_argument("--target", action="append", metavar="NAME=PATH")
         part.add_argument("--skill", action="append", help="only manage named skill (repeatable)")
+        if command == "plan":
+            part.add_argument("--adapter-manifest", type=Path,
+                              help="read-only preview of per-agent rendered hashes (v0.3a)")
+            part.add_argument("--json", action="store_true",
+                              help="print all hash fields as JSON in the local terminal")
         if command == "apply":
             part.add_argument("--yes", action="store_true", help="explicitly approve filesystem writes")
             part.add_argument("--skip-blocked", action="store_true")
             part.add_argument("--allow-update-adopted", action="store_true",
                               help="explicitly permit replacing a previously adopted exact-match skill")
+            part.add_argument("--adapter-manifest", type=Path,
+                              help="per-agent rendered apply: experimental, one skill/target only")
+            part.add_argument("--allow-rendered-apply", action="store_true",
+                              help="separate opt-in to modifying a target with rendered skill files")
         if command == "adopt":
+            part.add_argument("--adapter-manifest", type=Path,
+                              help="also recognise folders equal to the per-agent rendered skill")
             part.add_argument("--yes", action="store_true", help="record exact matches in private state")
             part.add_argument("--diff", action="store_true", help="show local SKILL.md diff for one selected mismatch")
+    fix = sub.add_parser("recover", help="revert an apply that was interrupted (preview unless --yes)")
+    fix.add_argument("--state-dir", type=Path, default=DEFAULT_STATE)
+    fix.add_argument("--yes", action="store_true", help="perform the reversion")
     undo = sub.add_parser("rollback")
     undo.add_argument("--state-dir", type=Path, default=DEFAULT_STATE)
     undo.add_argument("--transaction", required=True)
     undo.add_argument("--yes", action="store_true")
     args = parser.parse_args(argv)
     try:
+        if args.command == "recover":
+            steps = recover(args.state_dir.expanduser().absolute(), args.yes)
+            for s in steps:
+                print(f"{s['transaction']}  {s['action']:10} {s['destination']}")
+                for leftover in s["stage_leftovers"]:
+                    print(f"  leftover staging folder (inspect, then delete manually): {leftover}")
+            print(f"{len(steps)} step(s) " + ("reverted" if args.yes else "previewed; rerun with --yes to apply"))
+            return 0
         if args.command == "rollback":
             if not args.yes:
                 raise SafetyError("Rollback modifies skill folders; rerun with --yes")
@@ -627,26 +964,56 @@ def cli(argv: list[str] | None = None) -> int:
         if args.command == "adopt":
             if args.diff and (not selected or len(selected) != 1 or len(targets) != 1):
                 raise SafetyError("For private diffs, select exactly one --skill and one --target")
+            adopt_module = adopt_manifest = None
+            if args.adapter_manifest:
+                adopt_module = load_adapter_module()
+                adopt_manifest = adopt_module.load_manifest(args.adapter_manifest.expanduser().absolute())
             if args.yes:
-                transaction, actions = adopt(source, state_dir, targets, selected)
+                transaction, actions = adopt(source, state_dir, targets, selected,
+                                             adopt_manifest, adopt_module)
                 print(f"Adoption transaction: {transaction or '(nothing changed)'}")
             else:
-                actions = adoption_plan(source, state_dir, targets, selected)
+                actions = adoption_plan(source, state_dir, targets, selected,
+                                        adopt_manifest, adopt_module)
             for a in actions:
                 print(f"{a['target']:10} {a['status']:18} {a['name']}")
                 if args.diff:
                     show_adoption_diff(a)
-            print(f"Eligible exact matches: {sum(a['status'] == 'eligible' for a in actions)}")
+            print(f"Eligible exact matches: {sum(a['status'] in {'eligible', 'eligible_rendered'} for a in actions)}")
             return 0
-        actions = plan(source, state_dir, targets, selected)
+        adapter_module = None
+        adapter_manifest = None
+        if args.adapter_manifest:
+            adapter_module = load_adapter_module()
+            adapter_manifest = adapter_module.load_manifest(args.adapter_manifest.expanduser().absolute())
+        if args.command == "plan" and adapter_manifest is not None:
+            actions = adapter_module.render_aware_plan(source, state_dir, targets,
+                                                       adapter_manifest, selected)
+        else:
+            actions = plan(source, state_dir, targets, selected)
         if args.command == "apply":
             if not args.yes:
                 raise SafetyError("Apply modifies skill folders; inspect plan first, then use --yes")
+            if adapter_manifest is not None:
+                if not args.allow_rendered_apply:
+                    raise SafetyError("Rendered apply needs separate --allow-rendered-apply consent")
+                if selected is None or len(selected) != 1 or len(targets) != 1:
+                    raise SafetyError("Rendered apply is limited to one --skill and one --target")
+            elif args.allow_rendered_apply:
+                raise SafetyError("--allow-rendered-apply requires --adapter-manifest")
             transaction, actions = apply(source, state_dir, targets, selected,
-                                         args.skip_blocked, args.allow_update_adopted)
+                                         args.skip_blocked, args.allow_update_adopted,
+                                         adapter_manifest, adapter_module)
             print(f"Transaction: {transaction or '(nothing changed)'}")
-        for a in actions:
-            print(f"{a['target']:10} {a['status']:18} {a['name']}")
+        if args.command == "plan" and args.json:
+            print(json.dumps(actions, indent=2, ensure_ascii=True))
+        else:
+            for a in actions:
+                print(f"{a['target']:10} {a['status']:18} {a['name']}")
+                if args.command == "plan" and args.adapter_manifest:
+                    installed = a["installed_hash"] or "(missing/unsafe)"
+                    print(f"  source={a['source_hash'][:12]} render={a['render_hash'][:12]} "
+                          f"installed={installed[:12]}")
         return 0
     except (SafetyError, OSError, ValueError, json.JSONDecodeError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)

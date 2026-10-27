@@ -58,3 +58,35 @@ Kết quả chứa đường dẫn máy và tên skill thật, nên nằm trong 
 ```powershell
 python -I -m unittest discover -s tests
 ```
+
+## Phục hồi giao dịch bị ngắt giữa chừng
+
+Trước khi `apply` thay đổi bất kỳ thư mục nào, nó ghi một journal ở trạng thái
+`in_progress` trong `.local/manager/transactions/`. Nếu máy tắt hoặc tiến trình bị
+dừng giữa chừng, journal này còn lại. Khi đó `apply`, `adopt` và `rollback` đều từ
+chối chạy cho tới khi xử lý xong:
+
+```powershell
+python omniagent.py recover            # xem trước, không ghi gì
+python omniagent.py recover --yes      # đưa về trạng thái trước giao dịch
+```
+
+Với mỗi skill, `recover` phân loại: `revert` (đã cài bản mới, xóa và khôi phục từ
+backup), `restore` (bản cũ đã bị dời đi, khôi phục từ backup), `untouched` (chưa đổi).
+Nó **từ chối toàn bộ** nếu một skill không phải bản mới cũng không phải bản trước đó
+(ví dụ đã bị sửa tay), hoặc đang có `node_modules`. Thư mục tạm `.omniagent-stage-*`
+còn sót lại chỉ được liệt kê, cần tự kiểm tra rồi xóa.
+
+Giai đoạn cuối của `apply` là hai pha: journal chuyển sang `committing` (kèm đúng các
+bản ghi sẽ vào `state.json`), rồi ghi `state.json`, rồi journal thành `applied`. Nếu
+dừng ở giữa, `recover` **hoàn tất** (roll forward) bằng cách ghi các bản ghi đó, sau khi
+kiểm tra từng skill vẫn đúng nội dung mới; nếu một skill đã bị sửa tay thì từ chối. Cả
+`in_progress` (revert) và `committing` (hoàn tất) đều chặn `apply`/`adopt`/`rollback` cho
+tới khi chạy `recover`.
+
+`rollback` cũng ghi journal `rolling_back` trước khi đụng vào bất kỳ skill nào. Từng
+skill được dựng lại từ backup ở thư mục tạm rồi đổi tên vào chỗ, nên một lần dừng giữa
+chừng chỉ để skill ở một trong ba trạng thái: nguyên như cũ, vắng mặt, hoặc đã khôi phục
+đầy đủ, không bao giờ nửa vời. `recover` hoàn tất rollback đó (hiển thị
+`rollback-restore`, `rollback-remove` hoặc `rollback-done` cho từng skill) rồi mới cập
+nhật `state.json`; nó từ chối nếu một skill đã bị sửa tay hoặc backup không còn khớp.

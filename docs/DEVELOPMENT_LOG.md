@@ -118,3 +118,22 @@ Trong bản sao, đổi đường dẫn thành `{{SKILLS_DIR}}` và `{{AGENT_CON
 - Thiết kế render-aware hash trong `plan`/`apply`/state; thử trên bản sao rồi mới nối vào `apply`.
 - Xem lại `skill-C` và 4 skill `needs_review` của agents.
 - Quyết định cách xử lý CRLF ở `adopt`.
+
+## Template hóa nhóm 26 skill chỉ khác đường dẫn (sandbox, chỉ đọc)
+
+Trong bản sao `.local/experiments/` (không đụng SSOT thật), áp dụng hai luật thay
+(`.claude/skills` thành `{{SKILLS_DIR}}`, rồi `.claude/` còn lại thành
+`{{AGENT_CONFIG_DIR}}`), sau đó render và so với thư mục thật bằng Path Adapter:
+
+| Kho | match | drift |
+|---|---|---|
+| claude | 26 | 0 |
+| agents | 15 | 11 |
+
+- claude 26/26: bản render đúng bằng bản đang cài, nên việc template hóa không làm đổi nội dung bên claude.
+- agents 15/26 khớp từng byte, nên đủ điều kiện `adopt --adapter-manifest` (chỉ ghi state).
+- 11 skill còn lại lệch vì **bản cài của agents chuyển đổi chưa nhất quán**: một số file đã đổi sang `.agents/...`/`.Codex/...`, một số file khác trong cùng skill vẫn còn `.claude/...`. Bản render là bản nhất quán, nên đưa 11 skill này về bản render là một `update` làm thay đổi file thật, cần xác nhận riêng, không phải `adopt`.
+
+## Phục hồi giao dịch bị ngắt (v0.3d)
+
+`apply` ghi journal `in_progress` trước khi đổi thư mục; lệnh `recover` (xem trước, `--yes` để thực hiện) đưa về trạng thái trước giao dịch và từ chối nếu có bản sửa tay hay `node_modules`. `apply`/`adopt`/`rollback` bị chặn khi còn giao dịch dở. 7 test mô phỏng crash (cài, thay thế sau khi bản cũ đã bị dời, trước khi thay, bị sửa tay, có `node_modules`, chặn lệnh khác, giao dịch thành công không để lại journal dở). Giai đoạn cuối là hai pha: journal `committing` (kèm đúng các bản ghi state) rồi ghi `state.json` rồi `applied`; `recover` hoàn tất (roll forward) giao dịch `committing` sau khi kiểm tra nội dung, và revert giao dịch `in_progress`. Có thêm test dừng trước và sau khi ghi `state.json`. Chưa kiểm thử với kill tiến trình thật hay mất điện thật.
