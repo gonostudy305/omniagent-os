@@ -19,11 +19,11 @@ Lõi tự xây khoảng 650 dòng, không phụ thuộc gói ngoài. Tên công 
 ## Mô hình tin cậy
 
 1. **Agent chỉ đề xuất.** Ghi chú từ agent vào trạng thái `inbox` (chưa kiểm chứng). Mặc định tìm kiếm chỉ trả về ghi chú `verified`; muốn thấy đề xuất phải bật `include_unverified`, và kết quả luôn gắn nhãn `UNVERIFIED`.
-2. **Chỉ chủ dự án xác nhận.** `verify` chỉ có trong CLI, không có trong MCP. Không có công cụ xóa trong MCP.
+2. **Chỉ chủ dự án xác nhận.** `verify` chỉ có trong CLI, không có trong MCP, và MCP không có công cụ xóa. Các lệnh CLI làm thay đổi điều dự án tin cậy (`propose` với tư cách chủ dự án, `verify`, `restore --replace`) đòi hỏi một **terminal tương tác** và bạn phải gõ lại mã xác nhận. Qua ống dẫn hoặc script (cách công cụ shell của agent chạy lệnh) chúng bị từ chối. **Đây là rào cản ma sát, không phải xác thực:** một tiến trình cùng tài khoản Windows vẫn có thể tạo pseudo-terminal và vượt qua. Muốn tách thật sự cần phê duyệt ngoài băng (tài khoản Windows khác hoặc thiết bị khác); chưa làm.
 3. **Danh tính cố định khi khởi chạy.** `--agent` và `--project` được truyền khi chạy máy chủ; tham số do client gửi (`source_agent`, `status`, `project`...) bị bỏ qua. Không thể chạy máy chủ MCP với danh tính `user`.
 4. **Quét bí mật trước khi lưu.** Từ chối khóa riêng, bearer token, token GitHub/Slack/AWS/`sk-`, JWT, URL có mật khẩu, `password = ...`, chuỗi entropy cao. Thông báo lỗi chỉ nêu *loại*, không lặp lại giá trị. Quét theo heuristic nên có thể từ chối nhầm hoặc bỏ sót; đừng coi là bảo đảm.
 5. **Che đường dẫn cá nhân.** Thư mục home và `C:\Users\<tên>` được thay bằng `~`.
-6. **Mâu thuẫn.** Hai ghi chú cùng loại và tiêu đề nhưng nội dung khác nhau đều thành `contested` và không còn hiện ở tìm kiếm mặc định. Chủ dự án `verify` một bên thì bên kia thành `superseded`.
+6. **Agent không bao giờ đổi trạng thái của ghi chú đã `verified`.** Khi agent đề xuất ghi chú trái ngược (cùng loại và tiêu đề, nội dung khác), chính ghi chú *mới* bị giữ ở `contested`; ghi chú đã xác nhận vẫn `verified` và vẫn hiện ở tìm kiếm mặc định. `brain_conflicts` liệt kê ghi chú bị giữ cùng `conflicts_with`. Hai đề xuất chưa xác nhận mâu thuẫn nhau thì cùng bị giữ. Tham số `supersedes` của agent chỉ là **đề xuất thay thế** (`pending_replacement`): ghi chú cũ giữ nguyên cho tới khi bạn `verify` ghi chú mới, lúc đó ghi chú cũ và các ghi chú đối địch mới chuyển sang `superseded`. Chỉ ghi chú do chính bạn viết mới thay thế ngay lập tức.
 7. **Bằng chứng tệp.** Có thể đính kèm tệp; hash SHA-256 được lưu. `recheck` đánh dấu `contested` nếu tệp đổi hoặc mất.
 8. **Nhật ký.** Mọi hành động (đề xuất, xác nhận, thay thế, mâu thuẫn, nhập) ghi vào bảng `audit` kèm tác nhân.
 
@@ -60,9 +60,10 @@ In ra lệnh `claude mcp add ...`, khối `[mcp_servers.omniagent-brain]` cho Co
 
 ## Đã kiểm chứng
 
-- 28 test mới (123 test tổng) cho kho, quét bí mật, danh tính, mâu thuẫn, sao lưu và máy chủ MCP qua tiến trình thật.
+- 34 test mới (129 test tổng) cho kho, quét bí mật, danh tính, mâu thuẫn, sao lưu và máy chủ MCP qua tiến trình thật.
 - **Vertical slice** (`test_vertical_slice_claude_writes_codex_reads_gemini_retrieves`), ba tiến trình MCP riêng với danh tính `claude`, `codex`, `antigravity`: Claude ghi một quyết định kiến trúc kèm bằng chứng; Codex đọc lại được, gắn nhãn chưa kiểm chứng; chủ dự án xác nhận; Antigravity truy xuất được dưới dạng đã kiểm chứng; một đề xuất mâu thuẫn hiện ra trong `brain_conflicts`; nhật ký nêu đủ các tác nhân.
-- Kiểm tra đột biến: khi tạm tắt quét bí mật hoặc cho phép ai cũng `verify`, các test tương ứng fail.
+- Kiểm tra đột biến: khi tạm tắt quét bí mật, cho phép ai cũng `verify`, cho agent tự `supersedes`, bỏ cổng terminal hoặc bỏ việc giữ lại ghi chú mâu thuẫn, các test tương ứng fail.
+- Lỗi tin cậy được phát hiện khi review PR (một agent có thể làm ghi chú đã xác nhận biến mất khỏi tìm kiếm bằng `supersedes` hoặc bằng một ghi chú trái ngược) đã được sửa kèm test hồi quy.
 
 **Giới hạn của phần kiểm chứng:** vertical slice dùng *client MCP giả* nói giao thức MCP, chưa phải Claude Code, Codex hay Antigravity thật. Việc đăng ký vào agent thật và xác nhận từng agent gọi được công cụ chưa làm.
 
@@ -72,5 +73,7 @@ In ra lệnh `claude mcp add ...`, khối `[mcp_servers.omniagent-brain]` cho Co
 - Tìm kiếm ngữ nghĩa (hiện chỉ khớp chuỗi con, không embedding).
 - Nhập có chọn lọc từ bộ nhớ Claude Code (M4); không nhập từ Antigravity.
 - Kiểm chứng tự động bằng cách chạy lại lệnh (cố ý không làm: sẽ thực thi lệnh do agent đề xuất).
+- Phê duyệt tách khỏi quyền chạy lệnh của agent (xem giới hạn ở mục 2 của mô hình tin cậy).
+- Benchmark Memorix như một backend thay thế, sau khi MVP an toàn; đánh giá hiện tại dựa trên trang thư mục bên thứ ba và cần được kiểm lại bằng repo chính thức.
 - Điều phối nhiều agent (v0.5): handoff mới chỉ là một loại ghi chú, chưa có giao thức nhận việc và quyền sở hữu.
 - Quét bí mật chỉ là heuristic; che đường dẫn chỉ xử lý thư mục home.

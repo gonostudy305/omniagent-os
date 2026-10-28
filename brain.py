@@ -185,6 +185,10 @@ class Brain:
         note["evidence"] = self._evidence_rows(con, note_id)
         note["trust"] = ("verified by the project owner" if note["status"] == "verified"
                          else f"UNVERIFIED ({note['status']}): proposed by {note['source_agent']}, not confirmed")
+        pending = note["supersedes"] if note["status"] in ("inbox", "contested") else None
+        note["pending_replacement"] = pending
+        if pending:
+            note["trust"] += f"; proposes to replace {pending}, which stays as it is until the owner approves"
         return note
 
     # -- writing
@@ -238,18 +242,32 @@ class Brain:
             if agent == "user":
                 con.execute("insert into evidence(note_id,type,detail,added_by,added_at) values(?,?,?,?,?)",
                             (note_id, "user", "written by the project owner", "user", stamp))
-            if supersedes is not None:
+            if supersedes is not None and agent == "user":
+                # Only the owner's own note retires another note on the spot.
                 con.execute("update notes set status='superseded', updated_at=? where id=?", (stamp, supersedes))
                 self._audit(con, agent, "superseded", supersedes, f"by {note_id}")
+            elif supersedes is not None:
+                # An agent only PROPOSES the replacement; the old note keeps its status until the owner
+                # verifies this one (see verify()).
+                self._audit(con, agent, "propose_supersede", note_id, f"replaces {supersedes}")
             self._audit(con, agent, "propose", note_id, kind)
-            clash = [r["id"] for r in con.execute(
-                "select id from notes where kind=? and lower(title)=lower(?) and body<>? and id<>? "
-                "and status in ('inbox','verified','contested')", (kind, title, body, note_id))]
-            if clash and supersedes is None:
-                ids = clash + [note_id]
+            clash = con.execute(
+                "select id, status from notes where kind=? and lower(title)=lower(?) and body<>? and id<>? "
+                "and id is not ? and status in ('inbox','verified','contested')",
+                (kind, title, body, note_id, supersedes)).fetchall()
+            if clash and agent == "user":
+                # The owner wrote a contradicting note: let the owner choose between them.
+                ids = [r["id"] for r in clash] + [note_id]
                 con.executemany("update notes set status='contested', updated_at=? where id=?",
                                 [(stamp, i) for i in ids])
                 self._audit(con, agent, "contested", note_id, ",".join(ids))
+            elif clash:
+                # An agent's note never changes the status of a note that is already verified; the newcomer
+                # is held back instead, and unverified rivals are held back with it.
+                ids = [note_id] + [r["id"] for r in clash if r["status"] == "inbox"]
+                con.executemany("update notes set status='contested', updated_at=? where id=?",
+                                [(stamp, i) for i in ids])
+                self._audit(con, agent, "contested", note_id, ",".join(r["id"] for r in clash))
             con.commit()
             return self._note(con, note_id)
 
@@ -265,10 +283,11 @@ class Brain:
             con.execute("update notes set status='verified', updated_at=? where id=?", (stamp, note_id))
             con.execute("insert into evidence(note_id,type,detail,added_by,added_at) values(?,?,?,?,?)",
                         (note_id, "user", detail, "user", stamp))
-            # Choosing one side of a conflict retires the competing notes.
+            # The owner's choice retires the competing notes and any note this one proposed to replace.
             rivals = [r["id"] for r in con.execute(
-                "select id from notes where kind=? and lower(title)=lower(?) and id<>? and status='contested'",
-                (note["kind"], note["title"], note_id))]
+                "select id from notes where id<>? and status in ('inbox','verified','contested') and "
+                "((kind=? and lower(title)=lower(?)) or id=?)",
+                (note_id, note["kind"], note["title"], note["supersedes"]))]
             for rival in rivals:
                 con.execute("update notes set status='superseded', updated_at=? where id=?", (stamp, rival))
                 self._audit(con, "user", "superseded", rival, f"conflict resolved for {note_id}")
@@ -335,10 +354,16 @@ class Brain:
         if con is None:
             return []
         with closing(con):
-            return [{"id": r["id"], "kind": r["kind"], "title": r["title"], "source_agent": r["source_agent"],
-                     "created_at": r["created_at"]}
-                    for r in con.execute("select * from notes where status='contested' order by kind, "
-                                         "lower(title), created_at")]
+            result = []
+            for r in con.execute("select * from notes where status='contested' order by kind, "
+                                 "lower(title), created_at").fetchall():
+                rivals = [x["id"] for x in con.execute(
+                    "select id from notes where kind=? and lower(title)=lower(?) and body<>? and id<>? "
+                    "and status in ('inbox','verified','contested') order by created_at",
+                    (r["kind"], r["title"], r["body"], r["id"]))]
+                result.append({"id": r["id"], "kind": r["kind"], "title": r["title"], "source_agent": r["source_agent"],
+                               "created_at": r["created_at"], "conflicts_with": rivals})
+            return result
 
     def audit_log(self, limit: int = 50) -> list[dict]:
         con = self._connect(False)
@@ -561,6 +586,25 @@ def _print(data) -> None:
     sys.stdout.write(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
 
 
+def _interactive() -> bool:
+    return sys.stdin.isatty() and sys.stdout.isatty()
+
+
+def confirm_as_owner(summary: str, token: str) -> None:
+    """Owner-only actions need a person at a terminal who types the confirmation back.
+
+    This is friction, not authentication: a process that can open a pseudo-terminal under the same
+    Windows account could still get through. It stops the common cases, an agent running the CLI
+    through a plain shell tool (stdin and stdout are pipes) or in a script, from approving its own work.
+    """
+    if not _interactive():
+        raise BrainError("this action changes what the project trusts, so it needs an interactive terminal; "
+                         "run it yourself in a terminal, not through an agent or a script")
+    print(summary)
+    if input(f"Type {token} to confirm: ").strip() != token:
+        raise BrainError("not confirmed; nothing was changed")
+
+
 def cli(argv: list[str] | None = None) -> int:
     for stream, options in ((sys.stdout, {"newline": "\n"}), (sys.stderr, {"newline": "\n"}), (sys.stdin, {})):
         try:
@@ -613,7 +657,10 @@ def cli(argv: list[str] | None = None) -> int:
             body = args.body
             if args.body_file:
                 body = sys.stdin.read() if args.body_file == "-" else Path(args.body_file).read_text(encoding="utf-8")
-            _print(brain.propose("user", args.kind, args.title, body or "",
+            title, text = clean(args.title, "title", MAX_TITLE), clean(body or "", "body", MAX_BODY)
+            confirm_as_owner(f"Write a VERIFIED {args.kind} note in project '{args.project}':\n  {title}\n  {text[:200]}",
+                             args.project)
+            _print(brain.propose("user", args.kind, title, text,
                                  [{"type": "file", "ref": f} for f in args.evidence_file], args.supersedes))
         elif args.command == "list":
             _print(brain.search(args.query, args.kind, args.all, args.limit))
@@ -622,6 +669,10 @@ def cli(argv: list[str] | None = None) -> int:
         elif args.command == "read":
             _print(brain.read(args.id))
         elif args.command == "verify":
+            note = brain.read(args.id)
+            extra = f"\n  it proposes to replace {note['pending_replacement']}" if note["pending_replacement"] else ""
+            confirm_as_owner(f"Verify note {note['id']} ({note['kind']}) proposed by {note['source_agent']}:\n"
+                             f"  {note['title']}\n  {note['body'][:200]}{extra}", note["id"])
             _print(brain.verify(args.id, "user", args.detail))
         elif args.command == "recheck":
             _print(brain.recheck())
@@ -634,6 +685,9 @@ def cli(argv: list[str] | None = None) -> int:
         elif args.command == "backup":
             _print(brain.backup(args.dest))
         elif args.command == "restore":
+            if args.replace:
+                confirm_as_owner(f"Replace the database of project '{args.project}' with {args.source} "
+                                 "(a safety copy of the current one is kept).", args.project)
             _print(brain.restore(args.source, args.replace))
         elif args.command == "register-plan":
             print(register_plan(args.project, None if args.brain_dir == DEFAULT_DIR else args.brain_dir))

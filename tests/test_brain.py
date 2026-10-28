@@ -106,15 +106,57 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(self.brain.read(b["id"])["status"], "superseded")
         self.assertEqual(self.brain.conflicts(), [])
 
-    def test_supersedes_retires_the_old_note_without_a_conflict(self):
-        old = self.brain.propose("claude", "decision", "Storage", "Use files.")
-        new = self.brain.propose("claude", "decision", "Storage", "Use SQLite.", supersedes=old["id"])
-        self.assertEqual(self.brain.read(old["id"])["status"], "superseded")
+    def test_an_agent_cannot_retire_a_verified_note_by_superseding_it(self):
+        good = self.brain.propose("user", "decision", "Storage", "Use SQLite.")
+        new = self.brain.propose("claude", "decision", "Storage", "Use a vector database.", supersedes=good["id"])
+        self.assertEqual(self.brain.read(good["id"])["status"], "verified")
+        self.assertEqual([n["id"] for n in self.brain.search("storage")], [good["id"]])
         self.assertEqual(new["status"], "inbox")
+        self.assertEqual(new["pending_replacement"], good["id"])
+        self.assertIn("proposes to replace", new["trust"])
+        # Only the owner's approval retires the old note.
+        self.brain.verify(new["id"])
+        self.assertEqual(self.brain.read(good["id"])["status"], "superseded")
+        self.assertEqual([n["id"] for n in self.brain.search("storage")], [new["id"]])
+
+    def test_an_agent_cannot_retire_an_unverified_note_either(self):
+        old = self.brain.propose("claude", "decision", "Storage", "Use files.")
+        new = self.brain.propose("codex", "decision", "Storage", "Use SQLite.", supersedes=old["id"])
+        self.assertEqual(self.brain.read(old["id"])["status"], "inbox")
+        self.assertEqual(new["status"], "inbox")
+        self.brain.verify(new["id"])
+        self.assertEqual(self.brain.read(old["id"])["status"], "superseded")
         with self.assertRaises(BrainError):
             self.brain.propose("claude", "decision", "Storage", "Again.", supersedes=old["id"])
         with self.assertRaises(BrainError):
             self.brain.verify(old["id"])
+
+    def test_the_owner_can_supersede_immediately(self):
+        old = self.brain.propose("user", "decision", "Storage", "Use files.")
+        new = self.brain.propose("user", "decision", "Storage", "Use SQLite.", supersedes=old["id"])
+        self.assertEqual(self.brain.read(old["id"])["status"], "superseded")
+        self.assertEqual(new["status"], "verified")
+
+    def test_a_contradicting_agent_note_never_demotes_a_verified_note(self):
+        good = self.brain.propose("user", "decision", "Storage", "Use SQLite.")
+        clash = self.brain.propose("codex", "decision", "storage", "Use a hosted service.")
+        self.assertEqual(self.brain.read(good["id"])["status"], "verified")
+        self.assertEqual([n["id"] for n in self.brain.search("storage")], [good["id"]])
+        self.assertEqual(clash["status"], "contested")
+        pending = self.brain.conflicts()
+        self.assertEqual([(c["id"], c["conflicts_with"]) for c in pending], [(clash["id"], [good["id"]])])
+        # The owner can still choose the newcomer; then the old note is retired.
+        self.brain.verify(clash["id"])
+        self.assertEqual(self.brain.read(good["id"])["status"], "superseded")
+        self.assertEqual(self.brain.conflicts(), [])
+
+    def test_no_agent_action_changes_the_status_of_a_verified_note(self):
+        good = self.brain.propose("user", "fact", "Port", "Port 8080.")
+        for agent in ("claude", "codex", "antigravity"):
+            self.brain.propose(agent, "fact", "Port", f"Port {agent}.", supersedes=good["id"])
+            self.brain.propose(agent, "fact", "port", f"Other {agent}.")
+        self.assertEqual(self.brain.read(good["id"])["status"], "verified")
+        self.assertEqual([n["id"] for n in self.brain.search("port")], [good["id"]])
 
     def test_identical_proposals_are_not_duplicated(self):
         a = self.brain.propose("claude", "fact", "Same", "Same text.")
@@ -262,8 +304,9 @@ class McpTests(unittest.TestCase):
         return c
 
     def owner(self, *args) -> subprocess.CompletedProcess:
+        # stdin is closed and the call has a deadline: a regression must fail fast, never hang on a prompt.
         return subprocess.run([sys.executable, "-I", str(SCRIPT), "--brain-dir", str(self.dir), "--project", "demo", *args],
-                              capture_output=True, text=True, encoding="utf-8")
+                              capture_output=True, text=True, encoding="utf-8", stdin=subprocess.DEVNULL, timeout=60)
 
     def test_handshake_and_tool_list_expose_no_verify_or_delete(self):
         c = self.proc_client = McpClient(self.dir, "demo", "claude")
@@ -332,17 +375,22 @@ class McpTests(unittest.TestCase):
         self.assertEqual(read["evidence"][0]["type"], "file")
 
         # 3. The owner confirms it; Gemini now retrieves it by default, as verified.
-        done = self.owner("verify", note["id"], "--detail", "reviewed ADR-1")
-        self.assertEqual(done.returncode, 0, done.stderr)
+        Brain(self.dir, "demo").verify(note["id"], "user", "reviewed ADR-1")  # the owner's step, in a terminal
         got = gemini.tool("brain_search", query="memory backend")["notes"]
         self.assertEqual([(g["id"], g["verified"]) for g in got], [(note["id"], True)])
         self.assertEqual(gemini.tool("brain_read", id=note["id"])["status"], "verified")
 
-        # 4. A contradicting proposal from another agent surfaces as a conflict for the owner.
-        codex.tool("brain_propose", kind="decision", title="memory backend", body="Use a hosted vector service.")
+        # 4. A contradicting proposal from another agent is held back for the owner; it does NOT demote
+        #    or hide the verified note.
+        rival = codex.tool("brain_propose", kind="decision", title="memory backend", body="Use a hosted vector service.")
+        self.assertEqual(rival["status"], "contested")
         conflicts = gemini.tool("brain_conflicts")["conflicts"]
-        self.assertEqual(len(conflicts), 2)
-        self.assertEqual(gemini.tool("brain_search", query="memory backend"), {"notes": []})
+        self.assertEqual([(c["id"], c["conflicts_with"]) for c in conflicts], [(rival["id"], [note["id"]])])
+        still = gemini.tool("brain_search", query="memory backend")["notes"]
+        self.assertEqual([(g["id"], g["verified"]) for g in still], [(note["id"], True)])
+        # An agent also cannot replace it by claiming to supersede it.
+        claude.tool("brain_propose", kind="decision", title="Memory backend", body="Use files.", supersedes=note["id"])
+        self.assertEqual(gemini.tool("brain_read", id=note["id"])["status"], "verified")
 
         # 5. The audit trail names every actor.
         log = self.owner("audit")
@@ -357,16 +405,58 @@ class McpTests(unittest.TestCase):
             self.assertIn(expected, out.stdout)
         self.assertEqual(set(self.dir.rglob("*")) if self.dir.exists() else set(), before)
 
-    def test_owner_cli_end_to_end(self):
-        made = self.owner("propose", "--kind", "lesson", "--title", "Backups", "--body", "Back up first.")
-        self.assertEqual(made.returncode, 0, made.stderr)
-        self.assertEqual(json.loads(made.stdout)["status"], "verified")
+    def test_owner_actions_are_refused_without_an_interactive_terminal(self):
+        # Through a pipe (how an agent's shell tool runs commands) the trust-changing commands are refused.
+        proposal = Brain(self.dir, "demo").propose("claude", "fact", "Idea", "Only an idea.")
+        backup = Path(self.temp.name) / "b.db"
+        Brain(self.dir, "demo").backup(backup)
+        for args in (("propose", "--kind", "lesson", "--title", "Backups", "--body", "Back up first."),
+                     ("verify", proposal["id"]),
+                     ("restore", str(backup), "--replace")):
+            result = self.owner(*args)
+            self.assertEqual(result.returncode, 2, args)
+            self.assertIn("interactive terminal", result.stderr)
+        self.assertEqual(Brain(self.dir, "demo").read(proposal["id"])["status"], "inbox")
+        self.assertEqual(Brain(self.dir, "demo").search(), [])
+        # Read-only commands still work.
+        self.assertEqual(self.owner("list", "--all").returncode, 0)
+        self.assertEqual(self.owner("conflicts").returncode, 0)
+
+    def run_cli(self, argv, interactive=True, typed=""):
+        import contextlib
+        import io
+        from unittest import mock
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(brain, "_interactive", return_value=interactive), \
+                mock.patch("builtins.input", return_value=typed) as asked, \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = brain.cli(["--brain-dir", str(self.dir), "--project", "demo", *argv])
+        return code, out.getvalue(), err.getvalue(), asked
+
+    def test_owner_cli_with_a_terminal_and_the_typed_confirmation(self):
+        code, out, err, asked = self.run_cli(["propose", "--kind", "lesson", "--title", "Backups",
+                                              "--body", "Back up first."], typed="demo")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(json.loads(out[out.index("{"):])["status"], "verified")
+        asked.assert_called_once()
         listed = json.loads(self.owner("list").stdout)
         self.assertEqual([n["title"] for n in listed], ["Backups"])
-        refused = self.owner("propose", "--kind", "fact", "--title", "t", "--body", "token = " + "abcdefgh1234")
-        self.assertEqual(refused.returncode, 2)
-        self.assertIn("secret", refused.stderr)
-        self.assertNotIn("abcdefgh1234", refused.stderr)
+
+        proposal = Brain(self.dir, "demo").propose("claude", "fact", "Idea", "Only an idea.")
+        code, _, err, _ = self.run_cli(["verify", proposal["id"]], typed="yes")
+        self.assertEqual(code, 2)
+        self.assertEqual(Brain(self.dir, "demo").read(proposal["id"])["status"], "inbox")
+        code, _, err, _ = self.run_cli(["verify", proposal["id"]], typed=proposal["id"])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(Brain(self.dir, "demo").read(proposal["id"])["status"], "verified")
+
+    def test_the_cli_refuses_a_secret_before_it_even_asks_for_confirmation(self):
+        code, _, err, asked = self.run_cli(["propose", "--kind", "fact", "--title", "t",
+                                            "--body", "token = " + "abcdefgh1234"], typed="demo")
+        self.assertEqual(code, 2)
+        self.assertIn("secret", err)
+        self.assertNotIn("abcdefgh1234", err)
+        asked.assert_not_called()
 
 
 if __name__ == "__main__":
