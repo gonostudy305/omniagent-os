@@ -121,7 +121,7 @@ codex exec --skip-git-repo-check --ephemeral -s read-only -c 'approval_policy="n
 
 ## Chưa làm
 
-- Đăng ký vào cấu hình thật của ba agent (M3) và thử bằng agent thật.
+- Đăng ký vào cấu hình thật của ba agent (M3) và thử bằng agent thật: kế hoạch ở [M3_REGISTRATION_PLAN.md](M3_REGISTRATION_PLAN.md), chưa áp dụng.
 - Tìm kiếm ngữ nghĩa (hiện chỉ khớp chuỗi con, không embedding).
 - Nhập có chọn lọc từ bộ nhớ Claude Code (M4); không nhập từ Antigravity.
 - Kiểm chứng tự động bằng cách chạy lại lệnh (cố ý không làm: sẽ thực thi lệnh do agent đề xuất).
