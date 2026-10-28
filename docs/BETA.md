@@ -23,6 +23,8 @@ Chưa dùng ở beta:
 | 4 | Adopt và rollback không đổi byte nào | Đạt | `tests/test_byte_identity.py` (chu trình đủ bước trên fixture, kể cả thư mục rỗng) và chạy thật trên 3 skill: băm SHA-256 trước và sau, cả thư mục `~/.agents/skills` giữ nguyên số file và thời điểm sửa đổi |
 | 5 | Tài liệu, release notes, hướng dẫn khôi phục | Đạt | Trang này, [RELEASE_NOTES_v0.3.0-beta.1.md](RELEASE_NOTES_v0.3.0-beta.1.md), mục "Phục hồi" trong [USAGE.md](USAGE.md) |
 
+Trước buổi thử, chạy smoke test chỉ-đọc (xem [QUICKSTART.md](QUICKSTART.md)): `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\smoke_beta.ps1 -Source <template> -Manifest <adapters.json>`. Thêm `-Mode Trial` để nó tự thực hiện adopt, plan, rollback trong state mới và băm byte trước và sau. Script không chứng minh được agent có nạp skill hay hoàn thành tác vụ; hai mục đó luôn hiển thị `NOT VERIFIED` cho tới khi bạn thử tay.
+
 ## Buổi dùng thử an toàn (chỉ ghi state thử, không sửa nội dung skill nào)
 
 Điều kiện: đã backup thư mục skill và `.local/manager/`; dùng thư mục state **riêng** cho buổi thử.

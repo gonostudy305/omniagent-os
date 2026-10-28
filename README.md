@@ -52,7 +52,7 @@ flowchart TD
 
 - **Single Source of Truth (SSOT):** Maintain one canonical copy of skills to eliminate redundant copies across agent directories.
 - **Safe Skill Manager MVP:** Inventory, plan, copy, update, and roll back *managed* skill copies. Existing unmanaged skills are never replaced automatically.
-- **Smart Path Decoupling (v0.3 Draft):** `path_adapter.py` previews explicitly templated references (`{{SKILLS_DIR}}`) and verifies hashes per agent. A guarded, one-skill/one-target rendered `apply` is available for disposable fixtures only; ordinary `apply` refuses to overwrite managed rendered copies without a manifest.
+- **Smart Path Decoupling (v0.3 beta):** `path_adapter.py` previews explicitly templated references (`{{SKILLS_DIR}}`) and verifies hashes per agent. A guarded, one-skill/one-target rendered `apply` is available for disposable fixtures only; ordinary `apply` refuses to overwrite managed rendered copies without a manifest.
 - **Clean Source & Reproducible Dependencies:** Keeps repository source free of committed vendor packages (`node_modules`), with planned hydration scripts for skills requiring local runtime environments.
 - **Preserved System Runtimes:** Safely isolates vendor-specific runtimes (e.g., OpenAI `.system` skills) without polluting cross-agent tool registries.
 - **Audit & Validation Tooling:** Built-in Python scripts to audit, deduplicate, and verify parity across all local agent installations.
@@ -68,9 +68,10 @@ flowchart TD
 ├── audit_skills.py           # Fast SHA-256 hash & line-level unified diff auditor
 ├── generate_report.py        # Generates markdown audit reports
 ├── omniagent.py              # Safe discover / plan / adopt / apply / rollback CLI
-├── path_adapter.py           # Read-only v0.3 per-agent template preview
+├── path_adapter.py           # v0.3 per-agent template render, adapter-aware plan and adopt
 ├── adapters.example.json     # Public example; private manifest belongs in .local/
-├── tests/                    # Synthetic audit and Skill Manager safety tests
+├── scripts/smoke_beta.ps1    # Windows beta smoke test (read-only by default)
+├── tests/                    # Synthetic audit, Skill Manager safety, crash and smoke-script tests
 ├── SKILLS_AUDIT_REPORT.md    # Case study audit report across 4 skill stores
 └── ssot/                     # Local SSOT directory (managed locally / .gitignored)
     └── skills/               # Canonical, clean skills library
@@ -178,8 +179,9 @@ existing agent stores yet.
 - [docs/DEVELOPMENT_LOG.md](docs/DEVELOPMENT_LOG.md): what was done on a real machine, metrics, lessons
 - [docs/USAGE.md](docs/USAGE.md): Skill Manager runbook (discover, adopt, plan, apply, rollback)
 - [docs/PATH_ADAPTER.md](docs/PATH_ADAPTER.md): v0.3 template preview, guarded fixture apply and rollback
+- [docs/QUICKSTART.md](docs/QUICKSTART.md): 10-minute Windows start, smoke test and troubleshooting
 - [docs/BETA.md](docs/BETA.md): controlled beta guide, release criteria and evidence
-- [docs/RELEASE_NOTES_v0.3.0-beta.1.md](docs/RELEASE_NOTES_v0.3.0-beta.1.md): draft release notes
+- [docs/RELEASE_NOTES_v0.3.0-beta.1.md](docs/RELEASE_NOTES_v0.3.0-beta.1.md): release notes for the published pre-release
 
 ---
 
@@ -191,7 +193,7 @@ existing agent stores yet.
 - [x] Phase 4a: Conservative local Skill Manager MVP (discover, plan, adopt exact matches, copy, rollback).
 - [x] Phase 4b preview: Read-only, explicit per-agent path template renderer and drift detection (v0.3a).
 - [x] Phase 4b guarded fixture apply: single-skill adapter-aware staging, hash verification and rollback (v0.3b experimental).
-- [x] Phase 4b hardening (v0.3 beta candidate): adapter-aware adoption and crash-safe journal recovery (two-phase commit, `recover`).
+- [x] Phase 4b hardening (released as v0.3.0-beta.1): adapter-aware adoption, journaled apply and rollback, `recover`, `fsync`, junction detection.
 - [ ] Phase 4b remaining: drift reconciliation for partially converted installs, dependency-aware validation, execution compatibility checks on Codex/Antigravity.
 - [ ] Phase 5: Automated dependency hydration for skills with package requirements.
 - [ ] Phase 6: Cross-Agent Memory Integration via MCP (Memorix / Local Knowledge Graph).
@@ -203,7 +205,7 @@ existing agent stores yet.
 | Phiên bản | Phase trong lộ trình | Nội dung | Trạng thái |
 |---|---|---|---|
 | v0.2.0 | 4a | Skill Manager MVP | Đã phát hành (tag `v0.2.0`) |
-| v0.3.0-beta.1 | 4b | Path Adapter, adopt theo adapter, phục hồi giao dịch | PR #2 (Draft), chờ pilot trong agent thật |
+| v0.3.0-beta.1 | 4b | Path Adapter, adopt theo adapter, phục hồi giao dịch | Đã phát hành (pre-release, tag `v0.3.0-beta.1`); 3 skill pilot do chủ dự án tự xác nhận |
 | v0.3.x | 4b còn lại, 5 | Hòa giải skill lệch, hydration dependency | Chưa bắt đầu |
 | v0.4 | 6 | Shared Second Brain qua MCP | Chưa bắt đầu |
 | v0.5 | 7 | Điều phối nhiều agent | Chưa bắt đầu |
