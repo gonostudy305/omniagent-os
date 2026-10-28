@@ -68,6 +68,7 @@ flowchart TD
 ├── audit_skills.py           # Fast SHA-256 hash & line-level unified diff auditor
 ├── generate_report.py        # Generates markdown audit reports
 ├── omniagent.py              # Safe discover / plan / adopt / apply / rollback CLI
+├── brain.py                  # v0.4 shared second brain: SQLite notes + stdio MCP server
 ├── path_adapter.py           # Read-only v0.3 per-agent template preview
 ├── adapters.example.json     # Public example; private manifest belongs in .local/
 ├── tests/                    # Synthetic audit and Skill Manager safety tests
@@ -179,6 +180,7 @@ existing agent stores yet.
 - [docs/USAGE.md](docs/USAGE.md): Skill Manager runbook (discover, adopt, plan, apply, rollback)
 - [docs/PATH_ADAPTER.md](docs/PATH_ADAPTER.md): v0.3 template preview, guarded fixture apply and rollback
 - [docs/BETA.md](docs/BETA.md): controlled beta guide, release criteria and evidence
+- [docs/BRAIN.md](docs/BRAIN.md): shared second brain MVP (trust model, usage, what is verified and what is not)
 - [docs/RELEASE_NOTES_v0.3.0-beta.1.md](docs/RELEASE_NOTES_v0.3.0-beta.1.md): draft release notes
 
 ---
@@ -194,7 +196,7 @@ existing agent stores yet.
 - [x] Phase 4b hardening (v0.3 beta candidate): adapter-aware adoption and crash-safe journal recovery (two-phase commit, `recover`).
 - [ ] Phase 4b remaining: drift reconciliation for partially converted installs, dependency-aware validation, execution compatibility checks on Codex/Antigravity.
 - [ ] Phase 5: Automated dependency hydration for skills with package requirements.
-- [ ] Phase 6: Cross-Agent Memory Integration via MCP (Memorix / Local Knowledge Graph).
+- [~] Phase 6: Cross-Agent Memory Integration via MCP. MVP store and stdio MCP server done (`brain.py`, tested with a fake MCP client); registration into the real agents is not applied yet.
 - [ ] Phase 7: Multi-agent coordination: handoff, context sharing, permissions and conflict avoidance (git worktrees).
 - [ ] Phase 8: Windows Local Agent OS v1.0: installer/CLI, dependency hydration, health checks, onboarding and release testing.
 
