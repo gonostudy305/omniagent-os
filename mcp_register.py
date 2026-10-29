@@ -43,6 +43,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import brain
+from omniagent import process_alive
 
 if os.name == "nt":
     import msvcrt
@@ -66,30 +67,6 @@ class RegisterError(Exception):
 
 class LockBusy(RegisterError):
     """Another process holds the config's lock, or whether one does could not be determined."""
-
-
-def is_pid_alive(pid: int | None) -> bool:
-    """True if a process with this PID is currently running. Safe against Windows console signals."""
-    if not pid or pid <= 0:
-        return False
-    if os.name == "nt":
-        import ctypes
-        kernel32 = ctypes.windll.kernel32
-        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
-        if not handle:
-            return False
-        exit_code = ctypes.c_ulong()
-        kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code))
-        kernel32.CloseHandle(handle)
-        return exit_code.value == 259  # STILL_ACTIVE
-    try:
-        os.kill(pid, 0)
-        return True
-    except PermissionError:
-        return True
-    except OSError:
-        return False
 
 
 def short(value) -> str:
@@ -426,8 +403,10 @@ def run_cli(cmd: list[str], cwd: Path | None, on_start=None) -> tuple[int, str]:
     if on_start is not None:
         try:
             on_start(proc.pid)
-        except Exception:
-            pass
+        except Exception as exc:
+            proc.kill()
+            proc.wait()
+            raise RegisterError(f"could not record child writer PID ({exc}); process terminated") from exc
     try:
         stdout, stderr = proc.communicate(timeout=120)
     except subprocess.TimeoutExpired:
@@ -592,19 +571,16 @@ def apply(agent: str, config: Path, cli: str, scope: str, project_dir: Path, bra
                 handshake(entry["command"], list(entry.get("args") or []))
             except RegisterError as exc:
                 problems.append(f"registered command failed the handshake: {exc}")
-        if file_sha(config) != written:
-            problems.append("config file was modified by an external process during registration")
         if problems:
             current = file_sha(config)
             if current == original:
                 removed = {"clean": True, "problems": []}  # the CLI wrote nothing
             elif current == written:
                 removed = restore_original(config, folder, original or ABSENT)  # only the CLI wrote: undo all of it
-            else:  # something else wrote after the CLI (current != written): leave as-is to preserve external edits
-                removed = {"clean": False, "problems": [
-                    "config file was modified by an external process during registration (current content differs from CLI output); "
-                    "the writer cannot be distinguished, so the file was left as-is to preserve evidence; config.bak holds the original"
-                ]}
+            else:  # something else wrote after the CLI: keep that, remove only our entry
+                removed = rollback_entry(agent, config, cli, scope, project_dir, before)
+                removed["problems"] += settings_changes(before_settings, settings(agent, config))[0]
+                removed["clean"] = not removed["problems"]
             journal["state"] = "failed-rolled-back" if removed["clean"] else "failed-needs-attention"
             write_journal(folder, journal)
             raise RegisterError("registration failed and was reverted: " + "; ".join(problems) if removed["clean"]
@@ -647,10 +623,6 @@ def rollback_entry(agent: str, config: Path, cli: str, scope: str, project_dir: 
         if code != 0:
             problems.append(f"`mcp remove` exited with {code}: {out}")
         written = file_sha(config)
-        current = file_sha(config)
-        if current != written:
-            problems.append("config file was modified by another process while removing the entry; leaving file as-is for manual resolution")
-            return {"clean": False, "problems": problems}
         changed = settings_changes(start_settings, settings(agent, config))[0]
         if changed:
             if written == file_sha(config):
@@ -721,8 +693,9 @@ def _settle(folder: Path, journal: dict) -> tuple[str, str]:
     where = _scope_name(agent, journal["scope"], project_dir)
     if journal["state"] == "writing":
         child_pid = journal.get("child_pid")
-        if child_pid and is_pid_alive(child_pid):
-            return "in-progress", (f"writer process (PID {child_pid}) is still running; wait for it to exit "
+        if child_pid and process_alive(child_pid) is not False:
+            alive_desc = "still running" if process_alive(child_pid) is True else "status unknown"
+            return "in-progress", (f"writer process (PID {child_pid}) is {alive_desc}; wait for it to exit "
                                   f"before recovering (or terminate it manually with taskkill/kill); left alone")
     if (file_sha(config) or ABSENT) == journal["original_sha256"]:
         return "aborted-unchanged", ""

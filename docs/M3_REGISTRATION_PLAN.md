@@ -163,20 +163,23 @@ Test với CLI giả bao gồm: thiếu file, file hỏng, UTF-16, BOM + CRLF, m
 
 **Chưa kiểm chứng:** đăng ký vào profile thật (cần bạn cho phép riêng); Antigravity với CLI hay IDE thật; agent thật tự gọi tool qua mục do công cụ này đăng ký (lần chạy có đăng nhập trong [BRAIN.md](BRAIN.md) dùng cờ từng lần, không dùng mục đã đăng ký); khóa trên macOS (chỉ chạy Windows và Ubuntu); CLI mồ côi sau khi `apply` bị kill (mục 6).
 
-## 9. M3.2 Preflight: Kiểm chứng tích hợp an toàn trước Pilot
+## 9. Gia cố an toàn trước Pilot M3.2 (Preflight Hardening)
 
-Kết quả preflight hoàn thành trên nhánh `feat/m3.2-preflight-integration` nhằm chứng minh quy trình đăng ký đạt chuẩn an toàn fail-closed cho thử nghiệm Claude Code `--scope local`.
+Kết quả gia cố an toàn chuẩn bị cho thử nghiệm M3.2 (đăng ký thật vào Claude Code `--scope local`). Bản thân thử nghiệm M3.2 sẽ chỉ thực hiện khi có chỉ đạo và phê duyệt riêng.
 
 ### 9.1. Xử lý rủi ro tiến trình con mồ côi (Orphaned CLI Writer)
-- **Cơ chế:** Khi `apply` bước vào trạng thái `writing`, nó khởi tạo tiến trình con qua `subprocess.Popen` và ghi ngay `child_pid` vào `journal.json` trước khi chờ đợi.
-- **Kiểm tra trạng thái sống an toàn:** Hàm `is_pid_alive(pid)` trên Windows dùng trực tiếp Windows API `kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)` và `GetExitCodeProcess`. Tuyệt đối không dùng `os.kill(pid, 0)` trên Windows vì có thể phát tán tín hiệu console `CTRL_C_EVENT` gây ngắt tiến trình cha hoặc IDE. Trên POSIX, sử dụng kiểm tra tín hiệu chuẩn qua `os.kill(pid, 0)`.
-- **Hành vi của `recover`:** Khi nhật ký ở trạng thái `writing` và `child_pid` còn sống, `recover` trả về `in-progress`, không chạm vào file cấu hình, không xóa bản ghi chủ (`owner`), và cung cấp hướng dẫn dừng tiến trình con thủ công. Chỉ khi tiến trình con đã thoát, `recover` mới tiến hành thu dọn an toàn.
-- **Kiểm chứng:** Test `test_recover_leaves_running_child_writer_alone` chứng minh tiến trình con đang chạy được giữ nguyên hoàn toàn.
+- **Cơ chế:** Khi `apply` bước vào trạng thái `writing`, nó khởi tạo tiến trình con qua `subprocess.Popen` và ghi ngay `child_pid` vào `journal.json`. Nếu việc ghi nhận `child_pid` thất bại (hoặc callback `on_start` gặp lỗi), tiến trình con lập tức bị chấm dứt (`proc.kill()`) và báo lỗi fail-closed, không để sót tiến trình con không kiểm soát.
+- **Kiểm tra trạng thái sống qua `omniagent.process_alive`:** Sử dụng lại hàm `process_alive` từ `omniagent.py`:
+  - Trên Windows: Dùng trực tiếp Windows API với đầy đủ `wintypes` (`OpenProcess(SYNCHRONIZE, False, pid)` + `WaitForSingleObject(handle, 0)`), chuẩn xác trên kiến trúc 64-bit và không phát tán bất kỳ tín hiệu console nào (loại trừ hoàn toàn rủi ro Ctrl+C / `KeyboardInterrupt`). Nếu gặp lỗi truy cập hoặc hệ điều hành, hàm trả về `None` (không rõ, fail-closed).
+  - Trên POSIX: Sử dụng `os.kill(pid, 0)` với xử lý tường minh `ProcessLookupError` (False), `PermissionError` (True), `OSError` (None).
+- **Hành vi của `recover`:** Khi nhật ký ở trạng thái `writing` và `child_pid` còn sống (hoặc không thể xác định chắc chắn là đã chết, `process_alive(child_pid) is not False`), `recover` trả về `in-progress`, không chạm vào file cấu hình, không xóa bản ghi chủ (`owner`), và cung cấp hướng dẫn dừng tiến trình con thủ công. Chỉ khi tiến trình con đã xác nhận kết thúc, `recover` mới tiến hành thu dọn an toàn.
+- **Lưu ý về tái sử dụng PID:** Nếu hệ điều hành tái sử dụng (reuse) đúng PID đó cho một tiến trình khác trước khi `recover` chạy, `process_alive` sẽ thấy PID đang chạy và giữ nguyên `in-progress`. Đây là hướng an toàn (fail-closed, tránh ghi đè nhầm lên writer đang hoạt động); người dùng chỉ cần đợi tiến trình kết thúc hoặc dọn dẹp bản ghi owner thủ công.
 
-### 9.2. Bảo vệ chống ghi đè do chỉnh sửa đồng thời ngoài luồng (Concurrent External Edits)
-- **Cơ chế phát hiện:** `apply` ghi nhận `written = file_sha(config)` ngay khi lệnh `mcp add` vừa kết thúc. Trong suốt quá trình xác minh (handshake, snapshot), nếu phát hiện `file_sha(config) != written`, công cụ ghi nhận lỗi sửa đổi ngoài luồng.
-- **Fail-closed:** Khi xảy ra xung đột mà không thể phân định rõ ràng người sửa (CLI hay ứng dụng ngoài), công cụ **tuyệt đối không** tự động ghi đè file cấu hình bằng `config.bak`. File được giữ nguyên như hiện trạng để bảo toàn thay đổi của người dùng; `config.bak` được lưu lại làm bằng chứng trong thư mục backup; nhật ký chuyển sang `failed-needs-attention`.
-- **Kiểm chứng:** Các test `test_external_edit_during_apply_is_not_overwritten_and_fails_closed` và `test_external_edit_after_cli_write_is_not_overwritten` xác nhận không có bất kỳ thiết lập người dùng nào bị ghi đè tự động khi có tác nhân ngoài can thiệp.
+### 9.2. Xử lý chỉnh sửa đồng thời ngoài luồng (Concurrent External Edits)
+- **Bảo toàn sửa đổi ngoài luồng:** Khi file cấu hình bị một chương trình khác thay đổi sau khi CLI của agent ghi (`current != written`):
+  - Nếu bước xác minh thất bại (ví dụ: bắt tay MCP thất bại hoặc thiết lập ngoài bị thay đổi), công cụ **không dùng `config.bak` để ghi đè toàn bộ file** (tránh làm mất sửa đổi ngoài luồng của người dùng), mà gọi `rollback_entry` để **gỡ riêng mục `omniagent-brain`** thông qua `mcp remove` của chính agent, đồng thời bảo toàn các sửa đổi của chương trình khác.
+  - Khi bước xác minh thành công và cấu hình hợp lệ, mục đăng ký được giữ lại cùng các sửa đổi ngoài luồng mà không bị hủy bỏ sai lầm.
+- **Kiểm chứng:** Test `test_external_edit_after_cli_write_preserves_external_edit_and_removes_entry` xác nhận khi xảy ra lỗi xác minh sau một sửa đổi ngoài luồng, mục `omniagent-brain` được gỡ bỏ sạch sẽ và sửa đổi ngoài luồng vẫn được giữ nguyên.
 
 ### 9.3. Tương thích khóa `theme` trên Claude Code 2.1.246
 - **Tái hiện:** Khi chạy `claude mcp add` (cả ở phạm vi `--scope local` lẫn `--scope project`), Claude Code 2.1.246 đọc `~/.claude.json`, chuẩn hóa và tự động lược bỏ khóa `theme`.
@@ -199,10 +202,10 @@ Kết quả preflight hoàn thành trên nhánh `feat/m3.2-preflight-integration
 
 - **TESTED (Đã kiểm chứng đạt PASS):**
   - Môi trường sandbox dùng một lần với CLI thật (Claude Code 2.1.246, Codex 0.163.0): plan, apply, handshake, serve project isolation, rollback byte-for-byte, và rollback entry-only.
-  - Xử lý tiến trình con mồ côi và tránh can thiệp khi writer còn sống.
-  - Chống ghi đè khi có sửa đổi ngoài luồng đồng thời.
+  - Xử lý tiến trình con mồ côi qua `omniagent.process_alive` và tránh can thiệp khi writer còn sống hoặc chưa rõ trạng thái.
+  - Bảo toàn sửa đổi ngoài luồng đồng thời và gỡ bỏ đúng entry khi xác minh thất bại.
   - Từ chối an toàn và hoàn tác byte-for-byte khi Claude CLI xóa `theme`.
-  - Bộ 257 unit tests (bao gồm 91 test cho `mcp_register.py`).
+  - Toàn bộ 257 unit/regression tests địa phương và trên CI.
 
 - **NOT_VERIFIED (Chưa kiểm chứng):**
   - Đăng ký vào profile thật của người dùng trên máy thật (chờ phê duyệt M3.2).

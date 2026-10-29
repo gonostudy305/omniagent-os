@@ -668,22 +668,32 @@ class InterruptedTests(Base):
         self.assertIn("model", err[0])
         self.assertIn("changed", err[0])
 
-    def test_external_edit_after_cli_write_is_not_overwritten(self):
+    def test_external_edit_after_cli_write_preserves_external_edit_and_removes_entry(self):
         calls = []
         real_handshake = reg.handshake
         def fake_handshake(*args, **kwargs):
             calls.append(1)
             if len(calls) == 2:
                 # 1st call is in plan; 2nd call is in apply after CLI wrote (current != written)
-                self.config.write_bytes(self.config.read_bytes() + b"\n# external write\n")
+                if self.kind == "codex":
+                    self.config.write_bytes(self.config.read_bytes() + b"\n# external write\n")
+                else:
+                    doc = json.loads(self.config.read_text(encoding="utf-8"))
+                    doc["external_marker"] = "keep_me"
+                    self.config.write_text(json.dumps(doc, indent=2), encoding="utf-8")
+                raise reg.RegisterError("simulated handshake failure")
             return real_handshake(*args, **kwargs)
 
         with mock.patch.object(reg, "handshake", fake_handshake):
             with self.assertRaises(reg.RegisterError) as ctx:
                 self.call_apply("user")
-            self.assertIn("could not be fully reverted", str(ctx.exception))
-            self.assertIn("config file was modified by an external process", str(ctx.exception))
-            self.assertIn(b"# external write", self.config.read_bytes())
+            self.assertIn("registration failed and was reverted", str(ctx.exception))
+            self.assertIn("simulated handshake failure", str(ctx.exception))
+            # External edit is preserved (not overwritten by config.bak)
+            content = self.config.read_text(encoding="utf-8")
+            self.assertTrue("# external write" in content or "external_marker" in content)
+            # omniagent-brain entry was removed by rollback_entry, not left active!
+            self.assertNotIn(reg.NAME, self.names())
 
     def test_a_lock_left_before_any_journal_is_released_by_recover(self):
         lid = reg.lock_id(self.config)
