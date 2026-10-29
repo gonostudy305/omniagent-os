@@ -551,9 +551,36 @@ for i in range(int(sys.argv[4])):
         b.search(None, None, True, 5)
     except Exception as exc:
         errors += 1
-        print(type(exc).__name__, exc, file=sys.stderr)
+        import traceback
+        where = [f.line for f in traceback.extract_tb(exc.__traceback__) if f.filename.endswith("brain.py")][-1:]
+        print(type(exc).__name__, exc, "at", where, file=sys.stderr)
 sys.exit(1 if errors else 0)
 """
+
+    def test_a_busy_database_is_retried_until_the_deadline(self):
+        from unittest import mock
+        calls = []
+
+        @brain._retry_busy
+        def flaky(fail_times, message="database is locked"):
+            calls.append(1)
+            if len(calls) <= fail_times:
+                raise brain.sqlite3.OperationalError(message)
+            return "done"
+
+        with mock.patch.object(brain.time, "sleep"):
+            self.assertEqual(flaky(3), "done")
+            self.assertEqual(len(calls), 4)
+            calls.clear()
+            with self.assertRaises(brain.sqlite3.OperationalError):  # other errors are never retried
+                flaky(1, "no such table: notes")
+            self.assertEqual(len(calls), 1)
+            calls.clear()
+            clock = iter(range(0, 1000, 10))
+            with mock.patch.object(brain.time, "monotonic", lambda: next(clock)), \
+                    self.assertRaises(brain.sqlite3.OperationalError):  # gives up after BUSY_SECONDS
+                flaky(10_000)
+            self.assertLess(len(calls), 10)
 
     def test_parallel_servers_do_not_hit_database_is_locked(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -16,6 +16,7 @@ Trust model:
 from __future__ import annotations
 
 import argparse
+import functools
 import hashlib
 import json
 import math
@@ -25,6 +26,7 @@ import secrets
 import shutil
 import sqlite3
 import sys
+import time
 import uuid
 from contextlib import closing
 from datetime import datetime, timezone
@@ -137,6 +139,29 @@ create table if not exists meta(key text primary key, value text);
 """
 
 
+def _retry_busy(method):
+    """Re-run a whole operation when SQLite reports the file busy.
+
+    busy_timeout covers most waits, but SQLite can still return SQLITE_BUSY without calling the busy
+    handler (for example while another process's last connection checkpoints and removes the WAL on
+    Windows). Each operation is one transaction that rolls back on error, so running it again is safe;
+    after BUSY_SECONDS the error is raised as usual.
+    """
+    @functools.wraps(method)
+    def wrapper(*args, **kwargs):
+        deadline, pause = time.monotonic() + BUSY_SECONDS, 0.05
+        while True:
+            try:
+                return method(*args, **kwargs)
+            except sqlite3.OperationalError as exc:
+                text = str(exc).lower()
+                if ("locked" not in text and "busy" not in text) or time.monotonic() + pause > deadline:
+                    raise
+                time.sleep(pause)
+                pause = min(pause * 2, 1.0)
+    return wrapper
+
+
 class Brain:
     """One project's store: `<brain_dir>/<project>.db`."""
 
@@ -205,6 +230,7 @@ class Brain:
         return note
 
     # -- writing
+    @_retry_busy
     def propose(self, agent: str, kind: str, title: str, body: str, evidence: list | None = None,
                 supersedes: str | None = None, session: str | None = None) -> dict:
         if agent not in AGENTS:
@@ -284,6 +310,7 @@ class Brain:
             con.commit()
             return self._note(con, note_id)
 
+    @_retry_busy
     def verify(self, note_id: str, by: str = "user", detail: str = "confirmed by the project owner") -> dict:
         if by != "user":
             raise BrainError("only the project owner (user) can verify a note")
@@ -308,6 +335,7 @@ class Brain:
             con.commit()
             return self._note(con, note_id)
 
+    @_retry_busy
     def recheck(self) -> list[dict]:
         """Flag verified notes whose file evidence changed or disappeared."""
         drifted = []
@@ -330,6 +358,7 @@ class Brain:
         return drifted
 
     # -- reading
+    @_retry_busy
     def search(self, query: str | None = None, kind: str | None = None, include_unverified: bool = False,
                limit: int = 20) -> list[dict]:
         con = self._connect(False)
@@ -355,6 +384,7 @@ class Brain:
                      "created_at": r["created_at"], "snippet": r["body"][:200]}
                     for r in con.execute(sql, args)]
 
+    @_retry_busy
     def read(self, note_id: str) -> dict:
         con = self._connect(False)
         if con is None:
@@ -362,6 +392,7 @@ class Brain:
         with closing(con):
             return self._note(con, note_id)
 
+    @_retry_busy
     def conflicts(self) -> list[dict]:
         con = self._connect(False)
         if con is None:
@@ -378,6 +409,7 @@ class Brain:
                                "created_at": r["created_at"], "conflicts_with": rivals})
             return result
 
+    @_retry_busy
     def audit_log(self, limit: int = 50) -> list[dict]:
         con = self._connect(False)
         if con is None:
@@ -387,6 +419,7 @@ class Brain:
                                                  "order by id desc limit ?", (limit,))]
 
     # -- export, import, backup, restore
+    @_retry_busy
     def export_jsonl(self, dest: Path) -> int:
         con = self._connect(False)
         rows = []
@@ -401,6 +434,7 @@ class Brain:
                 handle.write(json.dumps(note, ensure_ascii=False) + "\n")
         return len(rows)
 
+    @_retry_busy
     def import_jsonl(self, source: Path) -> dict:
         """Import notes as UNVERIFIED inbox items; an imported 'verified' flag is never trusted."""
         added = skipped = 0
