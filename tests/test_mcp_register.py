@@ -597,6 +597,94 @@ class InterruptedTests(Base):
         self.assertEqual((folder / "journal.json").read_text(encoding="utf-8"), "{ not json")
         self.assertEqual(self.config.read_bytes(), original)
 
+    def test_recover_leaves_running_child_writer_alone(self):
+        proc = subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()"],
+                                stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.addCleanup(lambda: (proc.kill() if proc.poll() is None else None, proc.wait()))
+
+        folder = self.state / "backups" / "mcp-test-child"
+        folder.mkdir(parents=True)
+        lid = reg.lock_id(self.config)
+        reg.lock_dir().mkdir(parents=True, exist_ok=True)
+        owner_file = reg._owner_path(lid)
+        owner_file.write_text(json.dumps({"config": str(self.config), "backup_dir": str(folder),
+                                          "pid": os.getpid(), "at": brain.now()}), encoding="utf-8")
+        original = self.config.read_bytes()
+        journal = {"agent": self.agent, "scope": "user", "config": str(self.config), "cli": self.cli,
+                   "project_dir": str(self.project_dir), "name": reg.NAME,
+                   "before_entries": reg.snapshot(self.agent, self.config, self.project_dir),
+                   "before_settings": reg.settings(self.agent, self.config),
+                   "original_sha256": reg.file_sha(self.config), "written_entry_sha256": None,
+                   "applied_sha256": None, "applied_entry_sha256": None,
+                   "child_pid": proc.pid, "state": "writing", "at": brain.now()}
+        reg.write_journal(folder, journal)
+
+        report = reg.recover(self.state)
+        entry = next(r for r in report if r.get("backup_dir") == folder.name)
+        self.assertEqual(entry["outcome"], "in-progress")
+        self.assertIn(str(proc.pid), entry["detail"])
+        self.assertEqual(self.config.read_bytes(), original)
+        self.assertTrue(owner_file.exists())
+
+        proc.kill()
+        proc.wait()
+
+        report2 = reg.recover(self.state)
+        entry2 = next(r for r in report2 if r.get("backup_dir") == folder.name)
+        self.assertEqual(entry2["outcome"], "aborted-unchanged")
+        self.assertFalse(owner_file.exists())
+
+    def test_external_edit_during_apply_is_not_overwritten_and_fails_closed(self):
+        self.set_mode("block")
+        done, err = [], []
+
+        def worker():
+            try:
+                self.call_apply("user")
+                done.append(1)
+            except reg.RegisterError as exc:
+                err.append(str(exc))
+
+        t = threading.Thread(target=worker)
+        t.start()
+        self.wait_for(self.started, "fake CLI to block")
+
+        # An external process changes an existing setting or adds an external MCP server
+        if self.kind == "codex":
+            text = self.config.read_text(encoding="utf-8")
+            self.config.write_text(text.replace('model = "x"', 'model = "externally-changed"'), encoding="utf-8")
+        else:
+            doc = json.loads(self.config.read_text(encoding="utf-8"))
+            doc["model"] = "externally-changed"
+            self.config.write_text(json.dumps(doc, indent=2), encoding="utf-8")
+        external_bytes = self.config.read_bytes()
+
+        self.release.touch()
+        t.join(timeout=10)
+        self.assertFalse(t.is_alive())
+
+        self.assertEqual(len(err), 1)
+        self.assertIn("was reverted", err[0])
+        self.assertIn("model", err[0])
+        self.assertIn("changed", err[0])
+
+    def test_external_edit_after_cli_write_is_not_overwritten(self):
+        calls = []
+        real_handshake = reg.handshake
+        def fake_handshake(*args, **kwargs):
+            calls.append(1)
+            if len(calls) == 2:
+                # 1st call is in plan; 2nd call is in apply after CLI wrote (current != written)
+                self.config.write_bytes(self.config.read_bytes() + b"\n# external write\n")
+            return real_handshake(*args, **kwargs)
+
+        with mock.patch.object(reg, "handshake", fake_handshake):
+            with self.assertRaises(reg.RegisterError) as ctx:
+                self.call_apply("user")
+            self.assertIn("could not be fully reverted", str(ctx.exception))
+            self.assertIn("config file was modified by an external process", str(ctx.exception))
+            self.assertIn(b"# external write", self.config.read_bytes())
+
     def test_a_lock_left_before_any_journal_is_released_by_recover(self):
         lid = reg.lock_id(self.config)
         owner = reg._owner_path(lid)
@@ -678,6 +766,9 @@ class LivenessTests(Base):
         self.assert_left_alone(reg.recover(self.state), folder, self.config.read_bytes(), "writing")
         proc.kill()  # a genuine crash: no finally blocks, no cleanup
         proc.wait(timeout=60)
+        self.release.touch()  # release the orphaned writer CLI so it can exit
+        # wait a moment for the writer CLI to exit
+        time.sleep(0.5)
         report = reg.recover(self.state)
         self.assertIn({"backup_dir": folder.name, "outcome": "recovered-entry-removed", "detail": ""}, report)
         self.assertEqual(self.names(), before)

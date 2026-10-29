@@ -100,8 +100,8 @@ Bắt đầu bằng Claude `--scope local` vì rủi ro thấp nhất: chỉ m�
 | Một lần chạy bị ngắt giữa chừng giữ khóa | Không bao giờ xóa khóa vì "trông cũ"; `recover` đọc nhật ký rồi mới quyết định (mục 8) |
 | CLI của agent đổi thiết lập không liên quan | Đã gặp thật: Claude Code 2.1.246 xóa khóa `theme` khỏi `.claude.json` khi `mcp add` (profile dùng một lần, cả khi profile đã khởi tạo); `model`, `hooks`, khóa tùy chỉnh thì giữ. `apply` phát hiện và hoàn tác; nghĩa là cấu hình còn `theme` sẽ không đăng ký được bằng Claude CLI bản này. Codex 0.163.0 chỉ đổi `mcp_servers` |
 | Python bản Microsoft Store ảo hóa thư mục `AppData` | Khóa đặt dưới `%LOCALAPPDATA%` sẽ khác nhau giữa Python Store và Python khác; vì thế khóa nằm ở `~/.omniagent-os/register-locks` |
-| Phiên Claude khác ghi `~/.claude.json` trong lúc `apply` | Thay đổi đó hiện ra như "thiết lập đổi" và `apply` thất bại an toàn rồi hoàn tác; chạy lại khi ít phiên đang mở. Giới hạn còn lại: khi hoàn tác bằng byte gốc (file vẫn đúng như CLI vừa ghi), một lần ghi của chương trình khác **trong vài giây CLI đang chạy** cũng bị hoàn tác theo, vì không phân biệt được ai đổi |
-| `apply` bị kill trong lúc CLI của agent (tiến trình con) còn chạy | Khóa thuộc về tiến trình `apply`, nên nhả ngay khi nó chết, còn CLI mồ côi có thể ghi tiếp sau đó. `recover` quyết định theo file ở thời điểm nó chạy; sau một lần sập, đợi CLI con kết thúc (`mcp add` thật xong trong vài giây) rồi mới `recover`, và chạy `plan` để kiểm tra lại. Chưa có cơ chế tự động |
+| Phiên Claude khác ghi `~/.claude.json` trong lúc `apply` | Đã giải quyết ở M3.2: `apply` đối chiếu `file_sha(config)` với `written` ngay sau khi CLI ghi và trước khi hoàn tất. Nếu file bị sửa ngoài luồng (`current != written`), `apply` từ chối tự động ghi đè bằng `config.bak`, giữ nguyên file để bảo tồn dữ liệu người dùng và đánh dấu `failed-needs-attention` |
+| `apply` bị kill trong lúc CLI của agent (tiến trình con) còn chạy | Đã giải quyết ở M3.2: `apply` ghi nhận `child_pid` vào nhật ký ngay khi khởi tạo tiến trình; `recover` kiểm tra `is_pid_alive(child_pid)` qua kernel API an toàn. Nếu writer con còn chạy, `recover` giữ nguyên file và khóa, báo `in-progress` kèm hướng dẫn; chỉ xử lý khi writer đã dừng |
 | Khóa chỉ loại trừ các lần chạy của công cụ này | Agent và phiên Claude không dùng khóa này; vì vậy vẫn cần kiểm tra hash ngay trước khi ghi và so sánh sau khi ghi. Chạy song song bản M3.1 cũ (khóa trong `--state-dir`) với bản mới thì không loại trừ nhau |
 
 ## 7. Việc bạn cần quyết định
@@ -162,3 +162,55 @@ Test với CLI giả bao gồm: thiếu file, file hỏng, UTF-16, BOM + CRLF, m
 **Đảm bảo chính xác của phần so sánh thiết lập:** so theo hash giá trị đã phân tích của từng khóa cấp cao nhất (và từng khóa trong mỗi bản ghi dự án của Claude), nên thay đổi lồng bên trong một khóa cũng bị phát hiện. Không so: định dạng, thứ tự khóa, chú thích TOML. Khóa mới do CLI thêm không bị coi là lỗi mà được liệt kê trong `settings_added`.
 
 **Chưa kiểm chứng:** đăng ký vào profile thật (cần bạn cho phép riêng); Antigravity với CLI hay IDE thật; agent thật tự gọi tool qua mục do công cụ này đăng ký (lần chạy có đăng nhập trong [BRAIN.md](BRAIN.md) dùng cờ từng lần, không dùng mục đã đăng ký); khóa trên macOS (chỉ chạy Windows và Ubuntu); CLI mồ côi sau khi `apply` bị kill (mục 6).
+
+## 9. M3.2 Preflight: Kiểm chứng tích hợp an toàn trước Pilot
+
+Kết quả preflight hoàn thành trên nhánh `feat/m3.2-preflight-integration` nhằm chứng minh quy trình đăng ký đạt chuẩn an toàn fail-closed cho thử nghiệm Claude Code `--scope local`.
+
+### 9.1. Xử lý rủi ro tiến trình con mồ côi (Orphaned CLI Writer)
+- **Cơ chế:** Khi `apply` bước vào trạng thái `writing`, nó khởi tạo tiến trình con qua `subprocess.Popen` và ghi ngay `child_pid` vào `journal.json` trước khi chờ đợi.
+- **Kiểm tra trạng thái sống an toàn:** Hàm `is_pid_alive(pid)` trên Windows dùng trực tiếp Windows API `kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)` và `GetExitCodeProcess`. Tuyệt đối không dùng `os.kill(pid, 0)` trên Windows vì có thể phát tán tín hiệu console `CTRL_C_EVENT` gây ngắt tiến trình cha hoặc IDE. Trên POSIX, sử dụng kiểm tra tín hiệu chuẩn qua `os.kill(pid, 0)`.
+- **Hành vi của `recover`:** Khi nhật ký ở trạng thái `writing` và `child_pid` còn sống, `recover` trả về `in-progress`, không chạm vào file cấu hình, không xóa bản ghi chủ (`owner`), và cung cấp hướng dẫn dừng tiến trình con thủ công. Chỉ khi tiến trình con đã thoát, `recover` mới tiến hành thu dọn an toàn.
+- **Kiểm chứng:** Test `test_recover_leaves_running_child_writer_alone` chứng minh tiến trình con đang chạy được giữ nguyên hoàn toàn.
+
+### 9.2. Bảo vệ chống ghi đè do chỉnh sửa đồng thời ngoài luồng (Concurrent External Edits)
+- **Cơ chế phát hiện:** `apply` ghi nhận `written = file_sha(config)` ngay khi lệnh `mcp add` vừa kết thúc. Trong suốt quá trình xác minh (handshake, snapshot), nếu phát hiện `file_sha(config) != written`, công cụ ghi nhận lỗi sửa đổi ngoài luồng.
+- **Fail-closed:** Khi xảy ra xung đột mà không thể phân định rõ ràng người sửa (CLI hay ứng dụng ngoài), công cụ **tuyệt đối không** tự động ghi đè file cấu hình bằng `config.bak`. File được giữ nguyên như hiện trạng để bảo toàn thay đổi của người dùng; `config.bak` được lưu lại làm bằng chứng trong thư mục backup; nhật ký chuyển sang `failed-needs-attention`.
+- **Kiểm chứng:** Các test `test_external_edit_during_apply_is_not_overwritten_and_fails_closed` và `test_external_edit_after_cli_write_is_not_overwritten` xác nhận không có bất kỳ thiết lập người dùng nào bị ghi đè tự động khi có tác nhân ngoài can thiệp.
+
+### 9.3. Tương thích khóa `theme` trên Claude Code 2.1.246
+- **Tái hiện:** Khi chạy `claude mcp add` (cả ở phạm vi `--scope local` lẫn `--scope project`), Claude Code 2.1.246 đọc `~/.claude.json`, chuẩn hóa và tự động lược bỏ khóa `theme`.
+- **Nguyên tắc xử lý:** `mcp_register.py` phát hiện việc mất khóa `theme`, lập tức hủy bỏ đăng ký (`RegisterError: setting 'theme' was removed`) và hoàn tác file trở về nguyên vẹn từng byte từ `config.bak`.
+- **Đường đi không phá hủy:** Để giữ tính toàn vẹn dữ liệu tuyệt đối, công cụ **không âm thầm xóa** khóa `theme` và không hạ chuẩn kiểm tra tính toàn vẹn. Người dùng muốn đăng ký Claude Code pilot cần đảm bảo cấu hình không chứa khóa `theme` (hoặc chờ bản cập nhật chính thức từ Claude Code).
+
+### 9.4. Bảng kiểm tra trước Pilot M3.2 (Read-only Pilot Checklist)
+
+| Mục kiểm tra | Chi tiết |
+|---|---|
+| **Mục tiêu thử nghiệm** | Đăng ký `omniagent-brain` vào Claude Code ở phạm vi dự án (`--scope local`) |
+| **Phạm vi áp dụng** | Duy nhất dự án `omniagent-os` |
+| **File đích** | `~/.claude.json` (chỉ thêm mục vào bảng `projects[<đường dẫn omniagent-os>].mcpServers`) |
+| **Thay đổi dự kiến** | Thêm 1 entry `omniagent-brain` (command: `python`, args: trỏ tới `.local/runtime/brain-<hash>.py`) |
+| **Vị trí sao lưu** | `.local/backups/mcp-<timestamp>-<hash>-claude/config.bak` (ngoài git, bảo mật token) |
+| **Chiến lược hoàn tác** | Chạy `rollback` (hoàn tác từng byte nếu file chưa đổi) hoặc `rollback --entry-only` |
+| **Điều kiện dừng ngay (Stop Conditions)** | 1. `plan` báo có `theme` trong `~/.claude.json`.<br>2. Tên `omniagent-brain` đã tồn tại.<br>3. File cấu hình bị khóa bởi tiến trình khác hoặc đang có phiên `apply` dở dang.<br>4. Hash file thay đổi giữa bước `plan` và `apply`. |
+
+### 9.5. Phân loại trạng thái kịch bản
+
+- **TESTED (Đã kiểm chứng đạt PASS):**
+  - Môi trường sandbox dùng một lần với CLI thật (Claude Code 2.1.246, Codex 0.163.0): plan, apply, handshake, serve project isolation, rollback byte-for-byte, và rollback entry-only.
+  - Xử lý tiến trình con mồ côi và tránh can thiệp khi writer còn sống.
+  - Chống ghi đè khi có sửa đổi ngoài luồng đồng thời.
+  - Từ chối an toàn và hoàn tác byte-for-byte khi Claude CLI xóa `theme`.
+  - Bộ 257 unit tests (bao gồm 91 test cho `mcp_register.py`).
+
+- **NOT_VERIFIED (Chưa kiểm chứng):**
+  - Đăng ký vào profile thật của người dùng trên máy thật (chờ phê duyệt M3.2).
+  - Model thật của Claude Code / Codex tự động gọi `brain_search` và `brain_propose` qua entry đã đăng ký (do không sao chép credential thật vào sandbox).
+  - Antigravity với CLI `agy` thật hoặc IDE thật (máy hiện chưa cài `agy`).
+
+- **UNSAFE (Từ chối thực hiện / Không an toàn):**
+  - Tự động chạy `apply`, `rollback` hoặc `recover` trên profile thật khi chưa có phê duyệt rõ ràng.
+  - Tự động kích hoạt auto-merge hoặc merge PR khi chưa có chỉ đạo của chủ dự án.
+  - Bỏ qua kiểm tra toàn vẹn hoặc âm thầm xóa khóa `theme` để ép đăng ký thành công.
+

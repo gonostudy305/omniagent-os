@@ -68,6 +68,30 @@ class LockBusy(RegisterError):
     """Another process holds the config's lock, or whether one does could not be determined."""
 
 
+def is_pid_alive(pid: int | None) -> bool:
+    """True if a process with this PID is currently running. Safe against Windows console signals."""
+    if not pid or pid <= 0:
+        return False
+    if os.name == "nt":
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            return False
+        exit_code = ctypes.c_ulong()
+        kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code))
+        kernel32.CloseHandle(handle)
+        return exit_code.value == 259  # STILL_ACTIVE
+    try:
+        os.kill(pid, 0)
+        return True
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
 def short(value) -> str:
     return hashlib.sha256(json.dumps(value, sort_keys=True).encode("utf-8")).hexdigest()[:12]
 
@@ -392,13 +416,25 @@ def safe_text(text: str) -> str:
     return "(output withheld: it looked like it contained a credential)" if brain.scan_secrets(text) else text
 
 
-def run_cli(cmd: list[str], cwd: Path | None) -> tuple[int, str]:
+def run_cli(cmd: list[str], cwd: Path | None, on_start=None) -> tuple[int, str]:
     try:
-        done = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
-                              timeout=120, cwd=cwd, stdin=subprocess.DEVNULL)
-    except (OSError, subprocess.TimeoutExpired) as exc:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True, encoding="utf-8", errors="replace",
+                                cwd=cwd, stdin=subprocess.DEVNULL)
+    except OSError as exc:
         raise RegisterError(f"could not run the {Path(cmd[0]).name} command ({type(exc).__name__})") from None
-    return done.returncode, safe_text(done.stdout + "\n" + done.stderr)
+    if on_start is not None:
+        try:
+            on_start(proc.pid)
+        except Exception:
+            pass
+    try:
+        stdout, stderr = proc.communicate(timeout=120)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        stdout, stderr = proc.communicate()
+        raise RegisterError(f"could not run the {Path(cmd[0]).name} command (TimeoutExpired)") from None
+    return proc.returncode, safe_text(stdout + "\n" + stderr)
 
 
 # ---------------------------------------------------------------- plan / apply / rollback / recover
@@ -521,10 +557,16 @@ def apply(agent: str, config: Path, cli: str, scope: str, project_dir: Path, bra
             raise RegisterError(f"{config.name} changed while preparing; nothing was written")
         journal["state"] = "writing"
         write_journal(folder, journal)
+        def _on_start(pid):
+            journal["child_pid"] = pid
+            write_journal(folder, journal)
         try:
-            code, out = run_cli(add_command(agent, cli, scope, command, args), project_dir)
+            code, out = run_cli(add_command(agent, cli, scope, command, args), project_dir, on_start=_on_start)
         except RegisterError as exc:  # the CLI did not start or timed out: check what it left, like any failure
             code, out = -1, str(exc)
+        finally:
+            journal["child_pid"] = None
+            write_journal(folder, journal)
         written = file_sha(config)
         problems, added = [], []
         if code != 0:
@@ -550,16 +592,19 @@ def apply(agent: str, config: Path, cli: str, scope: str, project_dir: Path, bra
                 handshake(entry["command"], list(entry.get("args") or []))
             except RegisterError as exc:
                 problems.append(f"registered command failed the handshake: {exc}")
+        if file_sha(config) != written:
+            problems.append("config file was modified by an external process during registration")
         if problems:
             current = file_sha(config)
             if current == original:
                 removed = {"clean": True, "problems": []}  # the CLI wrote nothing
             elif current == written:
                 removed = restore_original(config, folder, original or ABSENT)  # only the CLI wrote: undo all of it
-            else:  # something else wrote after the CLI: keep that, remove only our entry
-                removed = rollback_entry(agent, config, cli, scope, project_dir, before)
-                removed["problems"] += settings_changes(before_settings, settings(agent, config))[0]
-                removed["clean"] = not removed["problems"]
+            else:  # something else wrote after the CLI (current != written): leave as-is to preserve external edits
+                removed = {"clean": False, "problems": [
+                    "config file was modified by an external process during registration (current content differs from CLI output); "
+                    "the writer cannot be distinguished, so the file was left as-is to preserve evidence; config.bak holds the original"
+                ]}
             journal["state"] = "failed-rolled-back" if removed["clean"] else "failed-needs-attention"
             write_journal(folder, journal)
             raise RegisterError("registration failed and was reverted: " + "; ".join(problems) if removed["clean"]
@@ -602,6 +647,10 @@ def rollback_entry(agent: str, config: Path, cli: str, scope: str, project_dir: 
         if code != 0:
             problems.append(f"`mcp remove` exited with {code}: {out}")
         written = file_sha(config)
+        current = file_sha(config)
+        if current != written:
+            problems.append("config file was modified by another process while removing the entry; leaving file as-is for manual resolution")
+            return {"clean": False, "problems": problems}
         changed = settings_changes(start_settings, settings(agent, config))[0]
         if changed:
             if written == file_sha(config):
@@ -670,6 +719,11 @@ def _settle(folder: Path, journal: dict) -> tuple[str, str]:
     """Decide and do what an interrupted run needs. The caller holds the config's lock."""
     config, agent, project_dir = Path(journal["config"]), journal["agent"], Path(journal["project_dir"])
     where = _scope_name(agent, journal["scope"], project_dir)
+    if journal["state"] == "writing":
+        child_pid = journal.get("child_pid")
+        if child_pid and is_pid_alive(child_pid):
+            return "in-progress", (f"writer process (PID {child_pid}) is still running; wait for it to exit "
+                                  f"before recovering (or terminate it manually with taskkill/kill); left alone")
     if (file_sha(config) or ABSENT) == journal["original_sha256"]:
         return "aborted-unchanged", ""
     if journal["state"] in ("prepared", "backed-up"):
@@ -717,6 +771,9 @@ def recover(state_dir: Path) -> list[dict]:
                     outcome, detail = _settle(folder, journal)
                 except RegisterError as exc:
                     outcome, detail = "needs-attention", str(exc)
+                if outcome == "in-progress":
+                    report.append({"backup_dir": folder.name, "outcome": "in-progress", "detail": detail})
+                    continue
                 journal["state"] = outcome if outcome != "needs-attention" else "failed-needs-attention"
                 write_journal(folder, journal)
                 owner = _owner_path(lid)
