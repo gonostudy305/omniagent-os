@@ -9,9 +9,18 @@ backs the file up, runs the agent's own `mcp add` (the agent owns its file forma
 one entry was added and every other entry is unchanged (compared after parsing, because the CLIs reformat
 their files), and that the registered command answers an MCP handshake. Each stage is journaled.
 
+Every setting outside the MCP tables is compared too (by hash of its parsed value, per top-level key and, for
+Claude, per project key): a setting the CLI removed or changed fails the run, which is then reverted.
+
 `rollback` restores the original bytes, but only while the config still has exactly the bytes recorded right
 after `apply`. If anything changed it since, it refuses and leaves the file alone; `rollback --entry-only`
-then removes just our entry with the agent's own `mcp remove`. Standard library only.
+then removes just our entry with the agent's own `mcp remove`, and only while it is still the exact entry apply
+registered.
+
+One lock per config file and user, independent of `--state-dir`, held as an OS file lock: the OS releases it
+when its process ends, however it ends, so "is the owner still running" never depends on a PID or a file's age.
+A run that ends without settling its journal leaves an owner record that blocks new runs until `recover`.
+Standard library only.
 
 Agent config files can hold tokens. This tool therefore never prints an entry's value: output carries
 names, counts, paths of our own server and hashes only, and a CLI's own output is shown only when it
@@ -35,6 +44,11 @@ from pathlib import Path
 
 import brain
 
+if os.name == "nt":
+    import msvcrt
+else:
+    import fcntl
+
 NAME = "omniagent-brain"
 AGENTS = ("claude", "codex", "antigravity")
 EXPECTED_TOOLS = {t["name"] for t in brain.TOOLS}
@@ -43,14 +57,31 @@ DEFAULT_STATE = Path(__file__).resolve().parent / ".local"
 # Journal states. A run that stopped in one of the open states is handled by `recover`.
 OPEN_STATES = ("prepared", "backed-up", "writing", "verifying")
 ABSENT = "absent"  # what the plan shows, and `--expect-sha` takes, for a config file that does not exist yet
+SERVER_KEY = {"claude": "mcpServers", "codex": "mcp_servers", "antigravity": "mcpServers"}
 
 
 class RegisterError(Exception):
     pass
 
 
+class LockBusy(RegisterError):
+    """Another process holds the config's lock, or whether one does could not be determined."""
+
+
 def short(value) -> str:
     return hashlib.sha256(json.dumps(value, sort_keys=True).encode("utf-8")).hexdigest()[:12]
+
+
+def entry_sha(entry: dict) -> str:
+    return hashlib.sha256(json.dumps(entry, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def is_proposed(entry: dict, proposed: dict) -> bool:
+    """The entry runs exactly the proposed command and carries nothing else: no environment, headers or extras
+    beyond what `mcp add` itself writes for a stdio server (Claude adds `type` and an empty `env`)."""
+    return (entry.get("command") == proposed["command"] and list(entry.get("args") or []) == proposed["args"]
+            and set(entry) <= {"type", "command", "args", "env"} and entry.get("type", "stdio") == "stdio"
+            and not entry.get("env"))
 
 
 def file_sha(path: Path) -> str | None:
@@ -159,8 +190,8 @@ def _servers(value, config: Path) -> dict[str, dict]:
     return dict(value)
 
 
-def read_entries(agent: str, config: Path, project_dir: Path | None = None) -> dict[str, dict[str, dict]]:
-    """{scope: {server name: entry}} read from the config file. Callers must hash, never print, the entries."""
+def _load(agent: str, config: Path) -> dict:
+    """The parsed config ({} if there is no file). Errors never quote the file's content."""
     if file_sha(config) is None:
         return {}
     try:
@@ -168,26 +199,57 @@ def read_entries(agent: str, config: Path, project_dir: Path | None = None) -> d
     except UnicodeDecodeError:
         raise RegisterError(f"{config.name} is not UTF-8 text; nothing was changed") from None
     try:
-        if agent == "codex":
-            return {"user": _servers(tomllib.loads(text).get("mcp_servers"), config)}
-        doc = json.loads(text) if text.strip() else {}
+        doc = tomllib.loads(text) if agent == "codex" else json.loads(text) if text.strip() else {}
     except ValueError:  # JSON and TOML decode errors can quote file content, so say nothing more
         raise RegisterError(f"{config.name} is not valid {'TOML' if agent == 'codex' else 'JSON'}; nothing was changed") from None
     if not isinstance(doc, dict):
         raise RegisterError(f"{config.name} is not a JSON object; nothing was changed")
-    scopes = {"user": _servers(doc.get("mcpServers"), config)}
-    if agent == "antigravity":
-        return scopes
+    return doc
+
+
+def _projects(doc: dict, config: Path) -> dict[str, dict]:
     projects = doc.get("projects") or {}
     if not isinstance(projects, dict) or not all(isinstance(v, dict) for v in projects.values()):
         raise RegisterError(f"{config.name} has a project list in a shape this tool does not know; nothing was changed")
-    for key, value in projects.items():
+    return projects
+
+
+def read_entries(agent: str, config: Path, project_dir: Path | None = None) -> dict[str, dict[str, dict]]:
+    """{scope: {server name: entry}} read from the config file. Callers must hash, never print, the entries."""
+    doc = _load(agent, config)
+    scopes = {"user": _servers(doc.get(SERVER_KEY[agent]), config)}
+    if agent != "claude":
+        return scopes
+    for key, value in _projects(doc, config).items():
         servers = _servers(value.get("mcpServers"), config)
         if servers:
             scopes["project:" + _norm(key)] = servers
     if project_dir is not None:
         scopes.setdefault("project:" + _norm(str(project_dir)), {})
     return scopes
+
+
+def settings(agent: str, config: Path) -> dict[str, str]:
+    """Every setting outside the MCP server tables: {name: hash of its parsed value}. Top-level keys, plus each
+    key of each Claude project record. Formatting and TOML comments are not settings and are not compared."""
+    doc, out = _load(agent, config), {}
+    for key, value in doc.items():
+        if key == SERVER_KEY[agent]:
+            continue
+        if agent == "claude" and key == "projects":
+            for path, record in _projects(doc, config).items():
+                out.update({f"projects[{path}].{name}": short(item) for name, item in record.items() if name != "mcpServers"})
+            continue
+        out[key] = short(value)
+    return out
+
+
+def settings_changes(before: dict[str, str], after: dict[str, str]) -> tuple[list[str], list[str]]:
+    """(problems, added): a removed or changed setting is a problem; a new one is only reported. Names only,
+    with the home folder in project paths replaced by `~`."""
+    problems = [f"setting {brain.redact_paths(k)!r} was removed" for k in sorted(set(before) - set(after))]
+    problems += [f"setting {brain.redact_paths(k)!r} changed" for k in sorted(before) if k in after and after[k] != before[k]]
+    return problems, [brain.redact_paths(k) for k in sorted(set(after) - set(before))]
 
 
 def snapshot(agent: str, config: Path, project_dir: Path | None = None) -> dict[str, dict[str, str]]:
@@ -217,31 +279,92 @@ def compare(before: dict, after: dict, added: tuple[str, str] | None) -> list[st
 
 # ---------------------------------------------------------------- one run per config at a time
 
-def _lock_path(state_dir: Path, config: Path) -> Path:
-    return Path(state_dir) / "locks" / f"{hashlib.sha256(_norm(str(Path(config).absolute())).encode()).hexdigest()[:16]}.lock"
+def lock_dir() -> Path:
+    """Per user, not per --state-dir: every run on one config file meets the same lock, whatever folder it journals to.
+    Not under AppData: the Microsoft Store Python redirects AppData writes into its own package folder, so two
+    Pythons would see different locks."""
+    return Path.home() / ".omniagent-os" / "register-locks"
 
 
-def _release(lock: Path) -> None:
-    lock.unlink(missing_ok=True)
+def lock_id(config: Path) -> str:
+    """Same id for every spelling of the same file (relative, `..`, case on Windows, symlinks)."""
+    return hashlib.sha256(_norm(os.path.realpath(config)).encode("utf-8")).hexdigest()[:32]
+
+
+def _owner_path(lid: str) -> Path:
+    return lock_dir() / f"{lid}.owner.json"
+
+
+def _lock_region(handle) -> None:
+    handle.seek(0)
+    if os.name == "nt":
+        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+    else:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+def _unlock_region(handle) -> None:
+    handle.seek(0)
+    if os.name == "nt":
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+    else:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 @contextmanager
-def config_lock(state_dir: Path, config: Path, folder: Path):
-    """Created atomically; a second run on the same config is refused. Never removed for being old: an
-    interrupted run leaves it behind on purpose, and only `recover` clears it after checking the journal."""
-    lock = _lock_path(state_dir, config)
-    lock.parent.mkdir(parents=True, exist_ok=True)
+def held(lid: str):
+    """Hold the OS lock `<lid>.lock` without waiting. The OS drops it when the holding process ends, however it
+    ends, so a held lock means a live owner. Busy and "could not tell" both raise LockBusy: fail closed."""
+    path = lock_dir() / f"{lid}.lock"
     try:
-        fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-    except FileExistsError:
-        raise RegisterError(f"another registration for {Path(config).name} is running or was interrupted; "
-                            "if none is running, run `recover`") from None
-    with os.fdopen(fd, "w", encoding="utf-8") as handle:
-        json.dump({"config": str(config), "backup_dir": str(folder), "pid": os.getpid(), "at": brain.now()}, handle)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        handle = open(path, "a+b")  # never deleted: unlinking a lock file others may hold races on POSIX
+    except OSError as exc:
+        raise LockBusy(f"cannot open the registration lock ({type(exc).__name__}); nothing was changed") from None
     try:
-        yield
+        try:
+            _lock_region(handle)
+        except OSError:
+            raise LockBusy("another registration for this config is running right now (or its lock could not be "
+                           "checked); nothing was changed") from None
+        try:
+            yield
+        finally:
+            _unlock_region(handle)
     finally:
-        _release(lock)
+        handle.close()
+
+
+def _settled(folder: Path) -> bool:
+    """True when the run in `folder` never started or reached a final state. An unreadable journal is not settled."""
+    if not (Path(folder) / "journal.json").exists():
+        return True
+    try:
+        return _read_journal(folder)["state"] not in OPEN_STATES
+    except RegisterError:
+        return False
+
+
+@contextmanager
+def config_lock(config: Path, folder: Path):
+    """Hold the config's OS lock and record this run as its owner. A run that ends with its journal still open
+    (an exception, or a killed process) leaves the owner record behind, and new runs are refused until `recover`
+    settles that journal. Nothing here is ever cleared for being old."""
+    lid = lock_id(config)
+    with held(lid):
+        owner = _owner_path(lid)
+        try:
+            fd = os.open(owner, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            raise RegisterError(f"an earlier registration for {Path(config).name} was interrupted; "
+                                "run `recover` with its --state-dir; nothing was changed") from None
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:  # pid and time are for people; liveness is the OS lock
+            json.dump({"config": str(config), "backup_dir": os.path.realpath(folder), "pid": os.getpid(), "at": brain.now()}, handle)
+        try:
+            yield
+        finally:
+            if _settled(folder):
+                owner.unlink(missing_ok=True)
 
 
 # ---------------------------------------------------------------- the agent CLIs
@@ -314,17 +437,19 @@ def plan(agent: str, config: Path, cli: str | None, scope: str, project_dir: Pat
         "proposed_entry": {"name": NAME, "command": command, "args": args},
         "runtime": str(runtime), "handshake_tools": tools,
         "existing_entries": {s: sorted(v) for s, v in snap.items() if s == where or s == "user"},
-        "entry_count": len(flat(snap)),
+        "entry_count": len(flat(snap)), "setting_count": len(settings(agent, config)),
         "changes": [f"add one entry {NAME!r} to scope {where} with the agent's own `mcp add`",
-                    "the agent CLI rewrites the file (it may reformat it and update its own keys); every other "
-                    "MCP entry must compare equal after parsing, or the change is reverted"],
+                    "the agent CLI rewrites the file (it may reformat it); every other MCP entry and every other "
+                    "setting must compare equal after parsing, or the change is reverted; settings the CLI adds "
+                    "are listed in the result"],
         "expected_output_sha256": None,
         "expected_output_note": "not predictable: the agent CLI writes the file; apply records the resulting "
                                 "hash, and rollback restores the original bytes only while the file still has it",
         "backup_and_rollback": [
             "apply copies the config to <state-dir>/backups/mcp-<time>-<agent>/config.bak (may hold tokens; stays in .local)",
             "rollback --backup-dir <that folder>: byte-exact restore if the config is unchanged since apply",
-            "if it changed since: rollback refuses; rollback --entry-only removes just this entry with `mcp remove`",
+            "if it changed since: rollback refuses; rollback --entry-only removes just this entry with `mcp remove`, "
+            "and refuses if the entry itself was changed",
         ],
         "apply_with": f"apply --agent {agent} --scope {scope} --yes --expect-sha {original or ABSENT}",
         "problems": problems, "writes_nothing": True,
@@ -343,26 +468,48 @@ def backup_config(config: Path, folder: Path) -> str | None:
     return original
 
 
+def restore_original(config: Path, folder: Path, original_sha: str) -> dict:
+    """Put the original bytes back (or remove a file that did not exist). Callers check first that nothing but
+    this run wrote the file. The replace is one step: the file is either restored or as it was."""
+    try:
+        if original_sha == ABSENT:
+            config.unlink(missing_ok=True)
+        else:
+            data = (Path(folder) / "config.bak").read_bytes()
+            if hashlib.sha256(data).hexdigest() != original_sha:
+                return {"clean": False, "problems": ["config.bak does not match the recorded original; nothing was restored"]}
+            atomic_write(config, data)
+    except OSError as exc:
+        return {"clean": False, "problems": [f"could not restore {config.name} ({type(exc).__name__}); the file was left as it was"]}
+    if (file_sha(config) or ABSENT) != original_sha:
+        return {"clean": False, "problems": ["the restored file does not match the original hash"]}
+    return {"clean": True, "problems": []}
+
+
 def apply(agent: str, config: Path, cli: str, scope: str, project_dir: Path, brain_dir: Path, project: str,
           runtime_dir: Path, source: Path, state_dir: Path, confirm=None, expected_sha: str | None = None) -> dict:
     """Register our entry. `expected_sha` is the plan's `original_sha256`; the run stops if the file differs."""
-    preview = plan(agent, config, cli, scope, project_dir, brain_dir, project, runtime_dir, source)
-    if preview["problems"]:
-        raise RegisterError("; ".join(preview["problems"]))
-    if expected_sha is not None and preview["original_sha256"] != expected_sha:
-        raise RegisterError(f"{config.name} changed since the plan you reviewed; run plan again; nothing was changed")
-    scope = preview["scope"]
-    where = _scope_name(agent, scope, project_dir)
-    if confirm is not None:
-        confirm(f"Register {NAME} for {agent} (scope {scope}) in {preview['config_path']}; a backup is taken first.")
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     folder = Path(state_dir) / "backups" / f"mcp-{stamp}-{secrets.token_hex(3)}-{agent}"
-    with config_lock(state_dir, config, folder):
+    with config_lock(config, folder):  # first, so the checks below see the file no other run of ours is changing
+        preview = plan(agent, config, cli, scope, project_dir, brain_dir, project, runtime_dir, source)
+        if preview["problems"]:
+            raise RegisterError("; ".join(preview["problems"]))
+        if expected_sha is not None and preview["original_sha256"] != expected_sha:
+            raise RegisterError(f"{config.name} changed since the plan you reviewed; run plan again; nothing was changed")
+        scope = preview["scope"]
+        where = _scope_name(agent, scope, project_dir)
+        command, args = server_command(Path(preview["runtime"]), brain_dir, project, agent)
+        proposed = {"command": command, "args": args}
+        if confirm is not None:
+            confirm(f"Register {NAME} for {agent} (scope {scope}) in {preview['config_path']}; a backup is taken first.")
         folder.mkdir(parents=True)
-        before = snapshot(agent, config, project_dir)
+        before, before_settings = snapshot(agent, config, project_dir), settings(agent, config)
         journal = {"agent": agent, "scope": scope, "config": str(config), "cli": cli, "project_dir": str(project_dir),
-                   "name": NAME, "before_entries": before, "original_sha256": preview["original_sha256"],
-                   "applied_sha256": None, "state": "prepared", "at": brain.now()}
+                   "name": NAME, "proposed_entry": proposed, "before_entries": before,
+                   "before_settings": before_settings, "original_sha256": preview["original_sha256"],
+                   "written_entry_sha256": None, "applied_sha256": None, "applied_entry_sha256": None,
+                   "state": "prepared", "at": brain.now()}
         write_journal(folder, journal)
         original = backup_config(config, folder)
         journal["state"] = "backed-up"
@@ -375,55 +522,94 @@ def apply(agent: str, config: Path, cli: str, scope: str, project_dir: Path, bra
         journal["state"] = "writing"
         write_journal(folder, journal)
         try:
-            code, out = run_cli(add_command(agent, cli, scope, *server_command(Path(preview["runtime"]), brain_dir, project, agent)),
-                                project_dir)
+            code, out = run_cli(add_command(agent, cli, scope, command, args), project_dir)
         except RegisterError as exc:  # the CLI did not start or timed out: check what it left, like any failure
             code, out = -1, str(exc)
-        journal["state"] = "verifying"
-        write_journal(folder, journal)
-        problems = []
+        written = file_sha(config)
+        problems, added = [], []
         if code != 0:
             problems.append(f"`mcp add` exited with {code}: {out}")
         try:
+            entry = read_entries(agent, config, project_dir).get(where, {}).get(NAME)
             after = snapshot(agent, config, project_dir)
             problems += compare(before, after, (where, NAME))
-            entry = read_entries(agent, config, project_dir).get(where, {}).get(NAME)
+            changed, added = settings_changes(before_settings, settings(agent, config))
+            problems += [f"{p} (by the agent CLI, or by another program while it ran)" for p in changed]
         except RegisterError as exc:
             after, entry = {}, None
             problems.append(str(exc))
+        journal["written_entry_sha256"] = entry_sha(entry) if entry is not None else None  # what recover may remove
+        journal["state"] = "verifying"
+        write_journal(folder, journal)
         if entry is None:
             problems.append("the new entry is not in the config")
+        elif not is_proposed(entry, proposed):
+            problems.append("the registered entry does not run the proposed command")
         else:
             try:
-                handshake(entry.get("command", ""), list(entry.get("args", [])))
+                handshake(entry["command"], list(entry.get("args") or []))
             except RegisterError as exc:
                 problems.append(f"registered command failed the handshake: {exc}")
         if problems:
-            if file_sha(config) == original:
+            current = file_sha(config)
+            if current == original:
                 removed = {"clean": True, "problems": []}  # the CLI wrote nothing
-            else:
+            elif current == written:
+                removed = restore_original(config, folder, original or ABSENT)  # only the CLI wrote: undo all of it
+            else:  # something else wrote after the CLI: keep that, remove only our entry
                 removed = rollback_entry(agent, config, cli, scope, project_dir, before)
+                removed["problems"] += settings_changes(before_settings, settings(agent, config))[0]
+                removed["clean"] = not removed["problems"]
             journal["state"] = "failed-rolled-back" if removed["clean"] else "failed-needs-attention"
             write_journal(folder, journal)
             raise RegisterError("registration failed and was reverted: " + "; ".join(problems) if removed["clean"]
-                                else "registration failed and could not be fully reverted: " + "; ".join(problems + removed["problems"]))
+                                else "registration failed and could not be fully reverted (config.bak holds the "
+                                     "original): " + "; ".join(problems + removed["problems"]))
         journal["applied_sha256"] = file_sha(config)
+        journal["applied_entry_sha256"] = entry_sha(entry)
         journal["state"] = "applied"
         write_journal(folder, journal)
     return {"applied": True, "agent": agent, "scope": scope, "backup_dir": str(folder), "entries_before": len(flat(before)),
-            "entries_after": len(flat(after)), "original_sha256": preview["original_sha256"],
+            "entries_after": len(flat(after)), "settings_added": added, "original_sha256": preview["original_sha256"],
             "applied_sha256": journal["applied_sha256"]}
 
 
-def rollback_entry(agent: str, config: Path, cli: str, scope: str, project_dir: Path, before: dict) -> dict:
-    """Remove only our entry with the agent's own CLI; every other entry must match `before` afterwards."""
+def _manual_steps(agent: str, cli: str, scope: str) -> str:
+    name = Path(cli or agent).name
+    return (f"check it with `{name} mcp get {NAME}`; if you no longer want it, remove it yourself with "
+            f"`{' '.join([name] + remove_command(agent, name, scope)[1:])}`")
+
+
+def rollback_entry(agent: str, config: Path, cli: str, scope: str, project_dir: Path, before: dict,
+                   matches=None) -> dict:
+    """Remove only our entry with the agent's own CLI; every other entry must match `before` afterwards.
+
+    `matches(entry)` must accept the entry found, or it is left alone (someone changed it since we wrote it).
+    A setting the CLI removed or changed while removing is reverted by restoring the bytes it started from.
+    """
     where = _scope_name(agent, scope, project_dir)
     problems = []
-    present = (where, NAME) in flat(snapshot(agent, config, project_dir))
-    if present:
+    entry = read_entries(agent, config, project_dir).get(where, {}).get(NAME)
+    if entry is not None:
+        if matches is not None and not matches(entry):
+            return {"clean": False, "problems": [
+                f"the {NAME} entry ({'project ' + brain.redact_paths(str(project_dir)) if where != 'user' else 'user'} "
+                f"scope) is not the one this tool registered (its command, arguments or "
+                f"other properties changed since), so it was left in place and nothing was changed; "
+                + _manual_steps(agent, cli, scope)]}
+        start, start_settings = config.read_bytes(), settings(agent, config)
         code, out = run_cli(remove_command(agent, cli, scope), project_dir)
         if code != 0:
             problems.append(f"`mcp remove` exited with {code}: {out}")
+        written = file_sha(config)
+        changed = settings_changes(start_settings, settings(agent, config))[0]
+        if changed:
+            if written == file_sha(config):
+                atomic_write(config, start)
+                problems.append("`mcp remove` also changed other settings (" + "; ".join(changed) + "), so the file "
+                                "was put back as it was before the remove; " + _manual_steps(agent, cli, scope))
+                return {"clean": False, "problems": problems}
+            problems += changed
     after = snapshot(agent, config, project_dir)
     if (where, NAME) in flat(after):
         problems.append("the entry is still present")
@@ -441,7 +627,7 @@ def _read_journal(folder: Path) -> dict:
     return journal
 
 
-def rollback(backup_dir: Path, entry_only: bool = False, state_dir: Path | None = None) -> dict:
+def rollback(backup_dir: Path, entry_only: bool = False) -> dict:
     """Undo one `apply`. Default: restore the original bytes, only if the config is exactly as apply left it."""
     folder = Path(backup_dir)
     journal = _read_journal(folder)
@@ -449,46 +635,67 @@ def rollback(backup_dir: Path, entry_only: bool = False, state_dir: Path | None 
     if journal["state"] != "applied":
         raise RegisterError(f"journal state is {journal['state']!r}, not 'applied'; nothing was changed"
                             + (" (run recover)" if journal["state"] in OPEN_STATES else ""))
-    with config_lock(Path(state_dir) if state_dir else folder.parent.parent, config, folder):
+    with config_lock(config, folder):
         if entry_only:
+            recorded = journal.get("applied_entry_sha256")
+            if not recorded:
+                return {"clean": False, "mode": "refused", "problems": [
+                    "this journal comes from an older version and does not record the registered entry, so it cannot "
+                    "tell whether the entry was changed; nothing was changed; "
+                    + _manual_steps(journal["agent"], journal["cli"], journal["scope"])]}
             # Other entries may have changed legitimately since apply; compare with the file as it is now.
             current = snapshot(journal["agent"], config, Path(journal["project_dir"]))
             result = rollback_entry(journal["agent"], config, journal["cli"], journal["scope"],
-                                    Path(journal["project_dir"]), current)
+                                    Path(journal["project_dir"]), current, lambda entry: entry_sha(entry) == recorded)
             result["mode"] = "entry-only"
             if result["clean"]:
                 journal["state"] = "rolled-back-entry"
                 write_journal(folder, journal)
             return result
-        current = file_sha(config)
-        if current != journal["applied_sha256"]:
+        if file_sha(config) != journal["applied_sha256"]:
             return {"clean": False, "mode": "refused", "problems": [
                 f"{config.name} changed after registration (its hash differs from the one recorded by apply), so its "
                 "bytes were not restored and nothing was changed; rollback --entry-only removes just our entry "
                 "with the agent's own `mcp remove`, or restore config.bak by hand after comparing"]}
-        try:
-            if journal["original_sha256"] == ABSENT:
-                config.unlink()  # the file did not exist before, and nobody has changed it since apply created it
-            else:
-                data = (folder / "config.bak").read_bytes()
-                if hashlib.sha256(data).hexdigest() != journal["original_sha256"]:
-                    raise RegisterError("config.bak does not match the recorded original; nothing was changed")
-                atomic_write(config, data)
-        except OSError as exc:
-            # The replace is a single step, so the file is either fully restored or still as apply left it.
-            return {"clean": False, "mode": "exact", "problems": [f"could not restore {config.name} ({type(exc).__name__}); "
-                                                                   "the file is as apply left it"]}
-        if (file_sha(config) or ABSENT) != journal["original_sha256"]:
-            return {"clean": False, "mode": "exact", "problems": ["the restored file does not match the original hash"]}
-        journal["state"] = "rolled-back-exact"
-        write_journal(folder, journal)
-        return {"clean": True, "mode": "exact", "problems": [], "restored_sha256": journal["original_sha256"]}
+        result = restore_original(config, folder, journal["original_sha256"])
+        result["mode"] = "exact"
+        if result["clean"]:
+            journal["state"] = "rolled-back-exact"
+            write_journal(folder, journal)
+            result["restored_sha256"] = journal["original_sha256"]
+        return result
+
+
+def _settle(folder: Path, journal: dict) -> tuple[str, str]:
+    """Decide and do what an interrupted run needs. The caller holds the config's lock."""
+    config, agent, project_dir = Path(journal["config"]), journal["agent"], Path(journal["project_dir"])
+    where = _scope_name(agent, journal["scope"], project_dir)
+    if (file_sha(config) or ABSENT) == journal["original_sha256"]:
+        return "aborted-unchanged", ""
+    if journal["state"] in ("prepared", "backed-up"):
+        return "aborted-unchanged", "this run never wrote; the config was changed by something else"
+    if "before_settings" not in journal or "proposed_entry" not in journal:
+        return "needs-attention", "journal from an older version; compare the config with config.bak by hand"
+    now_snap = snapshot(agent, config, project_dir)
+    problems = compare(journal["before_entries"], now_snap, (where, NAME))
+    problems += settings_changes(journal["before_settings"], settings(agent, config))[0]
+    if problems:
+        return "needs-attention", "; ".join(problems) + "; left as it is (config.bak holds the original)"
+    if (where, NAME) not in flat(now_snap):
+        return "aborted-unchanged", ""
+    written = journal.get("written_entry_sha256")  # None if the run stopped while the CLI was still running
+    removed = rollback_entry(agent, config, journal["cli"], journal["scope"], project_dir, now_snap,
+                             (lambda e: entry_sha(e) == written) if written else
+                             (lambda e: is_proposed(e, journal["proposed_entry"])))
+    return ("recovered-entry-removed" if removed["clean"] else "needs-attention"), "; ".join(removed["problems"])
 
 
 def recover(state_dir: Path) -> list[dict]:
-    """Settle runs that stopped in an open state, then clear their locks. Run it only when no apply is running.
+    """Settle runs in `state_dir` that stopped in an open state, then clear owner records of settled runs.
 
-    Fails closed: a journal it cannot read, or a config whose other entries changed, is reported and left alone.
+    A run whose config lock is held by a live process is left completely alone ("in-progress"), as is anything
+    whose lock state cannot be determined. Fails closed: an unreadable journal, or a config whose other entries
+    or settings changed, is reported and left as it is.
     """
     state_dir = Path(state_dir)
     report = []
@@ -500,43 +707,59 @@ def recover(state_dir: Path) -> list[dict]:
             continue
         if journal["state"] not in OPEN_STATES:
             continue
-        config, agent, project_dir = Path(journal["config"]), journal["agent"], Path(journal["project_dir"])
-        where = _scope_name(agent, journal["scope"], project_dir)
-        outcome, detail = "needs-attention", ""
+        lid = lock_id(Path(journal["config"]))
         try:
-            if (file_sha(config) or ABSENT) == journal["original_sha256"]:
-                outcome = "aborted-unchanged"
-            elif journal["state"] in ("prepared", "backed-up"):
-                outcome, detail = "aborted-unchanged", "this run never wrote; the config was changed by something else"
-            else:
-                now_snap = snapshot(agent, config, project_dir)
-                problems = compare(journal["before_entries"], now_snap, (where, NAME))
-                if problems:
-                    detail = "; ".join(problems) + "; left as it is"
-                elif (where, NAME) not in flat(now_snap):
-                    outcome = "aborted-unchanged"
-                else:
-                    removed = rollback_entry(agent, config, journal["cli"], journal["scope"], project_dir, now_snap)
-                    outcome = "recovered-entry-removed" if removed["clean"] else "needs-attention"
-                    detail = "; ".join(removed["problems"])
-        except RegisterError as exc:
-            detail = str(exc)
-        journal["state"] = outcome if outcome != "needs-attention" else "failed-needs-attention"
-        write_journal(folder, journal)
-        report.append({"backup_dir": folder.name, "outcome": outcome, "detail": detail})
-    for lock in sorted((state_dir / "locks").glob("*.lock")):
-        try:
-            owner = Path(json.loads(lock.read_text(encoding="utf-8"))["backup_dir"])
-            state = _read_journal(owner)["state"] if (owner / "journal.json").exists() else "never-started"
-        except (OSError, ValueError, KeyError, RegisterError):
-            report.append({"lock": lock.name, "outcome": "needs-attention", "detail": "unreadable lock; left in place"})
+            with held(lid):
+                journal = _read_journal(folder)  # read again under the lock
+                if journal["state"] not in OPEN_STATES:
+                    continue
+                try:
+                    outcome, detail = _settle(folder, journal)
+                except RegisterError as exc:
+                    outcome, detail = "needs-attention", str(exc)
+                journal["state"] = outcome if outcome != "needs-attention" else "failed-needs-attention"
+                write_journal(folder, journal)
+                owner = _owner_path(lid)
+                if _owner_folder(owner) == _norm(os.path.realpath(folder)):
+                    owner.unlink(missing_ok=True)
+        except LockBusy as exc:
+            report.append({"backup_dir": folder.name, "outcome": "in-progress", "detail": f"{exc}; left alone"})
             continue
-        if state in OPEN_STATES:
-            report.append({"lock": lock.name, "outcome": "needs-attention", "detail": "its run is still open; left in place"})
-        else:
-            _release(lock)
-            report.append({"lock": lock.name, "outcome": "released", "detail": f"run state {state}"})
+        report.append({"backup_dir": folder.name, "outcome": outcome, "detail": detail})
+    for owner in sorted(lock_dir().glob("*.owner.json")) if lock_dir().exists() else []:
+        lid = owner.name.split(".")[0]
+        try:
+            with held(lid):
+                folder = _owner_folder(owner)
+                if folder is None:
+                    if owner.exists():
+                        report.append({"lock": lid, "outcome": "needs-attention", "detail": "unreadable owner record; left in place"})
+                    continue
+                if not (Path(folder) / "journal.json").exists():
+                    state = "never-started"
+                else:
+                    try:
+                        state = _read_journal(Path(folder))["state"]
+                    except RegisterError as exc:
+                        report.append({"lock": lid, "outcome": "needs-attention", "detail": f"{exc}; left in place"})
+                        continue
+                if state in OPEN_STATES:
+                    report.append({"lock": lid, "outcome": "needs-attention", "detail": "its run is still open in "
+                                   f"{brain.redact_paths(str(Path(folder).parent.parent))}; run recover with that --state-dir"})
+                    continue
+                owner.unlink(missing_ok=True)
+                report.append({"lock": lid, "outcome": "released", "detail": f"run state {state}"})
+        except LockBusy as exc:
+            report.append({"lock": lid, "outcome": "in-progress", "detail": f"{exc}; left alone"})
     return report
+
+
+def _owner_folder(owner: Path) -> str | None:
+    """The normalized backup folder an owner record names, or None if it is missing or unreadable."""
+    try:
+        return _norm(os.path.realpath(json.loads(owner.read_text(encoding="utf-8"))["backup_dir"]))
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
 
 
 # ---------------------------------------------------------------- CLI
@@ -565,11 +788,12 @@ def main(argv: list[str] | None = None) -> int:
                 raise RegisterError("rollback needs --backup-dir")
             how = "remove only the omniagent-brain entry" if args.entry_only else "restore the config's original bytes"
             brain.confirm_as_owner(f"Roll back {args.backup_dir.name}: {how}.", "rollback")
-            result = rollback(args.backup_dir, args.entry_only, args.state_dir)
+            result = rollback(args.backup_dir, args.entry_only)
             print(json.dumps(result, indent=2))
             return 0 if result["clean"] else 2
         if args.action == "recover":
-            brain.confirm_as_owner("Settle interrupted registrations. Only do this when no apply is running.", "recover")
+            brain.confirm_as_owner("Settle interrupted registrations. A run that is still going is detected by its "
+                                   "lock and left alone.", "recover")
             print(json.dumps(recover(args.state_dir), indent=2))
             return 0
         if args.action == "runtime":

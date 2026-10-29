@@ -1,13 +1,16 @@
 """Fake `claude` / `codex` / `agy` CLI used by test_mcp_register.py. It edits only the file named by FAKE_CONFIG.
 
 FAKE_KIND: claude | codex | agy        which config dialect to write
-FAKE_MODE: ok | fail | leak | noop | mutate | bad-command | reformat
+FAKE_MODE: ok | fail | leak | noop | mutate | bad-command | reformat | block
+           | drop-setting | change-setting | add-setting   (an unrelated, non-MCP setting)
+`block` writes, touches FAKE_STARTED, then waits (at most 60 s) until FAKE_RELEASE exists: a slow or stuck CLI.
 """
 
 import json
 import os
 import re
 import sys
+import time
 from pathlib import Path
 
 NAME = "omniagent-brain"
@@ -61,6 +64,12 @@ if kind in ("claude", "agy"):
         servers.pop(NAME, None)
     if mode == "mutate" and "other" in doc.get("mcpServers", {}):
         doc["mcpServers"]["other"]["args"] = ["changed"]
+    if mode == "drop-setting":
+        doc.pop("model", None)
+    if mode == "change-setting":
+        doc["hooks"] = {"PreToolUse": [{"matcher": "*"}]}
+    if mode == "add-setting":
+        doc["newKey"] = True
     write_json(doc)
 else:  # codex: TOML text, so only our own table is ever touched
     text = path.read_text(encoding="utf-8") if path.exists() else ""
@@ -71,4 +80,16 @@ else:  # codex: TOML text, so only our own table is ever touched
         text = text.rstrip("\n") + f"\n\n[mcp_servers.{NAME}]\ncommand = {json.dumps(command_line[0])}\nargs = [{args}]\n"
     if mode == "mutate":
         text = text.replace('args = ["--flag"]', 'args = ["changed"]')
+    if mode == "drop-setting":
+        text = text.replace('[projects.demo]\ntrust_level = "trusted"\n', "")
+    if mode == "change-setting":
+        text = text.replace('model = "x"', 'model = "changed"')
+    if mode == "add-setting":
+        text = "new_key = true\n" + text
     path.write_text(text, encoding="utf-8")
+
+if mode == "block" and adding:
+    Path(os.environ["FAKE_STARTED"]).touch()
+    deadline = time.time() + 60
+    while not Path(os.environ["FAKE_RELEASE"]).exists() and time.time() < deadline:
+        time.sleep(0.05)
