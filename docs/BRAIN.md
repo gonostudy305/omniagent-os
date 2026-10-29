@@ -121,7 +121,7 @@ codex exec --skip-git-repo-check --ephemeral -s read-only -c 'approval_policy="n
 
 ## Chưa làm
 
-- Đăng ký vào cấu hình thật của ba agent (M3) và thử bằng agent thật: kế hoạch ở [M3_REGISTRATION_PLAN.md](M3_REGISTRATION_PLAN.md), chưa áp dụng.
+- Đăng ký vào cấu hình thật của ba agent (M3) và thử bằng agent thật: công cụ `mcp_register.py` và hợp đồng an toàn ở [M3_REGISTRATION_PLAN.md](M3_REGISTRATION_PLAN.md); mới chạy trong profile dùng một lần, chưa áp dụng vào profile thật.
 - Tìm kiếm ngữ nghĩa (hiện chỉ khớp chuỗi con, không embedding).
 - Nhập có chọn lọc từ bộ nhớ Claude Code (M4); không nhập từ Antigravity.
 - Kiểm chứng tự động bằng cách chạy lại lệnh (cố ý không làm: sẽ thực thi lệnh do agent đề xuất).
@@ -129,6 +129,5 @@ codex exec --skip-git-repo-check --ephemeral -s read-only -c 'approval_policy="n
 - Adapter Memorix chỉ đọc (phương án lai trong ADR): hoãn tới khi tìm kiếm chuỗi con không đủ dùng.
 - Phát hiện mâu thuẫn theo chủ đề thay vì chỉ theo tiêu đề trùng (ý tưởng `conflictKey` của Memorix).
 - Test kill tiến trình giữa lúc ghi SQLite (hiện dựa vào tính nguyên tử của giao dịch SQLite, chưa có test riêng).
-- Đăng ký thật vào cấu hình agent: công cụ `mcp_register` đang ở nhánh riêng `feat/m3-register-tool`, chưa thành PR.
 - Điều phối nhiều agent (v0.5): handoff mới chỉ là một loại ghi chú, chưa có giao thức nhận việc và quyền sở hữu.
 - Quét bí mật chỉ là heuristic; che đường dẫn chỉ xử lý thư mục home.
