@@ -41,10 +41,15 @@ Cách đọc kết quả:
 Mã thoát: `0` không mục nào FAIL, `1` có mục FAIL, `2` lỗi môi trường (ví dụ thiếu Python).
 
 ## Bước 3 (tùy chọn). Thử ghi nhận và hoàn tác trong state riêng
-Chế độ `Trial` ghi nhận một adoption vào **một thư mục state mới** dưới `.local\smoke-state\`, chạy `plan`, hoàn tác, rồi băm toàn bộ thư mục skill trước và sau để chứng minh không byte nào đổi. Nó không ghi vào thư mục skill.
+Chế độ `Trial` ghi nhận một adoption vào **một thư mục state mới** dưới `.local\smoke-state\` (đổi bằng `-StateRoot`), chạy `plan`, hoàn tác, rồi băm toàn bộ thư mục skill trước và sau để chứng minh không byte nào đổi. Nó không ghi vào thư mục skill.
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\smoke_beta.ps1 -Source <thư mục template> -Manifest <adapters.json> -Mode Trial
 ```
+Mỗi lần chạy có một thư mục riêng `<thời điểm UTC>-<8 ký tự ngẫu nhiên>`; script từ chối chạy nếu thư mục đó đã tồn tại. **Script không bao giờ tự xóa thư mục này**: journal bên trong là bằng chứng adoption đã được ghi rồi hoàn tác (`status: rolled_back`). Xem xong thì tự xóa thư mục tương ứng trong `.local\smoke-state\`. Thư mục này nằm trong `.local/` nên không lên git.
+
+Chế độ chỉ-đọc dùng một đường dẫn state mới trong `%TEMP%` cho mỗi lần chạy và không tạo thư mục đó (`plan` chỉ đọc state), nên không thể đọc nhầm state cũ hay để lại rác.
+
+Script tự băm bằng .NET thay vì `Get-FileHash`, nên chạy được cả khi bạn gọi `powershell -File ...` từ cửa sổ PowerShell 7.
 
 ## Bước 4. Thử trong agent thật (cần bạn làm tay)
 Smoke test không chứng minh được điều này. Mở Codex hoặc Claude, gọi từng skill pilot và đánh dấu danh sách trong [BETA.md](BETA.md).

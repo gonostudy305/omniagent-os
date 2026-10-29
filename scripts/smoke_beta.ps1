@@ -8,9 +8,11 @@
   presence, junction/symlink, frontmatter, leftover placeholders, referenced files,
   skill-to-skill dependencies, and the source/render/installed hashes.
 
-  Mode Trial additionally records an adoption into a NEW state folder under .local\smoke-state
-  (state only, never skill files), runs plan, rolls the adoption back, and proves with a
-  byte-level fingerprint that the skill folders did not change.
+  Mode Trial additionally records an adoption into a NEW state folder under -StateRoot
+  (default .local\smoke-state; state only, never skill files), runs plan, rolls the adoption
+  back, and proves with a byte-level fingerprint that the skill folders did not change.
+  Each Trial state folder is kept as evidence (its journal shows the adoption and rollback)
+  and is never deleted by this script; delete it by hand once you have reviewed it.
 
   What this script can NOT prove: that an agent really loads the skill, or that the skill
   completes its task. Those are listed as NOT VERIFIED and need a manual check (docs\BETA.md).
@@ -30,6 +32,7 @@ param(
     [string[]]$Skills = @("threejs", "ask", "preview"),
     [ValidateSet("ReadOnly", "Trial")][string]$Mode = "ReadOnly",
     [string]$ReportDir,
+    [string]$StateRoot,
     [switch]$RunTests
 )
 
@@ -40,6 +43,9 @@ $RepoRoot = Split-Path -Parent $PSScriptRoot
 if (-not $ReportDir) { $ReportDir = Join-Path $RepoRoot ".local\reports" }
 $Results = New-Object System.Collections.ArrayList
 $Stamp = (Get-Date).ToUniversalTime().ToString("yyyyMMddTHHmmssZ")
+if (-not $StateRoot) { $StateRoot = Join-Path $RepoRoot ".local\smoke-state" }
+# Seconds alone collide when two runs start in the same second.
+$RunId = "$Stamp-$([guid]::NewGuid().ToString('N').Substring(0, 8))"
 
 function Add-Result([string]$Id, [string]$Status, [string]$Detail) {
     [void]$Results.Add([pscustomobject]@{ id = $Id; status = $Status; detail = $Detail })
@@ -85,15 +91,19 @@ function Get-TreeFingerprint([string]$Root) {
     # Bytes, names, sizes, empty directories and modification times: any change alters the value.
     $sb = New-Object System.Text.StringBuilder
     $items = Get-ChildItem -LiteralPath $Root -Recurse -Force | Sort-Object FullName
+    # .NET, not Get-FileHash: started from PowerShell 7, Windows PowerShell 5.1 inherits a
+    # PSModulePath whose Core-only Utility module hides Get-FileHash (CI run 40813644887).
+    $sha = [System.Security.Cryptography.SHA256]::Create()
     foreach ($i in $items) {
         $rel = $i.FullName.Substring($Root.Length).TrimStart("\")
         if ($i.PSIsContainer) { [void]$sb.Append("D|$rel|$($i.LastWriteTimeUtc.Ticks)`n") }
         else {
-            $h = (Get-FileHash -LiteralPath $i.FullName -Algorithm SHA256).Hash
+            $stream = [System.IO.File]::OpenRead($i.FullName)
+            try { $h = [BitConverter]::ToString($sha.ComputeHash($stream)).Replace("-", "") }
+            finally { $stream.Dispose() }
             [void]$sb.Append("F|$rel|$($i.Length)|$h|$($i.LastWriteTimeUtc.Ticks)`n")
         }
     }
-    $sha = [System.Security.Cryptography.SHA256]::Create()
     $hash = $sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($sb.ToString()))
     return ([BitConverter]::ToString($hash)).Replace("-", "").ToLower()
 }
@@ -201,7 +211,10 @@ foreach ($name in $Skills) {
 # ---- 5. Hashes: source, render, installed
 $planned = @{}
 if ($sourceOk -and $manifestOk -and $targetOk) {
-    $argsPlan = @("plan", "--source", $Source, "--state-dir", (Join-Path $env:TEMP "omniagent-smoke-readonly"),
+    # A fresh, never-created path: plan only reads state, so no stale state from an earlier
+    # run can be picked up and nothing is left behind.
+    $readOnlyState = Join-Path $env:TEMP "omniagent-smoke-readonly-$RunId"
+    $argsPlan = @("plan", "--source", $Source, "--state-dir", $readOnlyState,
         "--target", "$AgentName=$Target", "--adapter-manifest", $Manifest, "--json")
     foreach ($s in $Skills) { $argsPlan += @("--skill", $s) }
     $r = Invoke-Omni $argsPlan
@@ -213,7 +226,10 @@ if ($sourceOk -and $manifestOk -and $targetOk) {
             if (-not $row) { Add-Result "skill.$name.hashes" "FAIL" "skill not found in the source"; continue }
             $short = { param($h) if ($h) { $h.Substring(0, 12) } else { "-" } }
             $detail = "source=$(& $short $row.source_hash) render=$(& $short $row.render_hash) installed=$(& $short $row.installed_hash) status=$($row.status)"
-            if ($row.status -in @("conflict", "unsafe", "mismatch")) { Add-Result "skill.$name.hashes" "FAIL" $detail }
+            # The state path is fresh, so every installed skill is unmanaged here; only `blocked`
+            # (a link or a file instead of a folder) can still appear. `conflict*` needs a record
+            # and is kept only as a guard. (`unsafe`/`mismatch` are adopt statuses, never plan.)
+            if ($row.status -eq "blocked" -or $row.status -like "conflict*") { Add-Result "skill.$name.hashes" "FAIL" $detail }
             elseif ($row.render_matches_installed) { Add-Result "skill.$name.hashes" "PASS" $detail }
             else { Add-Result "skill.$name.hashes" "FAIL" "render and installed hashes differ. $detail" }
         }
@@ -227,7 +243,8 @@ if ($Mode -eq "Trial") {
         Add-Result "trial.run" "FAIL" "Trial mode needs -Source, -Manifest and every pilot skill installed"
     }
     else {
-        $state = Join-Path $RepoRoot ".local\smoke-state\$Stamp"
+        $state = Join-Path $StateRoot $RunId
+        if (Test-Path -LiteralPath $state) { throw "Trial state folder already exists: $state" }
         $before = @{}; foreach ($n in $Skills) { $before[$n] = Get-TreeFingerprint $installedDirs[$n] }
         $common = @("--source", $Source, "--state-dir", $state, "--target", "$AgentName=$Target", "--adapter-manifest", $Manifest)
         foreach ($s in $Skills) { $common += @("--skill", $s) }
