@@ -188,6 +188,7 @@ existing agent stores yet.
 - [docs/QUICKSTART.md](docs/QUICKSTART.md): 10-minute Windows start, smoke test and troubleshooting
 - [docs/BETA.md](docs/BETA.md): controlled beta guide, release criteria and evidence
 - [docs/BRAIN.md](docs/BRAIN.md): shared second brain MVP (trust model, usage, what is verified and what is not)
+- [docs/M3_REGISTRATION_PLAN.md](docs/M3_REGISTRATION_PLAN.md): previewed, journaled, byte-exact reversible MCP registration (`mcp_register.py`); not applied to real profiles
 - [docs/RELEASE_NOTES_v0.3.0-beta.1.md](docs/RELEASE_NOTES_v0.3.0-beta.1.md): release notes for the published pre-release
 
 ---

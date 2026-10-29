@@ -25,6 +25,7 @@ import re
 import secrets
 import shutil
 import sqlite3
+import subprocess
 import sys
 import time
 import uuid
@@ -655,17 +656,24 @@ class McpServer:
                 stdout.flush()
 
 
+def server_args(script: str | Path, project: str, brain_dir: Path | None, agent: str) -> list[str]:
+    """Arguments after the interpreter that start the stdio MCP server (global options come first)."""
+    args = [str(script)]
+    if brain_dir:
+        args += ["--brain-dir", str(brain_dir)]
+    return args + ["--project", project, "serve", "--agent", agent]
+
+
 def register_plan(project: str, brain_dir: Path | None) -> str:
     """Config snippets for each agent. Printed only: nothing is written to any agent folder."""
-    script = str(Path(__file__).resolve())
+    script = Path(__file__).resolve()
     lines = ["# Not applied. Review, then add by hand or with a backed-up, previewed change.", ""]
     for agent in ("claude", "codex", "antigravity"):
-        # --brain-dir and --project belong to the top-level parser, so they must come before "serve".
-        args = [script] + (["--brain-dir", str(brain_dir)] if brain_dir else []) +             ["--project", project, "serve", "--agent", agent]
+        args = server_args(script, project, brain_dir, agent)
         entry = {"command": sys.executable, "args": args}
         lines.append(f"## {agent}")
         if agent == "claude":
-            lines.append("claude mcp add omniagent-brain -- " + " ".join(json.dumps(x) for x in [sys.executable] + args))
+            lines.append("claude mcp add omniagent-brain -- " + subprocess.list2cmdline([sys.executable] + args))
         elif agent == "codex":
             lines += ["[mcp_servers.omniagent-brain]", f"command = {json.dumps(sys.executable)}",
                       "args = [" + ", ".join(json.dumps(x) for x in args) + "]"]
