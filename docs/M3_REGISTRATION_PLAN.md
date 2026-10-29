@@ -35,14 +35,14 @@ Mục đăng ký chung: tên `omniagent-brain`, lệnh `python`, đối số `<r
 | Agent | Phạm vi đề xuất | Lệnh sẽ chạy (khi được duyệt) | Ghi chú |
 |---|---|---|---|
 | Claude Code | `--scope local` từ thư mục dự án: chỉ dự án này thấy, riêng tư với tài khoản | `claude mcp add --scope local omniagent-brain -- python <runtime> ...` | Khớp nguyên tắc "bộ nhớ theo dự án". Không dùng `--scope project` vì nó tạo `.mcp.json` trong repo chứa đường dẫn cá nhân |
-| Codex | Toàn cục (chưa xác minh Codex có cấu hình MCP theo dự án) | `codex mcp add omniagent-brain -- python <runtime> ...` | Mọi phiên Codex sẽ thấy brain của `omniagent-os`; chấp nhận hoặc không làm bước này |
+| Codex | Toàn cục qua CLI, hoặc theo dự án bằng `<dự án>/.codex/config.toml` (chỉ có hiệu lực với dự án đã được tin cậy; file gần nhất thắng) | `codex mcp add omniagent-brain -- python <runtime> ...` | `codex mcp add` **không có cờ chọn phạm vi** (đã kiểm `--help`): luôn ghi vào cấu hình người dùng. Phạm vi dự án nghĩa là tự thêm một bảng vào `.codex/config.toml` (thay đổi file có kiểm soát, hoàn tác được), chưa làm trong M3.1 |
 | Antigravity CLI | Toàn cục (`config/mcp_config.json`) | `agy mcp add omniagent-brain -- python <runtime> ...` (cờ phải đứng trước tên) | Cùng lưu ý phạm vi như Codex |
 
 Vì danh tính (`--agent`) và dự án cố định lúc khởi chạy, ghi chú đề xuất từ một phiên Codex ở dự án khác vẫn vào `omniagent-os` nhưng được gắn `source_agent=codex` và luôn là `inbox`. Đó là lý do cần chấp nhận rủi ro "toàn cục" một cách có ý thức.
 
 ## 4. Quy trình mỗi agent (xem trước, sao lưu, ghi, kiểm tra, hoàn tác)
 
-Công cụ đề xuất xây ở bước M3.1 (`brain.py register`, có test với CLI giả, mặc định chỉ xem trước):
+Công cụ `mcp_register.py` (M3.1, đã xây, có 26 test với CLI giả và cấu hình tạm; chưa chạy `apply` trên máy thật). Dùng: `python mcp_register.py runtime`, `plan --agent claude`, `apply --agent claude --yes` (cần terminal tương tác), `rollback --backup-dir <thư mục>`. Mặc định chỉ xem trước:
 
 1. **Điều kiện đầu:** tìm thấy CLI; `brain.py` chạy được; trạng thái sao lưu ghi lại (kích thước, hash, danh sách tên mục).
 2. **Xem trước (mặc định):** in lệnh chính xác sẽ chạy, file đích, đường dẫn sao lưu, và khẳng định "chưa ghi gì". Không in giá trị của mục nào.
@@ -57,8 +57,8 @@ Kiểm thử (không động vào máy thật): CLI giả ghi vào file tạm; k
 
 | Bước | Việc | Ghi vào máy thật? | Cần bạn duyệt |
 |---|---|---|---|
-| M3.0 | Chuẩn bị `.local\runtime\brain-<hash>.py` và kiểm tra bắt tay stdio với đúng lệnh | Không (chỉ `.local`) | Không |
-| M3.1 | Xây `brain.py register` (xem trước) + test CLI giả | Không | Merge PR |
+| M3.0 | Chuẩn bị `.local\runtime\brain-<hash>.py` và kiểm tra bắt tay stdio với đúng lệnh (`mcp_register.py runtime`) | Không (chỉ `.local`) | Không. Đã code và test; chưa chạy vào `.local` của repo chính |
+| M3.1 | `mcp_register.py` (xem trước, sao lưu, áp dụng, hoàn tác) + test CLI giả | Không | Merge PR. Đã code và test; chạy `plan` chỉ-đọc trên cấu hình thật xác nhận phân tích được cả ba file (claude, codex: 5 mục mỗi bên; agy: 11 mục), không ghi gì |
 | M3.2 | Claude Code, `--scope local`, dự án này | Có (`~/.claude.json`) | **Có** |
 | M3.3 | Thử thật: Claude gọi `brain_propose` và `brain_search` | Ghi vào `.local\brain` | Có |
 | M3.4 | Codex | Có (`config.toml`) | **Có** |
@@ -77,7 +77,9 @@ Bắt đầu bằng Claude `--scope local` vì rủi ro thấp nhất: chỉ m�
 | Đổi nhánh Git làm mất `brain.py` | Chạy từ bản chép `.local\runtime\` có hash |
 | Phạm vi toàn cục của Codex và Antigravity | Chấp nhận có ý thức, hoặc bỏ qua hai agent đó ở v0.4 |
 | Antigravity IDE có thể đọc một file cấu hình khác | Kiểm chứng riêng ở M3.7, không đăng ký "cho chắc" vào cả ba file |
-| Codex có cấu hình MCP theo dự án không | Chưa xác minh; không dựa vào |
+| Codex theo dự án | Có (`.codex/config.toml`, chỉ dự án tin cậy) nhưng CLI không ghi vào đó; để sau, nếu bạn muốn tránh phạm vi toàn cục |
+| `agy` không có trên PATH của shell này | `plan` báo "agent CLI not found"; cần truyền `--cli <đường dẫn agy>` khi làm M3.5 |
+| Nhiều tiến trình MCP dùng chung một file SQLite | Đã gặp lỗi `database is locked` khi thử tải (5/150 lần ghi) và đã sửa (busy timeout, khởi tạo schema một lần, `BEGIN IMMEDIATE`); có test nhiều tiến trình |
 | Agent chạy được shell vẫn có thể gọi CLI chủ dự án | Đã có cổng terminal tương tác; **đó là ma sát, không phải xác thực** (xem BRAIN.md) |
 | Client thật có thể xử lý giao thức MCP khác client giả | Đó chính là lý do M3.3 và M3.6 dùng agent thật; chưa kiểm chứng |
 | `agy mcp add` "thêm hoặc cập nhật": trùng tên sẽ ghi đè | Bước xem trước kiểm tra tên chưa tồn tại và dừng nếu đã có |
