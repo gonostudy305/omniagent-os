@@ -1,6 +1,6 @@
 # M3: đăng ký MCP `omniagent-brain` vào Claude Code, Codex và Antigravity
 
-> English summary: `mcp_register.py` registers the brain server through each agent's own `mcp add/remove`, with the lifecycle inspect → preview → approve → apply → verify → rollback (+ recover). Apply needs the config hash from the plan and stops if the file changed. Rollback restores the original bytes only while the file is exactly as apply left it; otherwise it refuses, and `--entry-only` removes just our entry. Every stage is journaled and one run per config holds a lock. Proven against real Claude Code 2.1.246 and Codex 0.163.0 in throwaway profiles only; Antigravity only with a fake CLI. Nothing has been written to any real agent config.
+> English summary: `mcp_register.py` registers the brain server through each agent's own `mcp add/remove`, with the lifecycle inspect → preview → approve → apply → verify → rollback (+ recover). Apply needs the config hash from the plan and stops if the file changed. Rollback restores the original bytes only while the file is exactly as apply left it; otherwise it refuses, and `--entry-only` removes just our entry. Every stage is journaled. M3.1.1 hardening: one OS file lock per config file and user, independent of `--state-dir`, so `recover` leaves a run whose process is alive alone (no PID or age heuristics; an unknown lock state fails closed); `--entry-only` and `recover` remove our entry only while it is exactly the entry that was registered; and every setting outside the MCP tables is compared, so a CLI that removes or changes one (real Claude Code 2.1.246 drops a `theme` key) makes the run fail and be reverted. Proven against real Claude Code 2.1.246 and Codex 0.163.0 in throwaway profiles only; Antigravity only with a fake CLI. Nothing has been written to any real agent config.
 
 Trạng thái: **công cụ đã xây và kiểm thử; chưa ghi vào cấu hình thật của agent nào.** Đăng ký trên máy thật (M3.2 trở đi) cần bạn cho phép riêng từng agent. Phụ thuộc: [BRAIN.md](BRAIN.md) (PR #9, đã merge). Số liệu khảo sát lấy ngày 28/10/2026 trên một máy Windows, chỉ ghi số lượng và tên khóa, không giá trị (file cấu hình có thể chứa token).
 
@@ -59,8 +59,8 @@ Mặc định chỉ xem trước. Chi tiết hợp đồng an toàn ở mục 8;
 2. **Xem trước (mặc định):** in lệnh chính xác sẽ chạy, file đích, đường dẫn sao lưu, và khẳng định "chưa ghi gì". Không in giá trị của mục nào.
 3. **Sao lưu:** chép file cấu hình đích sang `.local\backups\mcp-<giờ>\` và kiểm tra hash bản sao. File sao lưu có thể chứa token nên nằm ngoài git và phải giữ nguyên quyền riêng tư.
 4. **Ghi:** chạy đúng một lệnh `mcp add` (cần `--yes` và, tương tự `verify`, một terminal tương tác).
-5. **Kiểm tra sau khi ghi:** (a) danh sách tên mục = danh sách trước + `omniagent-brain`; (b) mọi mục khác không đổi (so sánh sau khi phân tích cú pháp, không so byte vì ứng dụng có thể định dạng lại); (c) bắt tay MCP thật với **đúng lệnh đã đăng ký** (`initialize`, `tools/list` thấy bốn công cụ).
-6. **Hoàn tác:** nếu file vẫn đúng hash đã ghi lúc `apply`, khôi phục nguyên từng byte từ bản sao lưu (ghi qua file tạm rồi thay thế một bước; file vốn không tồn tại thì xóa lại). Nếu file đã đổi sau đó, **từ chối** và không động vào; `--entry-only` gỡ riêng mục của mình bằng `mcp remove`, rồi kiểm tra mọi mục khác vẫn như ngay trước khi gỡ.
+5. **Kiểm tra sau khi ghi:** (a) danh sách tên mục = danh sách trước + `omniagent-brain`; (b) mọi mục khác không đổi (so sánh sau khi phân tích cú pháp, không so byte vì ứng dụng có thể định dạng lại); (c) mọi thiết lập ngoài bảng MCP không bị xóa hay đổi (khóa CLI thêm mới thì được liệt kê trong kết quả); (d) mục mới chạy đúng lệnh đề xuất và không mang gì thêm; (e) bắt tay MCP thật với **đúng lệnh đã đăng ký** (`initialize`, `tools/list` thấy bốn công cụ).
+6. **Hoàn tác:** nếu file vẫn đúng hash đã ghi lúc `apply`, khôi phục nguyên từng byte từ bản sao lưu (ghi qua file tạm rồi thay thế một bước; file vốn không tồn tại thì xóa lại). Nếu file đã đổi sau đó, **từ chối** và không động vào; `--entry-only` gỡ riêng mục của mình bằng `mcp remove`, nhưng chỉ khi mục đó còn đúng từng thuộc tính như lúc `apply` ghi nhận, rồi kiểm tra mọi mục và thiết lập khác vẫn như ngay trước khi gỡ.
 
 Kiểm thử (không động vào máy thật): CLI giả ghi vào file tạm; kịch bản cho thêm, kiểm tra, hoàn tác, mục trùng tên, CLI lỗi giữa chừng, file bị ứng dụng đổi khi đang thao tác, và khẳng định không có giá trị nào xuất hiện trong đầu ra.
 
@@ -70,6 +70,7 @@ Kiểm thử (không động vào máy thật): CLI giả ghi vào file tạm; k
 |---|---|---|---|
 | M3.0 | Chuẩn bị `.local\runtime\brain-<hash>.py` và kiểm tra bắt tay stdio với đúng lệnh (`mcp_register.py runtime`) | Không (chỉ `.local`) | Không. Đã code và test; chưa chạy vào `.local` của repo chính |
 | M3.1 | `mcp_register.py` (xem trước, sao lưu, áp dụng, hoàn tác đúng từng byte, nhật ký, khóa, `recover`) + test CLI giả + lần chạy CLI thật trong profile dùng một lần | Không | Merge PR. Đã code và test; chạy `plan` chỉ-đọc trên cấu hình thật (28/10) xác nhận phân tích được cả ba file (claude, codex: 5 mục mỗi bên; agy: 11 mục), không ghi gì |
+| M3.1.1 | Gia cố: khóa hệ điều hành theo file cấu hình và người dùng (không phụ thuộc `--state-dir`), `recover` không đụng lần chạy còn sống, `--entry-only` chỉ gỡ đúng mục đã đăng ký, so sánh các thiết lập ngoài MCP | Không (chỉ tạo `~/.omniagent-os/register-locks` khi chạy `apply`/`rollback`/`recover`) | Merge PR |
 | M3.2 | Claude Code, `--scope local`, dự án này | Có (`~/.claude.json`) | **Có** |
 | M3.3 | Thử thật: Claude gọi `brain_propose` và `brain_search` | Ghi vào `.local\brain` | Có |
 | M3.4 | Codex | Có (`config.toml`) | **Có** |
@@ -97,6 +98,11 @@ Bắt đầu bằng Claude `--scope local` vì rủi ro thấp nhất: chỉ m�
 | `~/.claude.json` thật bị các phiên Claude đang chạy ghi lại liên tục | Gần như chắc chắn hash sẽ đổi giữa `apply` và `rollback`, nên hoàn tác đúng từng byte sẽ bị từ chối; dùng `--entry-only`. Đây là thiết kế: không ghi đè thay đổi của ứng dụng |
 | Claude CLI tự để lại file của nó (`.claude/backups/.claude.json.backup.*`, log MCP trong `AppData/Local/claude-cli-nodejs/Cache`) | Không phải file của OmniAgent-OS nên `rollback` không xóa; file cấu hình thì về đúng từng byte |
 | Một lần chạy bị ngắt giữa chừng giữ khóa | Không bao giờ xóa khóa vì "trông cũ"; `recover` đọc nhật ký rồi mới quyết định (mục 8) |
+| CLI của agent đổi thiết lập không liên quan | Đã gặp thật: Claude Code 2.1.246 xóa khóa `theme` khỏi `.claude.json` khi `mcp add` (profile dùng một lần, cả khi profile đã khởi tạo); `model`, `hooks`, khóa tùy chỉnh thì giữ. `apply` phát hiện và hoàn tác; nghĩa là cấu hình còn `theme` sẽ không đăng ký được bằng Claude CLI bản này. Codex 0.163.0 chỉ đổi `mcp_servers` |
+| Python bản Microsoft Store ảo hóa thư mục `AppData` | Khóa đặt dưới `%LOCALAPPDATA%` sẽ khác nhau giữa Python Store và Python khác; vì thế khóa nằm ở `~/.omniagent-os/register-locks` |
+| Phiên Claude khác ghi `~/.claude.json` trong lúc `apply` | Thay đổi đó hiện ra như "thiết lập đổi" và `apply` thất bại an toàn rồi hoàn tác; chạy lại khi ít phiên đang mở. Giới hạn còn lại: khi hoàn tác bằng byte gốc (file vẫn đúng như CLI vừa ghi), một lần ghi của chương trình khác **trong vài giây CLI đang chạy** cũng bị hoàn tác theo, vì không phân biệt được ai đổi |
+| `apply` bị kill trong lúc CLI của agent (tiến trình con) còn chạy | Khóa thuộc về tiến trình `apply`, nên nhả ngay khi nó chết, còn CLI mồ côi có thể ghi tiếp sau đó. `recover` quyết định theo file ở thời điểm nó chạy; sau một lần sập, đợi CLI con kết thúc (`mcp add` thật xong trong vài giây) rồi mới `recover`, và chạy `plan` để kiểm tra lại. Chưa có cơ chế tự động |
+| Khóa chỉ loại trừ các lần chạy của công cụ này | Agent và phiên Claude không dùng khóa này; vì vậy vẫn cần kiểm tra hash ngay trước khi ghi và so sánh sau khi ghi. Chạy song song bản M3.1 cũ (khóa trong `--state-dir`) với bản mới thì không loại trừ nhau |
 
 ## 7. Việc bạn cần quyết định
 
@@ -112,19 +118,21 @@ Bắt đầu bằng Claude `--scope local` vì rủi ro thấp nhất: chỉ m�
 
 **`apply`** (mỗi bước ghi vào `journal.json` qua file tạm rồi thay thế):
 
-1. Chạy lại `plan`; dừng nếu có vấn đề hoặc nếu hash khác `--expect-sha`.
-2. Tạo khóa cho file cấu hình (tạo nguyên tử; lần chạy thứ hai bị từ chối). Nhật ký `prepared`.
+1. Giữ khóa của file cấu hình (xem **Khóa** bên dưới); lần chạy thứ hai, dù dùng `--state-dir` khác, bị từ chối.
+2. Chạy lại `plan` trong khóa; dừng nếu có vấn đề hoặc nếu hash khác `--expect-sha`. Nhật ký `prepared` (ghi cả mục đề xuất và hash của từng thiết lập ngoài MCP).
 3. Sao lưu `config.bak`, kiểm tra hash. Nhật ký `backed-up`.
 4. Kiểm tra lại ngay trước khi ghi: file phải đúng hash của plan và của bản sao lưu, nếu không thì `aborted-unchanged`.
-5. Nhật ký `writing`, chạy `mcp add` của agent. Nhật ký `verifying`.
-6. Kiểm tra: file vẫn phân tích được, có đúng một mục mới, mọi mục khác không đổi, lệnh đã đăng ký bắt tay MCP được. Lỗi thì gỡ mục của mình (`failed-rolled-back`) hoặc báo `failed-needs-attention`.
-7. Ghi `applied_sha256`, nhật ký `applied`.
+5. Nhật ký `writing`, chạy `mcp add` của agent. Ghi hash của mục vừa được viết, nhật ký `verifying`.
+6. Kiểm tra như mục 4, bước 5. Lỗi thì: nếu file vẫn đúng như CLI vừa ghi, khôi phục nguyên byte gốc (hoàn tác cả thiết lập CLI đã đổi); nếu có chương trình khác ghi sau CLI, chỉ gỡ mục của mình và báo phần còn khác. Kết quả `failed-rolled-back` hoặc `failed-needs-attention`.
+7. Ghi `applied_sha256` và hash của mục đã đăng ký, nhật ký `applied`.
 
 Từ chối ngay, không ghi gì, khi: file không phải UTF-8, JSON không phải object, danh sách server hoặc dự án có dạng lạ, TOML hoặc JSON hỏng (không trích nội dung), đã có mục trùng tên.
 
-**`rollback`**: như mục 4, bước 6. Lỗi ghi (ví dụ bị khóa quyền) để nguyên file như sau `apply` và báo lỗi.
+**`rollback`**: như mục 4, bước 6. Lỗi ghi (ví dụ bị khóa quyền) để nguyên file như sau `apply` và báo lỗi. `--entry-only` so mục hiện có với hash đã ghi lúc `apply`; khác (lệnh, đối số, `env` hay thuộc tính nào khác) thì từ chối, không in giá trị, và chỉ cách kiểm tra (`<cli> mcp get omniagent-brain`) rồi tự gỡ. Nhật ký từ bản M3.1 không có hash này nên cũng bị từ chối. Nếu `mcp remove` làm đổi thiết lập khác, file được trả về đúng như trước khi gỡ và báo lỗi.
 
-**`recover`** (chỉ chạy khi không có `apply` nào đang chạy; cần xác nhận ở terminal): với mỗi nhật ký còn mở, file vẫn đúng hash gốc thì `aborted-unchanged`; đã có mục của mình và mọi mục khác không đổi thì gỡ mục (`recovered-entry-removed`); có mục khác đổi thì **để nguyên** và báo `needs-attention`. Nhật ký không đọc được cũng được báo và để nguyên. Khóa chỉ được nhả khi lần chạy của nó đã khép lại.
+**Khóa.** Mỗi file cấu hình (đường dẫn chuẩn hóa: `..`, chữ hoa/thường trên Windows, symlink) có một khóa trong `~/.omniagent-os/register-locks/`, dùng chung mọi `--state-dir`. Khóa là khóa file của hệ điều hành (`msvcrt.locking` trên Windows, `flock` trên Linux/macOS), giữ suốt lần chạy; hệ điều hành tự nhả khi tiến trình kết thúc, dù kết thúc kiểu gì. Vì vậy "chủ khóa còn sống không" được trả lời bằng chính khóa, không dựa vào PID (tránh PID bị dùng lại) hay tuổi file. Kèm theo là một bản ghi chủ (`<id>.owner.json`): lần chạy kết thúc mà nhật ký còn mở (bị kill, hay lỗi Python giữa chừng) để lại bản ghi này, và mọi lần chạy mới bị từ chối cho tới khi `recover`. Không xác định được trạng thái khóa (lỗi hệ điều hành) thì coi như đang bận: từ chối.
+
+**`recover`** (cần xác nhận ở terminal): với mỗi nhật ký còn mở trong `--state-dir`, trước hết thử giữ khóa của file cấu hình đó. Đang có tiến trình giữ khóa (hay không xác định được) thì báo `in-progress` và **không đụng** gì: không đổi file, không đổi nhật ký, không nhả khóa. Giữ được khóa nghĩa là chủ đã chết; khi đó: file vẫn đúng hash gốc thì `aborted-unchanged`; còn mục của mình, mọi mục và thiết lập khác không đổi, và mục đó đúng là mục đã ghi (hash ghi sau `mcp add`, hoặc nếu chưa kịp ghi thì đúng lệnh đề xuất và không mang `env`/thuộc tính lạ) thì gỡ mục (`recovered-entry-removed`); ngoài ra thì **để nguyên** và báo `needs-attention`. Nhật ký không đọc được cũng được báo và để nguyên. Bản ghi chủ chỉ bị xóa khi lần chạy của nó đã khép lại; nếu nó thuộc một `--state-dir` khác, `recover` chỉ báo thư mục cần dùng.
 
 **Bằng chứng (29/10/2026, Windows 11, Python 3.13):**
 
@@ -132,10 +140,25 @@ Từ chối ngay, không ghi gì, khi: file không phải UTF-8, JSON không ph�
 |---|---|---|---|
 | Vị trí và định dạng cấu hình do CLI thật ghi (profile dùng một lần) | `$CLAUDE_CONFIG_DIR/.claude.json`, LF; mục `{type: stdio, command, args, env: {}}`; phạm vi local nằm trong `projects.<đường dẫn>` | `$CODEX_HOME/config.toml`, LF; bảng `[mcp_servers.omniagent-brain]` | NOT_VERIFIED (không có `agy` trên máy) |
 | `scripts/sandbox_register_e2e.py`, chưa có cấu hình: plan → apply → CLI thấy mục → server đúng dự án và danh tính → rollback đúng từng byte | PASS (`mcp list` báo Connected) | PASS (`mcp get`) | NOT_VERIFIED |
-| Như trên, với cấu hình có sẵn cài đặt riêng, CRLF | PASS | PASS | NOT_VERIFIED |
-| Profile thật giữ nguyên kích thước và thời điểm sửa | PASS | PASS | — |
-| Test với CLI giả (`tests/test_mcp_register.py`, 58 test) | PASS | PASS | PASS |
+| Như trên, với cấu hình có sẵn cài đặt riêng (`model`, `hooks`, khóa tùy chỉnh), CRLF | PASS | PASS | NOT_VERIFIED |
+| (M3.1.1) Mọi thiết lập có trước vẫn y nguyên sau `apply`; khóa CLI thêm mới được liệt kê | PASS (profile mới: CLI thêm 17 khóa khởi tạo, như `userID`, `firstStartTime`, và bản ghi dự án) | PASS (không thêm khóa nào) | NOT_VERIFIED |
+| (M3.1.1) `--entry-only` từ chối mục cùng tên đã bị sửa (thêm `env`), file giữ nguyên; gỡ được mục còn nguyên và mọi thiết lập vẫn như sau `apply` | PASS | PASS | NOT_VERIFIED |
+| (M3.1.1) Cấu hình có `theme`: CLI xóa nó khi `mcp add`, `apply` báo `setting 'theme' was removed`, hoàn tác đúng từng byte | PASS | — (Codex không xóa thiết lập nào) | NOT_VERIFIED |
+| Profile thật giữ nguyên kích thước và thời điểm sửa; không tạo `~/.omniagent-os` thật | PASS | PASS | — |
+| Test với CLI giả (`tests/test_mcp_register.py`, 88 test) | PASS | PASS | PASS |
+
+**Bằng chứng riêng cho bốn biện pháp gia cố M3.1.1** (test với CLI giả, chạy trên Windows; CI chạy cả Ubuntu):
+
+| Biện pháp | Test chứng minh |
+|---|---|
+| A. `recover` không đụng lần chạy còn sống | `LivenessTests`: một `apply` bị chặn giữa chừng trong luồng khác và **trong một tiến trình khác** được để nguyên (file, nhật ký, khóa); tiến trình đó bị kill thật thì `recover` xử lý được; bản ghi chủ mang PID còn sống không cản `recover` khi khóa đã nhả; khóa đang bị giữ được tôn trọng dù PID ghi lại đã chết; lỗi khi kiểm tra khóa thì từ chối (cả `apply` lẫn `recover`); lỗi Python giữa chừng chặn lần chạy mới cho tới `recover` |
+| B. Khóa không phụ thuộc `--state-dir` | `LockIdentityTests`: `--state-dir` thứ hai bị từ chối khi lần đầu đang chạy; bốn luồng với bốn `--state-dir` khác nhau, đúng một thành công; các cách viết khác của cùng đường dẫn dùng chung khóa; lần chạy bị ngắt ở một `--state-dir` chặn `--state-dir` khác cho tới khi `recover` đúng thư mục |
+| C. `--entry-only` chỉ gỡ đúng mục đã đăng ký | `EntryOnlyTests` (JSON và TOML): mục bị thêm `env` chứa token thì từ chối, không lộ token, file giữ nguyên; mục còn nguyên thì gỡ; nhật ký bản cũ thì từ chối; `recover` cũng không gỡ mục đã bị sửa |
+| Kiểm tra đột biến (bản sao tạm, mỗi lần tắt một biện pháp) | Bỏ khóa hệ điều hành; `recover` bỏ qua khóa đang giữ; lần chạy dở vẫn xóa bản ghi chủ; khóa phụ thuộc `--state-dir`; mã khóa không chuẩn hóa đường dẫn; `--entry-only` bỏ qua hash mục; `recover` bỏ qua thuộc tính mục; bỏ qua thiết lập đổi; không trả lại file sau `mcp remove`: cả 9 đều làm test fail |
+| D. Thiết lập ngoài MCP | `SettingsTests` (JSON và TOML): CLI xóa hay đổi một thiết lập (kể cả lồng bên trong `hooks`) thì `apply` thất bại và file về đúng từng byte; khóa CLI thêm mới được báo, không bị từ chối; `mcp remove` đổi thiết lập thì file được trả lại như trước khi gỡ; `recover` để nguyên khi thiết lập đã đổi |
 
 Test với CLI giả bao gồm: thiếu file, file hỏng, UTF-16, BOM + CRLF, mục trùng tên, giữ các mục khác, sửa ngoài giữa plan và apply, giữa sao lưu và ghi, giữa apply và rollback, file chỉ đọc, lỗi khi khôi phục, sập ở từng giai đoạn của nhật ký, nhật ký hỏng, khóa còn sót, bốn lần đăng ký song song (đúng một thành công), không lộ token, và chạy đúng lệnh đã đăng ký để đề xuất một ghi chú với đúng dự án và danh tính. Kiểm tra đột biến: tắt kiểm tra hash trước khi khôi phục, kiểm tra lại trước khi ghi, khóa, `--expect-sha`, kiểm tra dạng cấu hình, hoặc việc `recover` để nguyên file đã bị sửa, đều làm test fail.
 
-**Chưa kiểm chứng:** đăng ký vào profile thật (cần bạn cho phép riêng); Antigravity với CLI hay IDE thật; agent thật tự gọi tool qua mục do công cụ này đăng ký (lần chạy có đăng nhập trong [BRAIN.md](BRAIN.md) dùng cờ từng lần, không dùng mục đã đăng ký); `recover` không phân biệt được một `apply` đang chạy với một lần đã chết, nên chỉ chạy khi chắc không có `apply` nào.
+**Đảm bảo chính xác của phần so sánh thiết lập:** so theo hash giá trị đã phân tích của từng khóa cấp cao nhất (và từng khóa trong mỗi bản ghi dự án của Claude), nên thay đổi lồng bên trong một khóa cũng bị phát hiện. Không so: định dạng, thứ tự khóa, chú thích TOML. Khóa mới do CLI thêm không bị coi là lỗi mà được liệt kê trong `settings_added`.
+
+**Chưa kiểm chứng:** đăng ký vào profile thật (cần bạn cho phép riêng); Antigravity với CLI hay IDE thật; agent thật tự gọi tool qua mục do công cụ này đăng ký (lần chạy có đăng nhập trong [BRAIN.md](BRAIN.md) dùng cờ từng lần, không dùng mục đã đăng ký); khóa trên macOS (chỉ chạy Windows và Ubuntu); CLI mồ côi sau khi `apply` bị kill (mục 6).
