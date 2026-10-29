@@ -32,6 +32,12 @@ Chưa có dự án nào đủ chín để giải quyết cả ba lớp. Mỗi d�
 
 Định vị của OmniAgent-OS: **bộ điều khiển local-first cho vòng đời agent**: bắt đầu từ việc *hiểu, dọn và hợp nhất an toàn* cấu hình hiện có (audit, adopt, plan, apply, rollback), rồi mới mở sang memory và điều phối. Không cố thay thế các dự án trên; có thể dùng chúng làm thành phần.
 
+**Cập nhật 29/10/2026.** Bảng trên đã cũ: Memorix, AgentMux, AgentsMesh và nhiều dự án khác nay phủ phần lớn cả ba lớp, và có công cụ đã quảng cáo migration có backup/rollback (Helter5/agentbridge) hay lockfile/provenance (agentbridgehq/agentbridge). Xem [COMPETITIVE_STRATEGY.md](COMPETITIVE_STRATEGY.md). Định vị hiện tại chỉ nói điều đã làm được:
+
+> OmniAgent-OS is a local-first, fail-closed skill lifecycle manager for AI coding assistants. It explains planned changes, protects unmanaged or modified files, and supports verified rollback and recovery.
+
+Ba lớp ở mục 1 vẫn là tầm nhìn dài hạn; thứ tự ưu tiên và lời hứa sản phẩm thay đổi, không bỏ vision.
+
 ## 3. Nguyên tắc thiết kế
 
 1. **An toàn trước, tiện lợi sau.** Mặc định chỉ đọc. Ghi file cần `--yes`. Không bao giờ ghi đè skill chưa được quản lý hoặc đã bị sửa tay.

@@ -1,6 +1,6 @@
 # OmniAgent-OS / Local Agent Skills SSOT
 
-> **A Unified Single-Source-of-Truth (SSOT) & Cross-Agent Management Layer for Claude Code, OpenAI Codex, and Antigravity (Gemini).**
+> **OmniAgent-OS is a local-first, fail-closed skill lifecycle manager for AI coding assistants. It explains planned changes, protects unmanaged or modified files, and supports verified rollback and recovery.** Works with Claude Code, OpenAI Codex and Antigravity (Gemini) skill folders.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey)](#)
@@ -107,6 +107,10 @@ $skills = Join-Path $PWD 'ssot\skills'
 $claude = Join-Path $HOME '.claude\skills'
 python omniagent.py plan --source $skills --target "claude=$claude"
 
+# Read-only: why each skill is safe, blocked or needs opt-in, and how to undo it.
+# Add --json for deterministic, path-free output (see docs/USAGE.md).
+python omniagent.py plan --source $skills --target "claude=$claude" --explain
+
 # Preview existing unmanaged skills that exactly match the SSOT.
 python omniagent.py adopt --source $skills --target "claude=$claude"
 
@@ -143,7 +147,7 @@ Run isolated tests (no third-party Python packages required):
 
 ```powershell
 python tests/test_audit.py
-python -m unittest discover -s tests -p test_skill_manager.py -v
+python -m unittest discover -s tests -p "test_*.py" -v
 ```
 
 ### 4. Preview portable paths and stage a single rendered skill (v0.3 experimental)
@@ -176,6 +180,7 @@ existing agent stores yet.
 ## 📚 Docs
 
 - [docs/PROJECT_CONTEXT.md](docs/PROJECT_CONTEXT.md): why this project exists, design principles, decisions, roadmap
+- [docs/CODEBASE_REALITY_CHECK.md](docs/CODEBASE_REALITY_CHECK.md), [docs/COMPETITIVE_STRATEGY.md](docs/COMPETITIVE_STRATEGY.md), [docs/RESEARCH_DRIVEN_ROADMAP.md](docs/RESEARCH_DRIVEN_ROADMAP.md): what is verified, what competitors already cover, what to build next (29/10/2026)
 - [docs/DEVELOPMENT_LOG.md](docs/DEVELOPMENT_LOG.md): what was done on a real machine, metrics, lessons
 - [docs/USAGE.md](docs/USAGE.md): Skill Manager runbook (discover, adopt, plan, apply, rollback)
 - [docs/PATH_ADAPTER.md](docs/PATH_ADAPTER.md): v0.3 template preview, guarded fixture apply and rollback
