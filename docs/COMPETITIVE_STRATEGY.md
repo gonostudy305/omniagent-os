@@ -56,7 +56,9 @@ Những điểm này có giá trị với người đã có môi trường bẩn
 | "Second brain dùng chung" | **Giữ có điều kiện** (PR #9): memory theo dự án, agent chỉ đề xuất. Không tranh với Memorix về tìm kiếm/indexing |
 | "Điều phối" | **Hoãn**. Nếu cần, chỉ làm lớp chính sách quanh runtime có sẵn |
 
-Định vị đề xuất (để chủ dự án duyệt): *"OmniAgent-OS changes an existing AI coding setup without breaking it: it explains every change, refuses to overwrite anything it does not own, and can undo or recover what it did."*
+Định vị đã chọn (29/10/2026, dùng trong README và PROJECT_CONTEXT): *"OmniAgent-OS is a local-first, fail-closed skill lifecycle manager for AI coding assistants. It explains planned changes, protects unmanaged or modified files, and supports verified rollback and recovery."* Câu này chỉ nói những gì đã có, không tự nhận là hệ điều hành đa agent hay nền tảng conformance.
+
+Báo cáo Deep Research đầy đủ không đưa vào repo công khai; trang này và hai trang đi kèm chỉ giữ các kết luận đã gắn mức bằng chứng.
 
 ## 5. Quyết định build / integrate
 

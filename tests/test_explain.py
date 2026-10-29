@@ -80,30 +80,91 @@ class ExplainTests(unittest.TestCase):
     def test_every_dirty_state_gets_a_decision_reason_and_undo(self):
         self.dirty_workstation()
         doc = json.loads(self.run_cli("plan", *self.common(), "--explain", "--json").stdout)
-        self.assertEqual(doc["schema"], "omniagent.explain/1")
-        got = {e["name"]: (e["status"], e["cause"], e["decision"], e["l0_hash"]) for e in doc["entries"]}
+        self.assertEqual(doc["schema"], "omniagent.explain/2")
+        got = {e["name"]: (e["status"], e["cause"], e["decision"],
+                           e["installed_vs_recorded"], e["installed_vs_expected"]) for e in doc["entries"]}
         self.assertEqual(got, {
-            "a-install": ("install", None, "will_change", "SKIP"),
-            "b-unchanged": ("unchanged", None, "no_change", "PASS"),
-            "c-update": ("update", None, "will_change", "FAIL"),
-            "d-adopted": ("update_adopted", None, "needs_opt_in", "FAIL"),
-            "e-edited": ("conflict", "edited", "blocked", "FAIL"),
-            "f-missing": ("conflict_missing", None, "blocked", "FAIL"),
-            "g-unmanaged": ("blocked_unmanaged", "untracked", "blocked", "UNKNOWN"),
-            "h-file": ("blocked", "not_a_directory", "blocked", "UNKNOWN"),
-            "i-vendor": ("blocked_vendor", None, "blocked", "FAIL"),
-            "j-secret": ("conflict", "unreadable", "blocked", "UNKNOWN"),
+            "a-install": ("install", None, "ready", "NOT_CHECKED", "MISSING"),
+            "b-unchanged": ("unchanged", None, "no_change", "MATCH", "MATCH"),
+            "c-update": ("update", None, "ready", "MATCH", "DIFFERS"),
+            "d-adopted": ("update_adopted", None, "needs_opt_in", "MATCH", "DIFFERS"),
+            "e-edited": ("conflict", "edited", "blocked", "DIFFERS", "NOT_CHECKED"),
+            "f-missing": ("conflict_missing", None, "blocked", "MISSING", "MISSING"),
+            "g-unmanaged": ("blocked_unmanaged", "untracked", "blocked", "NOT_CHECKED", "NOT_CHECKED"),
+            "h-file": ("blocked", "not_a_directory", "blocked", "NOT_CHECKED", "NOT_CHECKED"),
+            "i-vendor": ("blocked_vendor", None, "blocked", "MATCH", "DIFFERS"),
+            "j-secret": ("conflict", "unreadable", "blocked", "UNREADABLE", "UNREADABLE"),
         })
-        self.assertEqual(doc["summary"], {"will_change": 2, "needs_opt_in": 1, "blocked": 6, "no_change": 1})
+        self.assertEqual(doc["summary"], {"ready": 2, "needs_opt_in": 1, "blocked": 6, "no_change": 1})
         for e in doc["entries"]:
             self.assertTrue(e["why"] and e["undo"], e)
-            if e["decision"] not in {"will_change", "needs_opt_in"}:
+            if e["decision"] not in {"ready", "needs_opt_in"}:
                 self.assertEqual(e["changes"], "nothing", e)  # blocked and no-op entries write nothing
             if e["decision"] == "blocked":
                 self.assertEqual(e["authority"], "target", e)  # existing bytes always win
                 self.assertTrue(e["resolve"], e)
-        for level in ("L1", "L2", "L3"):
+            # Blocked entries stop the batch, so not even a ready entry is written by default.
+            self.assertNotEqual(e["default_run"], "writes", e)
+        self.assertEqual(doc["default_run"]["result"], "refused")
+        self.assertEqual(doc["skip_blocked_run"]["writes"], 2)
+        for level in ("L2_agent_load", "L3_task_run"):
             self.assertEqual(doc["verification"][level], "NOT_VERIFIED")
+
+    def changed_entries(self, before: dict, after: dict) -> set:
+        """Skill names whose files under the target were created, changed or removed."""
+        root = str(self.target)
+        names = set()
+        for path in before.keys() | after.keys():
+            if path.startswith(root) and before.get(path) != after.get(path):
+                names.add(Path(path).relative_to(self.target).parts[0])
+        return names
+
+    def test_explanation_matches_what_apply_really_does(self):
+        self.dirty_workstation()
+        doc = json.loads(self.run_cli("plan", *self.common(), "--explain", "--json").stdout)
+        before = snapshot(self.target)
+        refused = self.run_cli("apply", *self.common(), "--yes", expected=2)
+        self.assertIn("nothing applied", refused.stderr)
+        self.assertEqual(before, snapshot(self.target))  # default run: refused, as explained
+        self.run_cli("apply", *self.common(), "--yes", "--skip-blocked")
+        predicted = {e["name"] for e in doc["entries"] if e["decision"] == "ready"}
+        self.assertEqual(self.changed_entries(before, snapshot(self.target)), predicted)
+        self.assertEqual(len(predicted), doc["skip_blocked_run"]["writes"])
+
+    def test_mixed_batch_reports_ready_entry_as_refused_by_default(self):
+        make_skill(self.source, "fresh")
+        make_skill(self.source, "taken")
+        make_skill(self.target, "taken", "user copy")
+        doc = json.loads(self.run_cli("plan", *self.common(), "--explain", "--json").stdout)
+        fresh = next(e for e in doc["entries"] if e["name"] == "fresh")
+        self.assertEqual((fresh["decision"], fresh["default_run"]), ("ready", "refused"))
+        self.assertEqual(doc["default_run"]["result"], "refused")
+        self.assertIn("1 entry is blocked", doc["default_run"]["reason"])
+        self.run_cli("apply", *self.common(), "--yes", expected=2)
+        self.assertFalse((self.target / "fresh").exists())
+        text = self.run_cli("plan", *self.common(), "--explain").stdout
+        self.assertIn("`apply --yes` would: refused", text)
+        self.assertIn("`apply --yes --skip-blocked` would: writes 1", text)
+
+    def test_opt_in_alone_also_refuses_the_default_batch(self):
+        make_skill(self.source, "mine", "v1")
+        make_skill(self.target, "mine", "v1")
+        self.run_cli("adopt", *self.common(), "--yes")
+        (self.source / "mine" / "SKILL.md").write_text("---\nname: mine\n---\nv2\n", encoding="utf-8")
+        make_skill(self.source, "fresh")
+        doc = json.loads(self.run_cli("plan", *self.common(), "--explain", "--json").stdout)
+        self.assertEqual(doc["default_run"]["result"], "refused")
+        self.run_cli("apply", *self.common(), "--yes", expected=2)
+        self.assertFalse((self.target / "fresh").exists())
+
+    def test_clean_batch_is_written_by_the_default_run(self):
+        make_skill(self.source, "one")
+        make_skill(self.source, "two")
+        doc = json.loads(self.run_cli("plan", *self.common(), "--explain", "--json").stdout)
+        self.assertEqual((doc["default_run"]["result"], doc["default_run"]["writes"]), ("writes", 2))
+        self.assertEqual({e["default_run"] for e in doc["entries"]}, {"writes"})
+        self.run_cli("apply", *self.common(), "--yes")
+        self.assertTrue((self.target / "one").is_dir() and (self.target / "two").is_dir())
 
     def test_explain_writes_nothing_and_is_byte_for_byte_deterministic(self):
         self.dirty_workstation()
@@ -140,7 +201,7 @@ class ExplainTests(unittest.TestCase):
         self.assertEqual(got, {
             "absent": ("install", "no_change", "nothing"),
             "differs": ("mismatch", "blocked", "nothing"),
-            "same": ("eligible", "will_change", "manager_state_only"),
+            "same": ("eligible", "ready", "manager_state_only"),
         })
         self.assertFalse(self.state.exists())
 
@@ -163,7 +224,7 @@ class ExplainTests(unittest.TestCase):
         make_skill(self.target, "fresh", "x")
         doc = json.loads(self.run_cli("adopt", *self.common(moved), "--explain", "--json").stdout)
         got = {e["name"]: (e["status"], e["decision"]) for e in doc["entries"]}
-        self.assertEqual(got, {"fresh": ("eligible", "will_change"),
+        self.assertEqual(got, {"fresh": ("eligible", "ready"),
                                "shared": ("managed_elsewhere", "blocked")})
         # Before this fix the identical "shared" folder was reported eligible and
         # then aborted the whole adoption, so "fresh" could never be adopted.
@@ -188,8 +249,8 @@ class ExplainTests(unittest.TestCase):
                          ("blocked_rendered", "blocked"))
         rendered = json.loads(self.run_cli("plan", *self.common(), "--adapter-manifest", manifest,
                                            "--explain", "--json").stdout)
-        self.assertEqual((rendered["entries"][0]["status"], rendered["entries"][0]["l0_hash"]),
-                         ("unchanged", "PASS"))
+        self.assertEqual((rendered["entries"][0]["status"], rendered["entries"][0]["installed_vs_expected"]),
+                         ("unchanged", "MATCH"))
 
     def test_every_status_the_code_emits_is_documented(self):
         code = SCRIPT.read_text(encoding="utf-8") + (ROOT / "path_adapter.py").read_text(encoding="utf-8")
@@ -205,7 +266,8 @@ class ExplainTests(unittest.TestCase):
     def test_an_undocumented_status_fails_closed(self):
         doc = omniagent.explain([{"target": "t", "name": "n", "status": "something_new"}], "plan")
         entry = doc["entries"][0]
-        self.assertEqual((entry["decision"], entry["changes"], entry["l0_hash"]), ("blocked", "nothing", "UNKNOWN"))
+        self.assertEqual((entry["decision"], entry["changes"], entry["installed_vs_expected"], entry["default_run"]),
+                         ("blocked", "nothing", "NOT_CHECKED", "untouched"))
 
     @unittest.skipUnless(hasattr(os, "symlink"), "needs symlink support")
     def test_symlinked_target_entry_is_blocked_with_cause(self):

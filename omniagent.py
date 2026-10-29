@@ -393,79 +393,98 @@ def adoption_plan(source: Path, state_dir: Path, targets: dict[str, Path],
     return result
 
 
-EXPLAIN_SCHEMA = "omniagent.explain/1"
-DECISIONS = ("will_change", "needs_opt_in", "blocked", "no_change")
-# One entry per status: what `--yes` would do, whose bytes win, what to do next.
-# l0 is the hash check this command actually performed; nothing here proves an
-# agent loads the skill (L2) or completes a task with it (L3).
+EXPLAIN_SCHEMA = "omniagent.explain/2"
+DECISIONS = ("ready", "needs_opt_in", "blocked", "no_change")
+# One entry per status: whether the entry itself is ready to change, whose bytes
+# win, what a successful run would write, what to do next. `rec` and `exp` are
+# the comparisons the command actually made: installed copy vs the hash the
+# manager recorded, and installed copy vs the SSOT (or rendered) bytes it wants.
+# Nothing here proves an agent loads the skill (L2) or completes a task (L3).
 _UNDO_APPLY = "rollback --transaction ID --yes (refused if the copy was edited afterwards)"
 _UNDO_NONE = "nothing to undo; no file or state is written for this entry"
 EXPLANATIONS = {
     "plan": {
-        "install": dict(decision="will_change", authority="ssot", changes="skill_files", l0="SKIP",
+        "install": dict(decision="ready", authority="ssot", changes="skill_files",
+                        rec="NOT_CHECKED", exp="MISSING",
                         why="The target has no folder with this name; apply copies the SSOT skill.",
                         resolve=[], undo="rollback --transaction ID --yes deletes the copy if it is unedited"),
-        "update": dict(decision="will_change", authority="ssot", changes="skill_files", l0="FAIL",
+        "update": dict(decision="ready", authority="ssot", changes="skill_files",
+                       rec="MATCH", exp="DIFFERS",
                        why="The managed copy is unedited and the SSOT changed; apply replaces it after a verified backup.",
                        resolve=[], undo=_UNDO_APPLY + "; the verified backup is restored"),
-        "update_adopted": dict(decision="needs_opt_in", authority="ssot", changes="skill_files", l0="FAIL",
+        "update_adopted": dict(decision="needs_opt_in", authority="ssot", changes="skill_files",
+                               rec="MATCH", exp="DIFFERS",
                                why="The folder was adopted from your existing install and the SSOT changed since.",
                                resolve=["review the change, then apply with --allow-update-adopted",
                                         "or leave it: apply --skip-blocked keeps your adopted copy"],
                                undo=_UNDO_APPLY + "; the verified backup is restored"),
-        "unchanged": dict(decision="no_change", authority="none", changes="nothing", l0="PASS",
+        "unchanged": dict(decision="no_change", authority="none", changes="nothing",
+                          rec="MATCH", exp="MATCH",
                           why="The managed copy matches the SSOT and its recorded hash.",
                           resolve=[], undo=_UNDO_NONE),
-        "blocked": dict(decision="blocked", authority="target", changes="nothing", l0="UNKNOWN",
+        "blocked": dict(decision="blocked", authority="target", changes="nothing",
+                        rec="NOT_CHECKED", exp="NOT_CHECKED",
                         why="The target entry is not a plain skill folder.",
                         resolve=["inspect the entry by hand; the manager never follows or replaces it"],
                         undo=_UNDO_NONE),
-        "blocked_unmanaged": dict(decision="blocked", authority="target", changes="nothing", l0="UNKNOWN",
+        "blocked_unmanaged": dict(decision="blocked", authority="target", changes="nothing",
+                                  rec="NOT_CHECKED", exp="NOT_CHECKED",
                                   why="A folder with this name exists that the manager did not install or adopt.",
                                   resolve=["run adopt to check whether it is an exact match of the SSOT",
                                            "if adopt reports mismatch, review it with adopt --skill NAME --diff and reconcile by hand"],
                                   undo=_UNDO_NONE),
-        "blocked_vendor": dict(decision="blocked", authority="target", changes="nothing", l0="FAIL",
+        "blocked_vendor": dict(decision="blocked", authority="target", changes="nothing",
+                               rec="MATCH", exp="DIFFERS",
                                why="An update would delete node_modules installed inside the managed copy.",
                                resolve=["move node_modules out yourself if it can be reinstalled, then plan again"],
                                undo=_UNDO_NONE),
-        "blocked_rendered": dict(decision="blocked", authority="target", changes="nothing", l0="UNKNOWN",
+        "blocked_rendered": dict(decision="blocked", authority="target", changes="nothing",
+                                 rec="MATCH", exp="NOT_CHECKED",
                                  why="The copy was rendered for one agent; a plain apply would overwrite it with unrendered files.",
                                  resolve=["plan with --adapter-manifest to compare it with the rendered SSOT"],
                                  undo=_UNDO_NONE),
-        "conflict": dict(decision="blocked", authority="target", changes="nothing", l0="FAIL",
+        "conflict": dict(decision="blocked", authority="target", changes="nothing",
+                         rec="DIFFERS", exp="NOT_CHECKED",
                          why="The managed copy changed after the manager wrote or adopted it.",
                          resolve=["the manager will not choose between your edit and the SSOT",
                                   "copy wanted edits into the SSOT, or move the folder aside, then plan again"],
                          undo=_UNDO_NONE),
-        "conflict_missing": dict(decision="blocked", authority="target", changes="nothing", l0="FAIL",
+        "conflict_missing": dict(decision="blocked", authority="target", changes="nothing",
+                                 rec="MISSING", exp="MISSING",
                                  why="State records a managed copy here, but the folder is gone (removed outside the manager).",
                                  resolve=["restore the folder from your own backup, or roll back the transaction that installed it"],
                                  undo=_UNDO_NONE),
     },
     "adopt": {
-        "eligible": dict(decision="will_change", authority="target", changes="manager_state_only", l0="PASS",
+        "eligible": dict(decision="ready", authority="target", changes="manager_state_only",
+                         rec="NOT_CHECKED", exp="MATCH",
                          why="The existing folder is byte-identical to the SSOT; adopt --yes records it without touching files.",
                          resolve=[], undo="rollback --transaction ID --yes untracks it; files are never touched"),
-        "eligible_rendered": dict(decision="will_change", authority="target", changes="manager_state_only", l0="PASS",
+        "eligible_rendered": dict(decision="ready", authority="target", changes="manager_state_only",
+                                  rec="NOT_CHECKED", exp="MATCH",
                                   why="The existing folder equals the SSOT rendered for this agent; adopt --yes records the rendered hash.",
                                   resolve=[], undo="rollback --transaction ID --yes untracks it; files are never touched"),
-        "mismatch": dict(decision="blocked", authority="target", changes="nothing", l0="FAIL",
+        "mismatch": dict(decision="blocked", authority="target", changes="nothing",
+                         rec="NOT_CHECKED", exp="DIFFERS",
                          why="The existing folder differs from the SSOT; only exact matches are adopted.",
                          resolve=["review with adopt --skill NAME --target NAME=PATH --diff (SKILL.md only)",
                                   "reconcile by hand; differences in other files must be inspected separately"],
                          undo=_UNDO_NONE),
-        "unsafe": dict(decision="blocked", authority="target", changes="nothing", l0="UNKNOWN",
+        "unsafe": dict(decision="blocked", authority="target", changes="nothing",
+                       rec="NOT_CHECKED", exp="UNREADABLE",
                        why="The existing folder holds something the manager refuses to read (link, credential-like or special file).",
                        resolve=["inspect the folder by hand"], undo=_UNDO_NONE),
-        "managed_elsewhere": dict(decision="blocked", authority="target", changes="nothing", l0="UNKNOWN",
+        "managed_elsewhere": dict(decision="blocked", authority="target", changes="nothing",
+                                  rec="NOT_CHECKED", exp="NOT_CHECKED",
                                   why="State already tracks this folder for a different SSOT path.",
                                   resolve=["use the --source the folder was managed from, or roll back that transaction first"],
                                   undo=_UNDO_NONE),
-        "already_managed": dict(decision="no_change", authority="none", changes="nothing", l0="UNKNOWN",
+        "already_managed": dict(decision="no_change", authority="none", changes="nothing",
+                                rec="NOT_CHECKED", exp="NOT_CHECKED",
                                 why="The folder is already managed; adopt leaves it alone.",
                                 resolve=["run plan to see whether it is unchanged, outdated or edited"], undo=_UNDO_NONE),
-        "install": dict(decision="no_change", authority="none", changes="nothing", l0="SKIP",
+        "install": dict(decision="no_change", authority="none", changes="nothing",
+                        rec="NOT_CHECKED", exp="MISSING",
                         why="No folder exists to adopt; adopt never installs.",
                         resolve=["plan and apply install missing skills"], undo=_UNDO_NONE),
     },
@@ -480,6 +499,35 @@ CAUSES = {
 }
 
 
+def _batch_outcome(entries: list[dict], command: str, rendered: bool) -> dict:
+    """What `--yes` with no other flag really does to the whole selection.
+
+    apply refuses the entire batch when any entry is blocked or needs an
+    opt-in flag, so an entry can be `ready` and still not be written.
+    """
+    ready = [e for e in entries if e["decision"] == "ready"]
+    if command == "adopt":
+        # adopt records every eligible entry and leaves the rest alone.
+        run = {"command": "adopt --yes", "result": "writes" if ready else "nothing_to_do",
+               "reason": None, "writes": len(ready)}
+        return {"default_run": run, "skip_blocked_run": None}
+    stoppers = [e for e in entries if e["decision"] in {"blocked", "needs_opt_in"}]
+    if rendered:
+        reason = "rendered apply needs --allow-rendered-apply with exactly one --skill and one --target"
+        run = {"command": "apply --yes", "result": "refused", "reason": reason, "writes": 0}
+    elif stoppers:
+        verb = "entry is blocked or needs" if len(stoppers) == 1 else "entries are blocked or need"
+        reason = f"{len(stoppers)} {verb} an opt-in flag; apply refuses the whole batch"
+        run = {"command": "apply --yes", "result": "refused", "reason": reason, "writes": 0}
+    else:
+        run = {"command": "apply --yes", "result": "writes" if ready else "nothing_to_do",
+               "reason": None, "writes": len(ready)}
+    skip = None if rendered else {"command": "apply --yes --skip-blocked",
+                                  "result": "writes" if ready else "nothing_to_do",
+                                  "reason": None, "writes": len(ready)}
+    return {"default_run": run, "skip_blocked_run": skip}
+
+
 def explain(actions: list[dict], command: str, rendered: bool = False) -> dict:
     """Deterministic, path-free explanation of a plan or adoption preview."""
     catalog = EXPLANATIONS[command]
@@ -488,43 +536,58 @@ def explain(actions: list[dict], command: str, rendered: bool = False) -> dict:
         status = a["status"]
         info = catalog.get(status) or EXPLANATIONS["plan"].get(status)
         if info is None:  # fail closed: an undocumented status is never presented as safe
-            info = dict(decision="blocked", authority="target", changes="nothing", l0="UNKNOWN",
+            info = dict(decision="blocked", authority="target", changes="nothing",
+                        rec="NOT_CHECKED", exp="NOT_CHECKED",
                         why="No explanation is recorded for this status; treat it as blocked.",
                         resolve=["report this status as a bug"], undo=_UNDO_NONE)
         elif command == "adopt" and status not in catalog:
             # Adoption only records exact matches; everything else is left alone.
             info = {**info, "decision": "blocked", "changes": "nothing", "undo": _UNDO_NONE}
-        why, l0 = info["why"], info["l0"]
+        why, rec, exp = info["why"], info["rec"], info["exp"]
         if a.get("cause") in CAUSES and status in {"blocked", "blocked_unmanaged", "conflict"}:
             why = f"{why} {CAUSES[a['cause']]}"
             if a["cause"] == "unreadable":
-                l0 = "UNKNOWN"
+                rec = exp = "UNREADABLE"
         entries.append({"target": a["target"], "name": a["name"], "status": status,
                         "cause": a.get("cause"), "decision": info["decision"],
                         "authority": info["authority"], "changes": info["changes"],
                         "why": why, "resolve": list(info["resolve"]), "undo": info["undo"],
-                        "l0_hash": l0})
+                        "installed_vs_recorded": rec, "installed_vs_expected": exp})
+    batch = _batch_outcome(entries, command, rendered)
+    for e in entries:
+        written = e["decision"] == "ready" and batch["default_run"]["result"] == "writes"
+        e["default_run"] = "writes" if written else (
+            "refused" if e["decision"] == "ready" else "untouched")
     return {"schema": EXPLAIN_SCHEMA, "command": command,
             "mode": "rendered" if rendered else "plain",
             "summary": {d: sum(e["decision"] == d for e in entries) for d in DECISIONS},
-            "verification": {"L0": "content hashes compared by this command (per entry l0_hash)",
-                             "L1": "NOT_VERIFIED", "L2": "NOT_VERIFIED", "L3": "NOT_VERIFIED"},
+            **batch,
+            "verification": {"installed_vs_recorded": "installed copy vs the hash the manager recorded",
+                             "installed_vs_expected": "installed copy vs the SSOT (or rendered) bytes",
+                             "values": "MATCH, DIFFERS, MISSING, UNREADABLE, NOT_CHECKED",
+                             "L2_agent_load": "NOT_VERIFIED", "L3_task_run": "NOT_VERIFIED"},
             "entries": entries}
 
 
 def print_explanation(doc: dict) -> None:
     for e in doc["entries"]:
         print(f"{e['target']:10} {e['status']:18} {e['name']}")
-        print(f"  {e['decision'].upper():12} kept: {e['authority']:6} writes: {e['changes']}  hash: {e['l0_hash']}")
+        print(f"  {e['decision'].upper():12} kept: {e['authority']:6} writes: {e['changes']}  "
+              f"default run: {e['default_run']}")
+        print(f"  hash: installed vs recorded {e['installed_vs_recorded']}, "
+              f"installed vs expected {e['installed_vs_expected']}")
         print(f"  why:  {e['why']}")
         for step in e["resolve"]:
             print(f"  next: {step}")
         print(f"  undo: {e['undo']}")
     s = doc["summary"]
-    print(f"Summary: {s['will_change']} will change, {s['needs_opt_in']} need opt-in, "
+    print(f"Summary: {s['ready']} ready, {s['needs_opt_in']} need opt-in, "
           f"{s['blocked']} blocked, {s['no_change']} no change. Nothing was written.")
-    print("Checked: content hashes only (L0). Static references (L1), agent loading (L2) "
-          "and task runs (L3): NOT_VERIFIED.")
+    for run in (doc["default_run"], doc["skip_blocked_run"]):
+        if run:
+            outcome = f"writes {run['writes']}" if run["result"] == "writes" else run["result"]
+            print(f"`{run['command']}` would: {outcome}" + (f" ({run['reason']})" if run["reason"] else ""))
+    print("Agent loading (L2) and task runs (L3): NOT_VERIFIED.")
 
 
 def show_adoption_diff(item: dict) -> None:
