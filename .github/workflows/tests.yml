@@ -21,5 +21,6 @@ jobs:
           python-version: '3.11'
       - name: Audit regression tests
         run: python tests/test_audit.py
-      - name: Skill Manager safety tests
-        run: python -m unittest discover -s tests -p test_skill_manager.py -v
+      # Every tests/test_*.py file: manager, path adapter, recovery, kill, hardening, explain.
+      - name: Full safety test suite
+        run: python -m unittest discover -s tests -p "test_*.py" -v
