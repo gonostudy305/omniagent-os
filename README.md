@@ -1,6 +1,6 @@
 # OmniAgent-OS / Local Agent Skills SSOT
 
-> **A Unified Single-Source-of-Truth (SSOT) & Cross-Agent Management Layer for Claude Code, OpenAI Codex, and Antigravity (Gemini).**
+> **OmniAgent-OS is a local-first, fail-closed skill lifecycle manager for AI coding assistants. It explains planned changes, protects unmanaged or modified files, and supports verified rollback and recovery.** Works with Claude Code, OpenAI Codex and Antigravity (Gemini) skill folders.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey)](#)
