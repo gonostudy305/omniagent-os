@@ -564,16 +564,24 @@ class InterruptedTests(Base):
         self.assertTrue(self.call_apply("user")["applied"])  # a fresh run works again
 
     def test_a_crash_before_the_cli_ran_changes_nothing(self):
-        for target, state in (("backup_config", "prepared"), ("run_cli", "writing")):
-            with self.subTest(target=target):
-                original = self.config.read_bytes()
-                folder = self.crash(target)
-                self.assertEqual(self.journal(folder)["state"], state)
-                report = reg.recover(self.state)
-                self.assertIn({"backup_dir": folder.name, "outcome": "aborted-unchanged", "detail": ""}, report)
-                self.assertEqual(self.config.read_bytes(), original)
-                self.assertEqual(self.locks(), [])
-                shutil.rmtree(self.state / "backups")
+        original = self.config.read_bytes()
+        # A crash before writing stage (at backup_config): state is prepared, settled as aborted-unchanged
+        folder = self.crash("backup_config")
+        self.assertEqual(self.journal(folder)["state"], "prepared")
+        report = reg.recover(self.state)
+        self.assertIn({"backup_dir": folder.name, "outcome": "aborted-unchanged", "detail": ""}, report)
+        self.assertEqual(self.config.read_bytes(), original)
+        self.assertEqual(self.locks(), [])
+        shutil.rmtree(self.state / "backups")
+
+        # A crash when entering run_cli: state is writing without PID evidence; fail-closed as needs-attention
+        folder = self.crash("run_cli")
+        self.assertEqual(self.journal(folder)["state"], "writing")
+        report = reg.recover(self.state)
+        entry = next(r for r in report if r.get("backup_dir") == folder.name)
+        self.assertEqual(entry["outcome"], "needs-attention")
+        self.assertIn("without evidence that the child writer exited", entry["detail"])
+        self.assertEqual(self.config.read_bytes(), original)
 
     def test_recover_leaves_a_config_alone_when_other_entries_changed(self):
         folder = self.crash("handshake", nth=2)
@@ -634,7 +642,71 @@ class InterruptedTests(Base):
         self.assertEqual(entry2["outcome"], "aborted-unchanged")
         self.assertFalse(owner_file.exists())
 
-    def test_external_edit_during_apply_is_not_overwritten_and_fails_closed(self):
+    def test_recover_refuses_writing_stage_without_child_pid_and_leaves_file_alone(self):
+        folder = self.state / "backups" / "mcp-test-no-pid"
+        folder.mkdir(parents=True)
+        lid = reg.lock_id(self.config)
+        reg.lock_dir().mkdir(parents=True, exist_ok=True)
+        owner_file = reg._owner_path(lid)
+        owner_file.write_text(json.dumps({"config": str(self.config), "backup_dir": str(folder),
+                                          "pid": os.getpid(), "at": brain.now()}), encoding="utf-8")
+        original = self.config.read_bytes()
+        # Simulated interruption between Popen and writing child_pid: state is "writing", writer_status is "spawning", child_pid is None
+        journal = {"agent": self.agent, "scope": "user", "config": str(self.config), "cli": self.cli,
+                   "project_dir": str(self.project_dir), "name": reg.NAME,
+                   "before_entries": reg.snapshot(self.agent, self.config, self.project_dir),
+                   "before_settings": reg.settings(self.agent, self.config),
+                   "original_sha256": reg.file_sha(self.config), "written_entry_sha256": None,
+                   "applied_sha256": None, "applied_entry_sha256": None,
+                   "child_pid": None, "writer_status": "spawning", "state": "writing", "at": brain.now()}
+        reg.write_journal(folder, journal)
+
+        report = reg.recover(self.state)
+        entry = next(r for r in report if r.get("backup_dir") == folder.name)
+        self.assertEqual(entry["outcome"], "needs-attention")
+        self.assertIn("without evidence that the child writer exited", entry["detail"])
+        self.assertEqual(self.config.read_bytes(), original)
+        self.assertEqual(self.journal(folder)["state"], "failed-needs-attention")
+
+    def test_apply_cleanup_refuses_to_remove_entry_if_modified_by_external_actor(self):
+        calls = []
+        real_handshake = reg.handshake
+        SECRET_TOKEN = "super-secret-token-12345"
+
+        def fake_handshake(*args, **kwargs):
+            calls.append(1)
+            if len(calls) == 2:
+                # 1st call is in plan; 2nd call is in apply after CLI wrote entry
+                # External actor modifies the omniagent-brain entry directly (e.g. adds secret env)
+                if self.kind == "codex":
+                    text = self.config.read_text(encoding="utf-8")
+                    text = text.replace(f"[mcp_servers.{reg.NAME}]\n",
+                                        f'[mcp_servers.{reg.NAME}]\nenv = {{ API_KEY = "{SECRET_TOKEN}" }}\n')
+                    self.config.write_text(text, encoding="utf-8")
+                else:
+                    doc = json.loads(self.config.read_text(encoding="utf-8"))
+                    doc["mcpServers"][reg.NAME]["env"] = {"API_KEY": SECRET_TOKEN}
+                    self.config.write_text(json.dumps(doc, indent=2), encoding="utf-8")
+                # Now simulate handshake failure to trigger apply error cleanup
+                raise reg.RegisterError("simulated handshake failure")
+            return real_handshake(*args, **kwargs)
+
+        with mock.patch.object(reg, "handshake", fake_handshake):
+            with self.assertRaises(reg.RegisterError) as ctx:
+                self.call_apply("user")
+            err_msg = str(ctx.exception)
+            # Must fail closed with cannot be fully reverted
+            self.assertIn("could not be fully reverted", err_msg)
+            self.assertIn("not the one this tool registered", err_msg)
+            # Secret token must NOT be leaked in error message
+            self.assertNotIn(SECRET_TOKEN, err_msg)
+            # The modified entry MUST NOT be removed!
+            self.assertIn(("user", reg.NAME), self.names())
+            content = self.config.read_text(encoding="utf-8")
+            self.assertIn(SECRET_TOKEN, content)
+
+    def test_external_edit_during_cli_run_fails_closed_and_restores_original(self):
+        original = self.config.read_bytes()
         self.set_mode("block")
         done, err = [], []
 
@@ -649,7 +721,7 @@ class InterruptedTests(Base):
         t.start()
         self.wait_for(self.started, "fake CLI to block")
 
-        # An external process changes an existing setting or adds an external MCP server
+        # An external process changes an existing setting while the CLI is executing
         if self.kind == "codex":
             text = self.config.read_text(encoding="utf-8")
             self.config.write_text(text.replace('model = "x"', 'model = "externally-changed"'), encoding="utf-8")
@@ -657,7 +729,6 @@ class InterruptedTests(Base):
             doc = json.loads(self.config.read_text(encoding="utf-8"))
             doc["model"] = "externally-changed"
             self.config.write_text(json.dumps(doc, indent=2), encoding="utf-8")
-        external_bytes = self.config.read_bytes()
 
         self.release.touch()
         t.join(timeout=10)
@@ -667,6 +738,8 @@ class InterruptedTests(Base):
         self.assertIn("was reverted", err[0])
         self.assertIn("model", err[0])
         self.assertIn("changed", err[0])
+        # Because the edit occurred while CLI was running, CLI write completed and apply reverted the entire run to original bytes
+        self.assertEqual(self.config.read_bytes(), original)
 
     def test_external_edit_after_cli_write_preserves_external_edit_and_removes_entry(self):
         calls = []
@@ -927,6 +1000,27 @@ class EntryOnlyTests(Base):
         self.assertFalse(rolled["clean"])
         self.assertIn("older version", rolled["problems"][0])
         self.assertEqual(self.config.read_bytes(), before)
+
+    def test_rollback_entry_reverts_if_cli_remove_mutates_settings(self):
+        folder = Path(self.call_apply("user")["backup_dir"])
+        real_run_cli = reg.run_cli
+        def mutating_run_cli(cmd, cwd, on_start=None):
+            code, out = real_run_cli(cmd, cwd, on_start=on_start)
+            if self.kind == "codex":
+                text = self.config.read_text(encoding="utf-8")
+                self.config.write_text(text.replace('model = "x"', 'model = "remove-mutated"'), encoding="utf-8")
+            else:
+                doc = json.loads(self.config.read_text(encoding="utf-8"))
+                doc["model"] = "remove-mutated"
+                self.config.write_text(json.dumps(doc, indent=2), encoding="utf-8")
+            return code, out
+
+        start_bytes = self.config.read_bytes()
+        with mock.patch.object(reg, "run_cli", mutating_run_cli):
+            rolled = reg.rollback(folder, entry_only=True)
+            self.assertFalse(rolled["clean"])
+            self.assertIn("also changed other settings", rolled["problems"][0])
+            self.assertEqual(self.config.read_bytes(), start_bytes)
 
     def test_recover_does_not_remove_an_entry_that_is_not_the_proposed_one(self):
         folder = InterruptedTests.crash(self, "handshake", nth=2)

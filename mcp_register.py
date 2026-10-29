@@ -535,14 +535,21 @@ def apply(agent: str, config: Path, cli: str, scope: str, project_dir: Path, bra
             write_journal(folder, journal)
             raise RegisterError(f"{config.name} changed while preparing; nothing was written")
         journal["state"] = "writing"
+        journal["writer_status"] = "spawning"
+        journal["child_pid"] = None
         write_journal(folder, journal)
         def _on_start(pid):
             journal["child_pid"] = pid
+            journal["writer_status"] = "running"
             write_journal(folder, journal)
         try:
             code, out = run_cli(add_command(agent, cli, scope, command, args), project_dir, on_start=_on_start)
+            journal["writer_status"] = "exited"
+            journal["writer_exit_code"] = code
         except RegisterError as exc:  # the CLI did not start or timed out: check what it left, like any failure
             code, out = -1, str(exc)
+            journal["writer_status"] = "failed"
+            journal["writer_exit_code"] = -1
         finally:
             journal["child_pid"] = None
             write_journal(folder, journal)
@@ -578,7 +585,10 @@ def apply(agent: str, config: Path, cli: str, scope: str, project_dir: Path, bra
             elif current == written:
                 removed = restore_original(config, folder, original or ABSENT)  # only the CLI wrote: undo all of it
             else:  # something else wrote after the CLI: keep that, remove only our entry
-                removed = rollback_entry(agent, config, cli, scope, project_dir, before)
+                expected_entry_sha = journal.get("written_entry_sha256")
+                entry_matcher = ((lambda e: entry_sha(e) == expected_entry_sha) if expected_entry_sha
+                                 else (lambda e: is_proposed(e, proposed)))
+                removed = rollback_entry(agent, config, cli, scope, project_dir, before, matches=entry_matcher)
                 removed["problems"] += settings_changes(before_settings, settings(agent, config))[0]
                 removed["clean"] = not removed["problems"]
             journal["state"] = "failed-rolled-back" if removed["clean"] else "failed-needs-attention"
@@ -622,15 +632,12 @@ def rollback_entry(agent: str, config: Path, cli: str, scope: str, project_dir: 
         code, out = run_cli(remove_command(agent, cli, scope), project_dir)
         if code != 0:
             problems.append(f"`mcp remove` exited with {code}: {out}")
-        written = file_sha(config)
         changed = settings_changes(start_settings, settings(agent, config))[0]
         if changed:
-            if written == file_sha(config):
-                atomic_write(config, start)
-                problems.append("`mcp remove` also changed other settings (" + "; ".join(changed) + "), so the file "
-                                "was put back as it was before the remove; " + _manual_steps(agent, cli, scope))
-                return {"clean": False, "problems": problems}
-            problems += changed
+            atomic_write(config, start)
+            problems.append("`mcp remove` also changed other settings (" + "; ".join(changed) + "), so the file "
+                            "was put back as it was before the remove; " + _manual_steps(agent, cli, scope))
+            return {"clean": False, "problems": problems}
     after = snapshot(agent, config, project_dir)
     if (where, NAME) in flat(after):
         problems.append("the entry is still present")
@@ -692,11 +699,18 @@ def _settle(folder: Path, journal: dict) -> tuple[str, str]:
     config, agent, project_dir = Path(journal["config"]), journal["agent"], Path(journal["project_dir"])
     where = _scope_name(agent, journal["scope"], project_dir)
     if journal["state"] == "writing":
+        writer_status = journal.get("writer_status")
         child_pid = journal.get("child_pid")
-        if child_pid and process_alive(child_pid) is not False:
-            alive_desc = "still running" if process_alive(child_pid) is True else "status unknown"
-            return "in-progress", (f"writer process (PID {child_pid}) is {alive_desc}; wait for it to exit "
-                                  f"before recovering (or terminate it manually with taskkill/kill); left alone")
+        if writer_status != "exited":
+            if child_pid and process_alive(child_pid) is True:
+                return "in-progress", (f"writer process (PID {child_pid}) is still running; wait for it to exit "
+                                      f"before recovering (or terminate it manually with taskkill/kill); left alone")
+            if child_pid and process_alive(child_pid) is None:
+                return "in-progress", (f"writer process (PID {child_pid}) status cannot be determined; "
+                                      f"wait for it to exit or terminate it manually; left alone")
+            if not child_pid:
+                return "needs-attention", ("interrupted during 'writing' stage without evidence that the child writer "
+                                          "exited; writer status is unknown; left alone for manual resolution (config.bak holds original)")
     if (file_sha(config) or ABSENT) == journal["original_sha256"]:
         return "aborted-unchanged", ""
     if journal["state"] in ("prepared", "backed-up"):

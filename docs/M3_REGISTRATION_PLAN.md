@@ -167,19 +167,26 @@ Test với CLI giả bao gồm: thiếu file, file hỏng, UTF-16, BOM + CRLF, m
 
 Kết quả gia cố an toàn chuẩn bị cho thử nghiệm M3.2 (đăng ký thật vào Claude Code `--scope local`). Bản thân thử nghiệm M3.2 sẽ chỉ thực hiện khi có chỉ đạo và phê duyệt riêng.
 
-### 9.1. Xử lý rủi ro tiến trình con mồ côi (Orphaned CLI Writer)
-- **Cơ chế:** Khi `apply` bước vào trạng thái `writing`, nó khởi tạo tiến trình con qua `subprocess.Popen` và ghi ngay `child_pid` vào `journal.json`. Nếu việc ghi nhận `child_pid` thất bại (hoặc callback `on_start` gặp lỗi), tiến trình con lập tức bị chấm dứt (`proc.kill()`) và báo lỗi fail-closed, không để sót tiến trình con không kiểm soát.
-- **Kiểm tra trạng thái sống qua `omniagent.process_alive`:** Sử dụng lại hàm `process_alive` từ `omniagent.py`:
+### 9.1. Xử lý rủi ro tiến trình con mồ côi (Orphaned CLI Writer) & Spawn-to-journal Gap
+- **Trạng thái bền vững của Writer (`writer_status`):** Quá trình ghi cấu hình được theo dõi qua các trạng thái bền vững: `spawning` → `running` → `exited` (hoặc `failed`).
+- **Khắc phục khoảng trống Spawn-to-journal:** Trong trường hợp tiến trình cha bị kill ngay sau khi gọi `subprocess.Popen` nhưng trước khi `on_start` kịp ghi nhận `child_pid`, nhật ký lưu trạng thái `state: "writing"` với `writer_status: "spawning"` và `child_pid: None`. Lệnh `recover` coi đây là trạng thái **không xác định (indeterminate)**, tuyệt đối không tự ý khôi phục hay gỡ entry, trả về `needs-attention` và giữ nguyên file cấu hình cùng bằng chứng để người dùng kiểm tra thủ công.
+- **Kiểm tra trạng thái sống qua `omniagent.process_alive`:** Tái sử dụng hàm `process_alive` từ `omniagent.py`:
   - Trên Windows: Dùng trực tiếp Windows API với đầy đủ `wintypes` (`OpenProcess(SYNCHRONIZE, False, pid)` + `WaitForSingleObject(handle, 0)`), chuẩn xác trên kiến trúc 64-bit và không phát tán bất kỳ tín hiệu console nào (loại trừ hoàn toàn rủi ro Ctrl+C / `KeyboardInterrupt`). Nếu gặp lỗi truy cập hoặc hệ điều hành, hàm trả về `None` (không rõ, fail-closed).
   - Trên POSIX: Sử dụng `os.kill(pid, 0)` với xử lý tường minh `ProcessLookupError` (False), `PermissionError` (True), `OSError` (None).
-- **Hành vi của `recover`:** Khi nhật ký ở trạng thái `writing` và `child_pid` còn sống (hoặc không thể xác định chắc chắn là đã chết, `process_alive(child_pid) is not False`), `recover` trả về `in-progress`, không chạm vào file cấu hình, không xóa bản ghi chủ (`owner`), và cung cấp hướng dẫn dừng tiến trình con thủ công. Chỉ khi tiến trình con đã xác nhận kết thúc, `recover` mới tiến hành thu dọn an toàn.
+- **Hành vi của `recover`:** Khi nhật ký ở trạng thái `writing`:
+  - Nếu `writer_status != "exited"` và `child_pid` còn sống (hoặc trạng thái chưa rõ, `process_alive(child_pid) is not False`), `recover` trả về `in-progress`, không chạm vào file cấu hình, không xóa bản ghi chủ (`owner`).
+  - Nếu thiếu PID hoặc thiếu bằng chứng writer đã thoát (`writer_status != "exited"` và `not child_pid`), `recover` trả về `needs-attention`, không gỡ entry và không sửa file cấu hình.
+  - Chỉ khi có bằng chứng chắc chắn tiến trình con đã kết thúc (`writer_status == "exited"` hoặc `process_alive(child_pid) is False`), `recover` mới tiến hành thu dọn an toàn.
 - **Lưu ý về tái sử dụng PID:** Nếu hệ điều hành tái sử dụng (reuse) đúng PID đó cho một tiến trình khác trước khi `recover` chạy, `process_alive` sẽ thấy PID đang chạy và giữ nguyên `in-progress`. Đây là hướng an toàn (fail-closed, tránh ghi đè nhầm lên writer đang hoạt động); người dùng chỉ cần đợi tiến trình kết thúc hoặc dọn dẹp bản ghi owner thủ công.
 
-### 9.2. Xử lý chỉnh sửa đồng thời ngoài luồng (Concurrent External Edits)
-- **Bảo toàn sửa đổi ngoài luồng:** Khi file cấu hình bị một chương trình khác thay đổi sau khi CLI của agent ghi (`current != written`):
-  - Nếu bước xác minh thất bại (ví dụ: bắt tay MCP thất bại hoặc thiết lập ngoài bị thay đổi), công cụ **không dùng `config.bak` để ghi đè toàn bộ file** (tránh làm mất sửa đổi ngoài luồng của người dùng), mà gọi `rollback_entry` để **gỡ riêng mục `omniagent-brain`** thông qua `mcp remove` của chính agent, đồng thời bảo toàn các sửa đổi của chương trình khác.
-  - Khi bước xác minh thành công và cấu hình hợp lệ, mục đăng ký được giữ lại cùng các sửa đổi ngoài luồng mà không bị hủy bỏ sai lầm.
-- **Kiểm chứng:** Test `test_external_edit_after_cli_write_preserves_external_edit_and_removes_entry` xác nhận khi xảy ra lỗi xác minh sau một sửa đổi ngoài luồng, mục `omniagent-brain` được gỡ bỏ sạch sẽ và sửa đổi ngoài luồng vẫn được giữ nguyên.
+### 9.2. Xác minh danh tính Entry khi Cleanup & Biên giới sửa đổi ngoài luồng
+- **Bảo vệ danh tính Entry (`matches=entry_matcher`):** Trong mọi đường cleanup tự động khi `apply` thất bại (đặc biệt khi `current != written`), `apply` truyền hàm kiểm tra danh tính `matches=entry_matcher` vào `rollback_entry(...)`. Nếu một tác nhân khác đã sửa `command`, `args` hoặc `env` của `omniagent-brain` trước khi cleanup:
+  - `rollback_entry` phát hiện fingerprint không khớp với entry mà công cụ đã đăng ký, lập tức từ chối gọi `mcp remove`, giữ nguyên entry đã bị sửa để không làm mất dữ liệu của người dùng.
+  - Tuyệt đối không làm lộ token/secret trong thông báo lỗi hoặc nhật ký.
+  - Nhật ký ghi nhận `failed-needs-attention` và báo lỗi ra terminal.
+- **Biên giới bảo toàn sửa đổi ngoài luồng:**
+  - *Sửa đổi diễn ra sau khi CLI đã ghi (`current != written`)*: Được bảo toàn hoàn toàn. Khi xác minh thất bại, `apply` chỉ gỡ riêng mục `omniagent-brain` mà không dùng `config.bak` ghi đè toàn bộ file.
+  - *Sửa đổi diễn ra trong vài giây CLI đang thực thi*: Do CLI của agent đọc và ghi đè toàn bộ file, `file_sha(config)` lúc CLI thoát trùng với `written`. `apply` không thể phân biệt nội dung nào do CLI ghi và nội dung nào do tác nhân khác ghi; do đó khi phát hiện thiết lập bị đổi và kích hoạt hoàn tác, file sẽ được khôi phục về byte gốc (`config.bak`). Đây là giới hạn kỹ thuật không thể loại trừ khi sử dụng CLI bên thứ ba và đã được ghi nhận rõ ràng trong tài liệu.
 
 ### 9.3. Tương thích khóa `theme` trên Claude Code 2.1.246
 - **Tái hiện:** Khi chạy `claude mcp add` (cả ở phạm vi `--scope local` lẫn `--scope project`), Claude Code 2.1.246 đọc `~/.claude.json`, chuẩn hóa và tự động lược bỏ khóa `theme`.
