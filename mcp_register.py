@@ -399,16 +399,26 @@ def run_cli(cmd: list[str], cwd: Path | None, on_start=None, watch_file: Path | 
             watch_info: dict | None = None) -> tuple[int, str]:
     file_hashes = []
     stop_event = threading.Event()
+    watcher_error = False
     t = None
     if watch_file is not None:
-        initial_sha = file_sha(watch_file)
+        try:
+            initial_sha = file_sha(watch_file)
+        except Exception:
+            initial_sha = None
+            watcher_error = True
         if initial_sha is not None:
             file_hashes.append(initial_sha)
         def _poll():
+            nonlocal watcher_error
             last = initial_sha
             while not stop_event.is_set():
                 time.sleep(0.01)
-                cur = file_sha(watch_file)
+                try:
+                    cur = file_sha(watch_file)
+                except Exception:
+                    watcher_error = True
+                    break
                 if cur is not None and cur != last:
                     file_hashes.append(cur)
                     last = cur
@@ -441,12 +451,17 @@ def run_cli(cmd: list[str], cwd: Path | None, on_start=None, watch_file: Path | 
         if t is not None:
             stop_event.set()
             t.join(timeout=1.0)
-            cur = file_sha(watch_file)
+            try:
+                cur = file_sha(watch_file)
+            except Exception:
+                cur = None
+                watcher_error = True
             if cur is not None and (not file_hashes or cur != file_hashes[-1]):
                 file_hashes.append(cur)
             if watch_info is not None:
                 watch_info["hashes"] = file_hashes
                 watch_info["concurrent_writes"] = len(file_hashes) > 2
+                watch_info["watcher_error"] = watcher_error
     return proc.returncode, safe_text(stdout + "\n" + stderr)
 
 
@@ -473,8 +488,10 @@ def plan(agent: str, config: Path, cli: str | None, scope: str, project_dir: Pat
     warnings = []
     current_settings = settings(agent, config)
     if agent == "claude" and "theme" in current_settings:
-        warnings.append("Claude Code 2.1.246 drops the 'theme' setting when registering an MCP server; "
-                        "apply will fail closed and revert unless 'theme' is removed from the config or upstream fixes it")
+        msg = ("Claude Code drops the 'theme' setting when registering an MCP server; "
+               "registration is blocked to prevent data loss")
+        problems.append(msg)
+        warnings.append(msg)
     runtime = prepare_runtime(source, runtime_dir)
     command, args = server_command(runtime, brain_dir, project, agent)
     try:
@@ -543,6 +560,9 @@ def restore_original(config: Path, folder: Path, original_sha: str) -> dict:
 def apply(agent: str, config: Path, cli: str, scope: str, project_dir: Path, brain_dir: Path, project: str,
           runtime_dir: Path, source: Path, state_dir: Path, confirm=None, expected_sha: str | None = None) -> dict:
     """Register our entry. `expected_sha` is the plan's `original_sha256`; the run stops if the file differs."""
+    if agent == "claude" and "theme" in settings(agent, config):
+        raise RegisterError("Claude Code drops the 'theme' setting when registering an MCP server; "
+                            "apply stopped before running the CLI to prevent data loss")
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     folder = Path(state_dir) / "backups" / f"mcp-{stamp}-{secrets.token_hex(3)}-{agent}"
     with config_lock(config, folder):  # first, so the checks below see the file no other run of ours is changing
@@ -598,14 +618,22 @@ def apply(agent: str, config: Path, cli: str, scope: str, project_dir: Path, bra
         problems, added = [], []
         if code != 0:
             problems.append(f"`mcp add` exited with {code}: {out}")
+        other_settings_changed = False
+        other_entry_problems = False
         try:
             entry = read_entries(agent, config, project_dir).get(where, {}).get(NAME)
             after = snapshot(agent, config, project_dir)
-            problems += compare(before, after, (where, NAME))
+            entry_problems = compare(before, after, (where, NAME))
+            if entry_problems:
+                other_entry_problems = True
+                problems += entry_problems
             changed, added = settings_changes(before_settings, settings(agent, config))
-            problems += [f"{p} (by the agent CLI, or by another program while it ran)" for p in changed]
+            if changed:
+                other_settings_changed = True
+                problems += [f"{p} (by the agent CLI, or by another program while it ran)" for p in changed]
         except RegisterError as exc:
             after, entry = {}, None
+            other_entry_problems = True
             problems.append(str(exc))
         journal["written_entry_sha256"] = entry_sha(entry) if entry is not None else None  # what recover may remove
         journal["state"] = "verifying"
@@ -621,19 +649,32 @@ def apply(agent: str, config: Path, cli: str, scope: str, project_dir: Path, bra
                 problems.append(f"registered command failed the handshake: {exc}")
         if problems:
             current = file_sha(config)
-            concurrent_write = (current != written or watch_info.get("concurrent_writes", False))
-            can_restore_bytes = (current == written and not concurrent_write)
+            external_risk = (
+                other_settings_changed
+                or other_entry_problems
+                or watch_info.get("concurrent_writes", False)
+                or watch_info.get("watcher_error", False)
+                or current != written
+            )
+            can_restore_bytes = (current == written and not external_risk)
             if current == original:
                 removed = {"clean": True, "problems": []}  # the CLI wrote nothing
             elif can_restore_bytes:
-                removed = restore_original(config, folder, original or ABSENT)  # only the CLI wrote: undo all of it
-            else:  # something else wrote during or after the CLI: keep that, remove only our entry
+                removed = restore_original(config, folder, original or ABSENT)  # only our entry was touched by CLI
+            else:  # changes outside our entry exist or cannot be ruled out: preserve file, remove ONLY our entry if fingerprint matches
                 expected_entry_sha = journal.get("written_entry_sha256")
                 entry_matcher = ((lambda e: entry_sha(e) == expected_entry_sha) if expected_entry_sha
                                  else (lambda e: is_proposed(e, proposed)))
                 removed = rollback_entry(agent, config, cli, scope, project_dir, before, matches=entry_matcher)
-                removed["problems"] += settings_changes(before_settings, settings(agent, config))[0]
-                removed["clean"] = not removed["problems"]
+                if other_settings_changed:
+                    removed["problems"] += ["setting changes detected; file preserved on disk for review"]
+                if watch_info.get("concurrent_writes"):
+                    removed["problems"] += ["concurrent writes detected during registration"]
+                if watch_info.get("watcher_error"):
+                    removed["problems"] += ["file watcher encountered read error during registration"]
+                if current != written:
+                    removed["problems"] += ["file changed after writer exited"]
+                removed["clean"] = False
             journal["state"] = "failed-rolled-back" if removed["clean"] else "failed-needs-attention"
             write_journal(folder, journal)
             raise RegisterError("registration failed and was reverted: " + "; ".join(problems) if removed["clean"]
@@ -659,7 +700,7 @@ def rollback_entry(agent: str, config: Path, cli: str, scope: str, project_dir: 
     """Remove only our entry with the agent's own CLI; every other entry must match `before` afterwards.
 
     `matches(entry)` must accept the entry found, or it is left alone (someone changed it since we wrote it).
-    A setting the CLI removed or changed while removing is reverted by restoring the bytes it started from.
+    If `mcp remove` mutates other settings, the file is left as-is to avoid overwriting concurrent edits (TOCTOU).
     """
     where = _scope_name(agent, scope, project_dir)
     problems = []
@@ -671,20 +712,15 @@ def rollback_entry(agent: str, config: Path, cli: str, scope: str, project_dir: 
                 f"scope) is not the one this tool registered (its command, arguments or "
                 f"other properties changed since), so it was left in place and nothing was changed; "
                 + _manual_steps(agent, cli, scope)]}
-        start, start_settings = config.read_bytes(), settings(agent, config)
+        start_settings = settings(agent, config)
         code, out = run_cli(remove_command(agent, cli, scope), project_dir)
-        written = file_sha(config)
         if code != 0:
             problems.append(f"`mcp remove` exited with {code}: {out}")
         changed = settings_changes(start_settings, settings(agent, config))[0]
         if changed:
-            if file_sha(config) != written:
-                problems.append("`mcp remove` also changed other settings, and config changed concurrently "
-                                "after removal; left as it is; " + _manual_steps(agent, cli, scope))
-                return {"clean": False, "problems": problems}
-            atomic_write(config, start)
-            problems.append("`mcp remove` also changed other settings (" + "; ".join(changed) + "), so the file "
-                            "was put back as it was before the remove; " + _manual_steps(agent, cli, scope))
+            problems.append(f"`mcp remove` also changed other settings ({'; '.join(changed)}); "
+                            "the file was left as-is to avoid overwriting concurrent edits; "
+                            + _manual_steps(agent, cli, scope))
             return {"clean": False, "problems": problems}
     after = snapshot(agent, config, project_dir)
     if (where, NAME) in flat(after):

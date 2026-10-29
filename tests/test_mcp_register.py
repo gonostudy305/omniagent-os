@@ -77,7 +77,7 @@ class Base(unittest.TestCase):
                 f'[mcp_servers.hub]\nurl = "https://example.invalid/mcp"\nbearer_token = "{TOKEN}"\n\n'
                 '[mcp_servers.other]\ncommand = "node"\nargs = ["--flag"]\n', encoding="utf-8")
         else:
-            doc = {"theme": "dark", "model": "m", "hooks": {"PreToolUse": []}, "mcpServers": {
+            doc = {"model": "m", "hooks": {"PreToolUse": []}, "mcpServers": {
                 "hub": {"type": "http", "url": "https://example.invalid/mcp", "headers": {"Authorization": "Bearer " + TOKEN}},
                 "other": {"command": "node", "args": ["--flag"]}}}
             self.config.write_text(json.dumps(doc, indent=2), encoding="utf-8")
@@ -207,7 +207,21 @@ class PlanTests(Base):
         result = self.call_plan()
         self.assertIn("warnings", result)
         self.assertTrue(any("theme" in w for w in result["warnings"]))
+        self.assertTrue(any("theme" in p for p in result["problems"]))
         self.assertNotIn(THEME_SECRET, json.dumps(result))
+
+    def test_apply_blocks_before_popen_when_claude_theme_present(self):
+        doc = json.loads(self.config.read_text(encoding="utf-8"))
+        THEME_SECRET = "custom-synthwave-neon-dark-88"
+        doc["theme"] = THEME_SECRET
+        self.config.write_text(json.dumps(doc, indent=2), encoding="utf-8")
+        with mock.patch("subprocess.Popen") as mock_popen:
+            with self.assertRaises(reg.RegisterError) as ctx:
+                self.call_apply("user")
+            self.assertIn("theme", str(ctx.exception))
+            self.assertIn("stopped before running the CLI", str(ctx.exception))
+            self.assertNotIn(THEME_SECRET, str(ctx.exception))
+            mock_popen.assert_not_called()
 
 
 class ApplyClaudeTests(Base):
@@ -435,7 +449,7 @@ class MalformedCodexTests(MalformedConfigTests):
 
 class ByteExactTests(Base):
     def test_bom_and_crlf_come_back_byte_for_byte(self):
-        doc = {"theme": "dark", "mcpServers": {"other": {"command": "node", "args": ["--flag"]}}}
+        doc = {"model": "m", "mcpServers": {"other": {"command": "node", "args": ["--flag"]}}}
         raw = b"\xef\xbb\xbf" + json.dumps(doc, indent=4).replace("\n", "\r\n").encode("utf-8")
         self.config.write_bytes(raw)
         result = self.call_apply("user")
@@ -787,7 +801,7 @@ class InterruptedTests(Base):
         with mock.patch.object(reg, "handshake", fake_handshake):
             with self.assertRaises(reg.RegisterError) as ctx:
                 self.call_apply("user")
-            self.assertIn("registration failed and was reverted", str(ctx.exception))
+            self.assertIn("registration failed and could not be fully reverted", str(ctx.exception))
             self.assertIn("simulated handshake failure", str(ctx.exception))
             # External edit is preserved (not overwritten by config.bak)
             content = self.config.read_text(encoding="utf-8")
@@ -1028,11 +1042,11 @@ class EntryOnlyTests(Base):
         self.assertIn("older version", rolled["problems"][0])
         self.assertEqual(self.config.read_bytes(), before)
 
-    def test_rollback_entry_reverts_if_cli_remove_mutates_settings(self):
+    def test_rollback_entry_leaves_file_as_is_if_cli_remove_mutates_settings(self):
         folder = Path(self.call_apply("user")["backup_dir"])
         real_run_cli = reg.run_cli
-        def mutating_run_cli(cmd, cwd, on_start=None):
-            code, out = real_run_cli(cmd, cwd, on_start=on_start)
+        def mutating_run_cli(cmd, cwd, on_start=None, **kwargs):
+            code, out = real_run_cli(cmd, cwd, on_start=on_start, **kwargs)
             if self.kind == "codex":
                 text = self.config.read_text(encoding="utf-8")
                 self.config.write_text(text.replace('model = "x"', 'model = "remove-mutated"'), encoding="utf-8")
@@ -1042,12 +1056,13 @@ class EntryOnlyTests(Base):
                 self.config.write_text(json.dumps(doc, indent=2), encoding="utf-8")
             return code, out
 
-        start_bytes = self.config.read_bytes()
         with mock.patch.object(reg, "run_cli", mutating_run_cli):
             rolled = reg.rollback(folder, entry_only=True)
             self.assertFalse(rolled["clean"])
             self.assertIn("also changed other settings", rolled["problems"][0])
-            self.assertEqual(self.config.read_bytes(), start_bytes)
+            self.assertIn("left as-is to avoid overwriting concurrent edits", rolled["problems"][0])
+            content = self.config.read_text(encoding="utf-8")
+            self.assertIn("remove-mutated", content)
 
     def test_rollback_entry_preserves_concurrent_edit_between_remove_and_restore(self):
         folder = Path(self.call_apply("user")["backup_dir"])
@@ -1078,7 +1093,7 @@ class EntryOnlyTests(Base):
             with mock.patch.object(reg, "settings_changes", concurrent_settings_changes):
                 rolled = reg.rollback(folder, entry_only=True)
                 self.assertFalse(rolled["clean"])
-                self.assertIn("config changed concurrently", rolled["problems"][0])
+                self.assertIn("also changed other settings", rolled["problems"][0])
                 # start was NOT restored over the file
                 content = self.config.read_text(encoding="utf-8")
                 self.assertTrue("concurrent_val" in content or "# concurrent write" in content)
@@ -1100,7 +1115,7 @@ class EntryOnlyCodexTests(EntryOnlyTests):
 
 
 class SettingsTests(Base):
-    """D. Settings outside the MCP tables: kept, or the change is detected, reported by name and reverted."""
+    """D. Settings outside the MCP tables: kept, or the change is detected, reported by name and fails closed."""
     dropped, changed, added = "model", "hooks", "newKey"
 
     def test_unrelated_settings_are_unchanged_by_a_normal_apply(self):
@@ -1110,23 +1125,25 @@ class SettingsTests(Base):
         self.assertEqual(reg.settings(self.agent, self.config), before)
         self.assertEqual(result["settings_added"], [])
 
-    def assert_reverted(self, mode, fragment):
+    def assert_setting_change_fails_closed(self, mode, fragment):
         self.set_mode(mode)
-        original = self.config.read_bytes()
+        before_apply = self.config.read_bytes()
         with self.assertRaises(reg.RegisterError) as ctx:
             self.call_apply("user")
         self.assertIn(fragment, str(ctx.exception))
-        self.assertIn("was reverted", str(ctx.exception))
+        self.assertIn("could not be fully reverted", str(ctx.exception))
         self.assertNotIn(TOKEN, str(ctx.exception))
-        self.assertEqual(self.config.read_bytes(), original)
-        self.assertEqual(self.journal()["state"], "failed-rolled-back")
+        after_snap = reg.snapshot(self.agent, self.config, self.project_dir)
+        self.assertNotIn((("user"), reg.NAME), reg.flat(after_snap).keys())
+        self.assertNotEqual(self.config.read_bytes(), before_apply)
+        self.assertEqual(self.journal()["state"], "failed-needs-attention")
         self.assertEqual(self.locks(), [])
 
-    def test_a_cli_that_removes_a_setting_is_reverted_byte_for_byte(self):
-        self.assert_reverted("drop-setting", f"setting {self.dropped!r} was removed")
+    def test_a_cli_that_removes_a_setting_is_reverted_with_needs_attention(self):
+        self.assert_setting_change_fails_closed("drop-setting", f"setting {self.dropped!r} was removed")
 
-    def test_a_cli_that_changes_a_setting_is_reverted_byte_for_byte(self):
-        self.assert_reverted("change-setting", f"setting {self.changed!r} changed")
+    def test_a_cli_that_changes_a_setting_is_reverted_with_needs_attention(self):
+        self.assert_setting_change_fails_closed("change-setting", f"setting {self.changed!r} changed")
 
     def test_a_setting_the_cli_adds_is_reported_not_refused(self):
         self.set_mode("add-setting")
@@ -1136,7 +1153,7 @@ class SettingsTests(Base):
         self.assertTrue(reg.rollback(Path(result["backup_dir"]))["clean"])
         self.assertEqual(self.config.read_bytes(), original)
 
-    def test_a_setting_changed_by_mcp_remove_is_put_back(self):
+    def test_a_setting_changed_by_mcp_remove_leaves_file_as_is(self):
         folder = Path(self.call_apply("user")["backup_dir"])
         self.external_edit()
         self.set_mode("drop-setting")
@@ -1144,9 +1161,58 @@ class SettingsTests(Base):
         rolled = reg.rollback(folder, entry_only=True)
         self.assertFalse(rolled["clean"])
         self.assertIn(f"setting {self.dropped!r} was removed", rolled["problems"][0])
-        self.assertIn("put back", rolled["problems"][0])
-        self.assertEqual(self.config.read_bytes(), start)
+        self.assertIn("left as-is to avoid overwriting concurrent edits", rolled["problems"][0])
+        self.assertNotEqual(self.config.read_bytes(), start)
         self.assertEqual(self.journal(folder)["state"], "applied")
+
+    def test_two_writes_between_polling_intervals_preserves_external_edit_and_removes_entry(self):
+        # Even if polling watcher observed <= 2 states (e.g. interval missed intermediary write),
+        # detection of setting mutation must prevent blind full-file restore from config.bak.
+        real_run_cli = reg.run_cli
+        def missed_poll_run_cli(cmd, cwd, on_start=None, watch_file=None, watch_info=None):
+            code, out = real_run_cli(cmd, cwd, on_start=on_start, watch_file=watch_file, watch_info=watch_info)
+            if self.kind == "codex":
+                text = self.config.read_text(encoding="utf-8")
+                self.config.write_text(text.replace('model = "x"', 'model = "concurrent-setting"'), encoding="utf-8")
+            else:
+                doc = json.loads(self.config.read_text(encoding="utf-8"))
+                doc["model"] = "concurrent-setting"
+                self.config.write_text(json.dumps(doc, indent=2), encoding="utf-8")
+            if watch_info is not None:
+                cur = reg.file_sha(self.config)
+                watch_info["hashes"] = [watch_info["hashes"][0], cur]
+                watch_info["concurrent_writes"] = False
+                watch_info["watcher_error"] = False
+            return code, out
+
+        with mock.patch.object(reg, "run_cli", missed_poll_run_cli):
+            with self.assertRaises(reg.RegisterError) as ctx:
+                self.call_apply("user")
+            self.assertIn("could not be fully reverted", str(ctx.exception))
+            after_snap = reg.snapshot(self.agent, self.config, self.project_dir)
+            self.assertNotIn((("user"), reg.NAME), reg.flat(after_snap).keys())
+            content = self.config.read_text(encoding="utf-8")
+            self.assertIn("concurrent-setting", content)
+            self.assertEqual(self.journal()["state"], "failed-needs-attention")
+
+    def test_watcher_read_error_fails_closed_without_blind_restore(self):
+        # If watcher encounters read/hashing errors, apply must fail closed and NOT do restore_original
+        real_run_cli = reg.run_cli
+        def error_watcher_run_cli(cmd, cwd, on_start=None, watch_file=None, watch_info=None):
+            code, out = real_run_cli(cmd, cwd, on_start=on_start, watch_file=watch_file, watch_info=watch_info)
+            if watch_info is not None:
+                watch_info["watcher_error"] = True
+            return code, out
+
+        with mock.patch.object(reg, "run_cli", error_watcher_run_cli):
+            with mock.patch.object(reg, "is_proposed", return_value=False):
+                with self.assertRaises(reg.RegisterError) as ctx:
+                    self.call_apply("user")
+                self.assertIn("could not be fully reverted", str(ctx.exception))
+                self.assertIn("file watcher encountered read error", str(ctx.exception))
+                after_snap = reg.snapshot(self.agent, self.config, self.project_dir)
+                self.assertNotIn((("user"), reg.NAME), reg.flat(after_snap).keys())
+                self.assertEqual(self.journal()["state"], "failed-needs-attention")
 
     def test_recover_leaves_a_config_alone_when_a_setting_changed(self):
         folder = InterruptedTests.crash(self, "handshake", nth=2)

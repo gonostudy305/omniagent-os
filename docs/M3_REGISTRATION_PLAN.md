@@ -185,17 +185,20 @@ Kết quả gia cố an toàn chuẩn bị cho thử nghiệm M3.2 (đăng ký t
   - `rollback_entry` phát hiện fingerprint không khớp với entry mà công cụ đã đăng ký, lập tức từ chối gọi `mcp remove`, giữ nguyên entry đã bị sửa để không làm mất dữ liệu của người dùng.
   - Tuyệt đối không làm lộ token/secret trong thông báo lỗi hoặc nhật ký.
   - Nhật ký ghi nhận `failed-needs-attention` và báo lỗi ra terminal.
-- **Biên giới bảo toàn sửa đổi ngoài luồng:**
-  - *Sửa đổi diễn ra sau khi CLI đã ghi (`current != written`)*: Được bảo toàn hoàn toàn. Khi xác minh thất bại, `apply` chỉ gỡ riêng mục `omniagent-brain` mà không dùng `config.bak` ghi đè toàn bộ file.
-  - *Sửa đổi diễn ra đồng thời trong khi CLI đang thực thi*: Được phát hiện qua theo dõi biến động file (`watch_file` trong `run_cli`). Nếu có nhiều lần ghi file diễn ra trong thời gian CLI thực thi (cho thấy có tác nhân ngoài can thiệp song song), `apply` **tuyệt đối không dùng `config.bak` ghi đè toàn bộ file** mà chuyển sang nhánh `rollback_entry` để gỡ riêng mục `omniagent-brain`, giữ nguyên các giá trị thiết lập ngoài (ví dụ `model = "externally-changed"`).
-  - *Giới hạn kỹ thuật của CLI bên thứ ba*: Nếu CLI bên thứ ba tự ý đọc và ghi đè toàn bộ file sau khi một chương trình ngoài vừa sửa đổi mà không tuân thủ khóa của OmniAgent-OS, nội dung ghi của CLI có thể đè lên sửa đổi ngoài trước đó. OmniAgent-OS không thể ngăn cản hành vi ghi file độc lập của CLI bên ngoài, nhưng cam kết không bao giờ tự ý dùng `config.bak` đè lên các thay đổi ngoài đã ghi nhận được; file `config.bak` luôn được lưu lại để người dùng tra cứu thủ công.
-- **Kiểm tra an toàn trong `rollback_entry`:** Trước khi hoàn tác thiết lập bằng `atomic_write(config, start)` khi `mcp remove` làm biến đổi thiết lập khác, hàm kiểm tra `file_sha(config) == written`. Nếu file bị sửa đổi đồng thời giữa lúc `mcp remove` kết thúc và nhánh restore bắt đầu, công cụ từ chối ghi đè, để nguyên hiện trạng và trả về `clean: False`.
+- **Nguyên tắc Fail-Closed đối với phục hồi file:**
+  - *Bộ giám sát hash (`watch_file`) chỉ mang tính chẩn đoán (diagnostic)*: Lấy mẫu hash theo chu kỳ thời gian (ví dụ 10 ms) không thể chứng minh toán học sự vắng mặt của tiến trình ghi ngoài xen kẽ giữa các khoảng lấy mẫu. Do đó, OmniAgent-OS **tuyệt đối không dựa vào `len(hashes) <= 2` để biện minh cho việc tự động ghi đè `config.bak` lên toàn bộ file**.
+  - *Cấm tự động ghi đè file toàn phần khi có rủi ro can thiệp ngoài*: Bất cứ khi nào thiết lập ngoài MCP bị xóa/đổi (`other_settings_changed`), mục MCP khác bị biến đổi (`other_entry_problems`), phát hiện ghi đồng thời (`concurrent_writes`), bộ giám sát gặp lỗi đọc/bị lỗi I/O (`watcher_error`), hoặc file bị đổi sau khi CLI thoát (`current != written`), `apply` **tuyệt đối không gọi `restore_original`**. File hiện trường được giữ nguyên để bảo tồn dữ liệu người dùng, chỉ gỡ riêng mục `omniagent-brain` qua `rollback_entry(..., matches=entry_matcher)`, và chuyển nhật ký sang `failed-needs-attention`.
+- **Loại bỏ hoàn toàn Blind Restore và TOCTOU trong `rollback_entry`:**
+  - Trước đây `rollback_entry` kiểm tra `file_sha(config) == written` trước khi gọi `atomic_write(start)` nếu `mcp remove` làm biến đổi thiết lập ngoài. Cơ chế này tiềm ẩn rủi ro TOCTOU đối với các tiến trình ghi đồng thời.
+  - Nay `rollback_entry` loại bỏ triệt để `atomic_write(start)`: nếu `mcp remove` làm thay đổi thiết lập ngoài MCP, công cụ **giữ nguyên file như hiện trạng** trên đĩa, trả về `clean: False`, báo cáo `failed-needs-attention` kèm hướng dẫn khôi phục thủ công an toàn từ `config.bak`.
 
-### 9.3. Tương thích khóa `theme` trên Claude Code 2.1.246
+### 9.3. Xử lý triệt để khóa `theme` trên Claude Code 2.1.246
 - **Tái hiện:** Khi chạy `claude mcp add` (cả ở phạm vi `--scope local` lẫn `--scope project`), Claude Code 2.1.246 đọc `~/.claude.json`, chuẩn hóa và tự động lược bỏ khóa `theme`.
-- **Cảnh báo sớm trong `plan`:** Lệnh `plan` tự động kiểm tra sự tồn tại của khóa `theme` khi agent là `claude`. Nếu phát hiện, `plan` xuất cảnh báo sớm trong danh sách `warnings` ("Claude Code 2.1.246 drops the 'theme' setting...") mà **không tiết lộ giá trị của `theme`** hay các thông tin nhạy cảm khác.
-- **Nguyên tắc xử lý khi `apply`:** `mcp_register.py` phát hiện việc mất khóa `theme`, lập tức hủy bỏ đăng ký (`RegisterError: setting 'theme' was removed`) và hoàn tác file trở về nguyên vẹn từng byte từ `config.bak`.
-- **Đường đi không phá hủy:** Để giữ tính toàn vẹn dữ liệu tuyệt đối, công cụ **không âm thầm xóa** khóa `theme` và không hạ chuẩn kiểm tra tính toàn vẹn. Người dùng muốn đăng ký Claude Code pilot cần đảm bảo cấu hình không chứa khóa `theme` (hoặc chờ bản cập nhật chính thức từ Claude Code).
+- **Dừng chặn trước khi thực thi tiến trình (`before Popen`):**
+  - Trong `plan()`: tự động phát hiện khóa `theme` khi agent là `claude` và thêm trực tiếp vào danh sách `problems` để chặn đứng đăng ký trước khi bất kỳ file nào bị thay đổi.
+  - Trong `apply()`: thiết lập chốt chặn phòng thủ nghiêm ngặt ngay đầu hàm, **trước khi tạo thư mục backup và trước khi gọi `subprocess.Popen`**. Nếu `theme` có trong cấu hình Claude, `apply` lập tức quăng lỗi `RegisterError` và dừng lại mà không chạy lệnh CLI.
+  - **Không rò rỉ dữ liệu:** Thông báo lỗi chỉ kiểm tra sự tồn tại của tên khóa, tuyệt đối không in giá trị hay nội dung của `theme`.
+  - **Không khuyến nghị phá hủy:** Công cụ không tự ý xóa `theme` và không khuyến nghị người dùng xóa `theme` như một giải pháp mặc định.
 
 ### 9.4. Bảng kiểm tra trước Pilot M3.2 (Read-only Pilot Checklist)
 
@@ -207,7 +210,7 @@ Kết quả gia cố an toàn chuẩn bị cho thử nghiệm M3.2 (đăng ký t
 | **Thay đổi dự kiến** | Thêm 1 entry `omniagent-brain` (command: `python`, args: trỏ tới `.local/runtime/brain-<hash>.py`) |
 | **Vị trí sao lưu** | `.local/backups/mcp-<timestamp>-<hash>-claude/config.bak` (ngoài git, bảo mật token) |
 | **Chiến lược hoàn tác** | Chạy `rollback` (hoàn tác từng byte nếu file chưa đổi) hoặc `rollback --entry-only` |
-| **Điều kiện dừng ngay (Stop Conditions)** | 1. `plan` báo có `theme` trong `~/.claude.json` (hiển thị trong `warnings`).<br>2. Tên `omniagent-brain` đã tồn tại.<br>3. File cấu hình bị khóa bởi tiến trình khác hoặc đang có phiên `apply` dở dang.<br>4. Hash file thay đổi giữa bước `plan` và `apply`. |
+| **Điều kiện dừng ngay (Stop Conditions)** | 1. `plan` hoặc `apply` phát hiện `theme` trong `~/.claude.json` (dừng chặn trước `Popen`).<br>2. Tên `omniagent-brain` đã tồn tại.<br>3. File cấu hình bị khóa bởi tiến trình khác hoặc đang có phiên `apply` dở dang.<br>4. Hash file thay đổi giữa bước `plan` và `apply`. |
 
 ### 9.5. Phân loại trạng thái kịch bản
 
@@ -216,10 +219,9 @@ Kết quả gia cố an toàn chuẩn bị cho thử nghiệm M3.2 (đăng ký t
   - Xử lý tiến trình con mồ côi qua `omniagent.process_alive` và tránh can thiệp khi writer còn sống hoặc chưa rõ trạng thái.
   - Giữ khóa sở hữu và không cho phép `apply` mới khi writer ở trạng thái không xác định (`not child_pid`).
   - Bảo toàn sửa đổi ngoài luồng đồng thời trong khi CLI chạy và sau khi CLI ghi, gỡ bỏ đúng entry khi xác minh thất bại mà không ghi đè `config.bak`.
-  - Bảo vệ chống ghi đè đồng thời trong `rollback_entry` khi phát hiện thay đổi giữa `mcp remove` và restore.
-  - Cảnh báo sớm khóa `theme` trong `plan` mà không lộ giá trị.
-  - Từ chối an toàn và hoàn tác byte-for-byte khi Claude CLI xóa `theme`.
-  - Toàn bộ 264 unit/regression tests địa phương và trên CI.
+  - Loại bỏ hoàn toàn blind full-file restore và TOCTOU trong `rollback_entry`; giữ nguyên file và báo `clean: False` khi có đột biến thiết lập ngoài.
+  - Chặn đứng hoàn toàn Claude Code trước `Popen` khi cấu hình chứa `theme` mà không để lộ giá trị `theme`.
+  - Toàn bộ 269 unit/regression tests địa phương trên cả Windows và Ubuntu.
 
 - **NOT_VERIFIED (Chưa kiểm chứng):**
   - Đăng ký vào profile thật của người dùng trên máy thật (chờ phê duyệt M3.2).
