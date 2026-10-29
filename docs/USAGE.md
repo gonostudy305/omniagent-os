@@ -32,9 +32,23 @@ Python 3 chuẩn, không cần cài thêm gói nào. Chạy từ thư mục gố
 | `install` | Skill chưa có ở đích, sẽ được cài |
 | `unchanged` | Đã quản lý và khớp SSOT |
 | `update` / `update_adopted` | SSOT mới hơn; bản đã adopt cần thêm `--allow-update-adopted` |
-| `blocked_unmanaged` | Đã có ở đích nhưng nội dung khác SSOT; không ghi đè |
+| `blocked_unmanaged` | Đã có thư mục cùng tên ở đích nhưng manager chưa cài hoặc adopt nó (`plan` không so nội dung; chạy `adopt` để biết có khớp SSOT không); không ghi đè |
+| `blocked` | Mục ở đích là symlink/junction hoặc là file, không phải thư mục skill |
 | `blocked_vendor` | Có `node_modules`; update/rollback bị chặn để không xóa dependency |
-| `conflict` | Bản đã cài bị sửa sau khi quản lý |
+| `blocked_rendered` | Bản đã render cho một agent; `apply` thường sẽ ghi đè bằng bản chưa render nên bị chặn, dùng `--adapter-manifest` |
+| `conflict` | Bản đã cài bị sửa sau khi quản lý, hoặc nay chứa file không đọc an toàn được (link, file giống credential) |
+| `conflict_missing` | State ghi là đang quản lý nhưng thư mục đã bị xóa bên ngoài manager |
+
+### Giải thích từng quyết định (`--explain`, chỉ đọc)
+
+```powershell
+python omniagent.py plan  --target "claude=$HOME\.claude\skills" --explain
+python omniagent.py adopt --target "claude=$HOME\.claude\skills" --explain --json
+```
+
+Với mỗi skill, `--explain` cho biết: quyết định (`will_change`, `needs_opt_in`, `blocked`, `no_change`), bản nào được giữ khi có xung đột (`authority`: `ssot` hoặc `target`), lệnh sẽ ghi gì (`skill_files`, `manager_state_only`, `nothing`), lý do (kèm `cause` khi một trạng thái có nhiều nguyên nhân), bước xử lý tiếp và cách hoàn tác. `l0_hash` là kết quả so hash mà lệnh thật sự đã làm (`PASS`, `FAIL`, `SKIP`, `UNKNOWN`). Agent có nạp skill (L2) hay chạy được tác vụ (L3) luôn là `NOT_VERIFIED`.
+
+Đầu ra không chứa đường dẫn máy hay hash nội dung, và giống hệt nhau giữa hai lần chạy trên cùng một trạng thái, nên dùng được cho script và báo lỗi. Tên skill và tên target vẫn xuất hiện; xóa bớt nếu chúng riêng tư. `adopt --explain` từ chối chạy cùng `--yes` hoặc `--diff`. `adopt` có thêm trạng thái `managed_elsewhere`: thư mục đang được quản lý từ một đường dẫn SSOT khác, nên không bao giờ được adopt lại.
 
 ## Hoàn tác
 
