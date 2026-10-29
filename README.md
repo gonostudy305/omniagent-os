@@ -214,7 +214,7 @@ existing agent stores yet.
 | v0.2.0 | 4a | Skill Manager MVP | Đã phát hành (tag `v0.2.0`) |
 | v0.3.0-beta.1 | 4b | Path Adapter, adopt theo adapter, phục hồi giao dịch | Đã phát hành (pre-release, tag `v0.3.0-beta.1`); 3 skill pilot do chủ dự án tự xác nhận |
 | v0.3.x | 4b còn lại, 5 | Hòa giải skill lệch, hydration dependency | Chưa bắt đầu |
-| v0.4 | 6 | Shared Second Brain qua MCP | Chưa bắt đầu |
+| v0.4 | 6 | Shared Second Brain qua MCP | MVP hoàn thành trong PR #9; tích hợp cấu hình thật và Antigravity chưa kiểm chứng |
 | v0.5 | 7 | Điều phối nhiều agent | Chưa bắt đầu |
 | v1.0 | 8 | Windows Local Agent OS | Chưa bắt đầu |
 
