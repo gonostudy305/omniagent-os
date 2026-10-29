@@ -397,33 +397,40 @@ def safe_text(text: str) -> str:
 
 def run_cli(cmd: list[str], cwd: Path | None, on_start=None, watch_file: Path | None = None,
             watch_info: dict | None = None) -> tuple[int, str]:
+    file_hashes = []
+    stop_event = threading.Event()
+    t = None
+    if watch_file is not None:
+        initial_sha = file_sha(watch_file)
+        if initial_sha is not None:
+            file_hashes.append(initial_sha)
+        def _poll():
+            last = initial_sha
+            while not stop_event.is_set():
+                time.sleep(0.01)
+                cur = file_sha(watch_file)
+                if cur is not None and cur != last:
+                    file_hashes.append(cur)
+                    last = cur
+        t = threading.Thread(target=_poll, daemon=True)
+        t.start()
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 text=True, encoding="utf-8", errors="replace",
                                 cwd=cwd, stdin=subprocess.DEVNULL)
     except OSError as exc:
+        if t is not None:
+            stop_event.set()
         raise RegisterError(f"could not run the {Path(cmd[0]).name} command ({type(exc).__name__})") from None
     if on_start is not None:
         try:
             on_start(proc.pid)
         except Exception as exc:
+            if t is not None:
+                stop_event.set()
             proc.kill()
             proc.wait()
             raise RegisterError(f"could not record child writer PID ({exc}); process terminated") from exc
-    file_hashes = []
-    stop_event = threading.Event()
-    if watch_file is not None:
-        def _poll():
-            last = file_sha(watch_file)
-            file_hashes.append(last)
-            while not stop_event.is_set():
-                time.sleep(0.02)
-                cur = file_sha(watch_file)
-                if cur != last:
-                    file_hashes.append(cur)
-                    last = cur
-        t = threading.Thread(target=_poll, daemon=True)
-        t.start()
     try:
         stdout, stderr = proc.communicate(timeout=120)
     except subprocess.TimeoutExpired:
@@ -431,11 +438,11 @@ def run_cli(cmd: list[str], cwd: Path | None, on_start=None, watch_file: Path | 
         stdout, stderr = proc.communicate()
         raise RegisterError(f"could not run the {Path(cmd[0]).name} command (TimeoutExpired)") from None
     finally:
-        if watch_file is not None:
+        if t is not None:
             stop_event.set()
             t.join(timeout=1.0)
             cur = file_sha(watch_file)
-            if not file_hashes or cur != file_hashes[-1]:
+            if cur is not None and (not file_hashes or cur != file_hashes[-1]):
                 file_hashes.append(cur)
             if watch_info is not None:
                 watch_info["hashes"] = file_hashes
