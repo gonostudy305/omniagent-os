@@ -170,27 +170,31 @@ Kết quả gia cố an toàn chuẩn bị cho thử nghiệm M3.2 (đăng ký t
 ### 9.1. Xử lý rủi ro tiến trình con mồ côi (Orphaned CLI Writer) & Spawn-to-journal Gap
 - **Trạng thái bền vững của Writer (`writer_status`):** Quá trình ghi cấu hình được theo dõi qua các trạng thái bền vững: `spawning` → `running` → `exited` (hoặc `failed`).
 - **Khắc phục khoảng trống Spawn-to-journal:** Trong trường hợp tiến trình cha bị kill ngay sau khi gọi `subprocess.Popen` nhưng trước khi `on_start` kịp ghi nhận `child_pid`, nhật ký lưu trạng thái `state: "writing"` với `writer_status: "spawning"` và `child_pid: None`. Lệnh `recover` coi đây là trạng thái **không xác định (indeterminate)**, tuyệt đối không tự ý khôi phục hay gỡ entry, trả về `needs-attention` và giữ nguyên file cấu hình cùng bằng chứng để người dùng kiểm tra thủ công.
+- **Duy trì khóa bảo vệ đối với Writer không xác định:** Trong trạng thái không xác định (`state: "writing"` và thiếu `child_pid` hoặc chưa có bằng chứng writer đã thoát), `recover` **không đánh dấu nhật ký là hoàn tất** (không chuyển thành `failed-needs-attention`) và **không xóa bản ghi sở hữu (`owner`)**. Nhờ vậy, mọi yêu cầu `apply` mới đều bị từ chối an toàn (fail-closed với `RegisterError: an earlier registration was interrupted; run recover first`), và các lần gọi `recover` kế tiếp tiếp tục báo `needs-attention` cho đến khi người dùng xử lý tiến trình con thủ công.
 - **Kiểm tra trạng thái sống qua `omniagent.process_alive`:** Tái sử dụng hàm `process_alive` từ `omniagent.py`:
   - Trên Windows: Dùng trực tiếp Windows API với đầy đủ `wintypes` (`OpenProcess(SYNCHRONIZE, False, pid)` + `WaitForSingleObject(handle, 0)`), chuẩn xác trên kiến trúc 64-bit và không phát tán bất kỳ tín hiệu console nào (loại trừ hoàn toàn rủi ro Ctrl+C / `KeyboardInterrupt`). Nếu gặp lỗi truy cập hoặc hệ điều hành, hàm trả về `None` (không rõ, fail-closed).
   - Trên POSIX: Sử dụng `os.kill(pid, 0)` với xử lý tường minh `ProcessLookupError` (False), `PermissionError` (True), `OSError` (None).
 - **Hành vi của `recover`:** Khi nhật ký ở trạng thái `writing`:
   - Nếu `writer_status != "exited"` và `child_pid` còn sống (hoặc trạng thái chưa rõ, `process_alive(child_pid) is not False`), `recover` trả về `in-progress`, không chạm vào file cấu hình, không xóa bản ghi chủ (`owner`).
-  - Nếu thiếu PID hoặc thiếu bằng chứng writer đã thoát (`writer_status != "exited"` và `not child_pid`), `recover` trả về `needs-attention`, không gỡ entry và không sửa file cấu hình.
+  - Nếu thiếu PID hoặc thiếu bằng chứng writer đã thoát (`writer_status != "exited"` và `not child_pid`), `recover` trả về `needs-attention`, giữ nguyên trạng thái `writing`, giữ nguyên khóa `owner` để chặn các lần `apply` mới.
   - Chỉ khi có bằng chứng chắc chắn tiến trình con đã kết thúc (`writer_status == "exited"` hoặc `process_alive(child_pid) is False`), `recover` mới tiến hành thu dọn an toàn.
 - **Lưu ý về tái sử dụng PID:** Nếu hệ điều hành tái sử dụng (reuse) đúng PID đó cho một tiến trình khác trước khi `recover` chạy, `process_alive` sẽ thấy PID đang chạy và giữ nguyên `in-progress`. Đây là hướng an toàn (fail-closed, tránh ghi đè nhầm lên writer đang hoạt động); người dùng chỉ cần đợi tiến trình kết thúc hoặc dọn dẹp bản ghi owner thủ công.
 
 ### 9.2. Xác minh danh tính Entry khi Cleanup & Biên giới sửa đổi ngoài luồng
-- **Bảo vệ danh tính Entry (`matches=entry_matcher`):** Trong mọi đường cleanup tự động khi `apply` thất bại (đặc biệt khi `current != written`), `apply` truyền hàm kiểm tra danh tính `matches=entry_matcher` vào `rollback_entry(...)`. Nếu một tác nhân khác đã sửa `command`, `args` hoặc `env` của `omniagent-brain` trước khi cleanup:
+- **Bảo vệ danh tính Entry (`matches=entry_matcher`):** Trong mọi đường cleanup tự động khi `apply` thất bại (đặc biệt khi `current != written` hoặc có chỉnh sửa ngoài luồng), `apply` truyền hàm kiểm tra danh tính `matches=entry_matcher` vào `rollback_entry(...)`. Nếu một tác nhân khác đã sửa `command`, `args` hoặc `env` của `omniagent-brain` trước khi cleanup:
   - `rollback_entry` phát hiện fingerprint không khớp với entry mà công cụ đã đăng ký, lập tức từ chối gọi `mcp remove`, giữ nguyên entry đã bị sửa để không làm mất dữ liệu của người dùng.
   - Tuyệt đối không làm lộ token/secret trong thông báo lỗi hoặc nhật ký.
   - Nhật ký ghi nhận `failed-needs-attention` và báo lỗi ra terminal.
 - **Biên giới bảo toàn sửa đổi ngoài luồng:**
   - *Sửa đổi diễn ra sau khi CLI đã ghi (`current != written`)*: Được bảo toàn hoàn toàn. Khi xác minh thất bại, `apply` chỉ gỡ riêng mục `omniagent-brain` mà không dùng `config.bak` ghi đè toàn bộ file.
-  - *Sửa đổi diễn ra trong vài giây CLI đang thực thi*: Do CLI của agent đọc và ghi đè toàn bộ file, `file_sha(config)` lúc CLI thoát trùng với `written`. `apply` không thể phân biệt nội dung nào do CLI ghi và nội dung nào do tác nhân khác ghi; do đó khi phát hiện thiết lập bị đổi và kích hoạt hoàn tác, file sẽ được khôi phục về byte gốc (`config.bak`). Đây là giới hạn kỹ thuật không thể loại trừ khi sử dụng CLI bên thứ ba và đã được ghi nhận rõ ràng trong tài liệu.
+  - *Sửa đổi diễn ra đồng thời trong khi CLI đang thực thi*: Được phát hiện qua theo dõi biến động file (`watch_file` trong `run_cli`). Nếu có nhiều lần ghi file diễn ra trong thời gian CLI thực thi (cho thấy có tác nhân ngoài can thiệp song song), `apply` **tuyệt đối không dùng `config.bak` ghi đè toàn bộ file** mà chuyển sang nhánh `rollback_entry` để gỡ riêng mục `omniagent-brain`, giữ nguyên các giá trị thiết lập ngoài (ví dụ `model = "externally-changed"`).
+  - *Giới hạn kỹ thuật của CLI bên thứ ba*: Nếu CLI bên thứ ba tự ý đọc và ghi đè toàn bộ file sau khi một chương trình ngoài vừa sửa đổi mà không tuân thủ khóa của OmniAgent-OS, nội dung ghi của CLI có thể đè lên sửa đổi ngoài trước đó. OmniAgent-OS không thể ngăn cản hành vi ghi file độc lập của CLI bên ngoài, nhưng cam kết không bao giờ tự ý dùng `config.bak` đè lên các thay đổi ngoài đã ghi nhận được; file `config.bak` luôn được lưu lại để người dùng tra cứu thủ công.
+- **Kiểm tra an toàn trong `rollback_entry`:** Trước khi hoàn tác thiết lập bằng `atomic_write(config, start)` khi `mcp remove` làm biến đổi thiết lập khác, hàm kiểm tra `file_sha(config) == written`. Nếu file bị sửa đổi đồng thời giữa lúc `mcp remove` kết thúc và nhánh restore bắt đầu, công cụ từ chối ghi đè, để nguyên hiện trạng và trả về `clean: False`.
 
 ### 9.3. Tương thích khóa `theme` trên Claude Code 2.1.246
 - **Tái hiện:** Khi chạy `claude mcp add` (cả ở phạm vi `--scope local` lẫn `--scope project`), Claude Code 2.1.246 đọc `~/.claude.json`, chuẩn hóa và tự động lược bỏ khóa `theme`.
-- **Nguyên tắc xử lý:** `mcp_register.py` phát hiện việc mất khóa `theme`, lập tức hủy bỏ đăng ký (`RegisterError: setting 'theme' was removed`) và hoàn tác file trở về nguyên vẹn từng byte từ `config.bak`.
+- **Cảnh báo sớm trong `plan`:** Lệnh `plan` tự động kiểm tra sự tồn tại của khóa `theme` khi agent là `claude`. Nếu phát hiện, `plan` xuất cảnh báo sớm trong danh sách `warnings` ("Claude Code 2.1.246 drops the 'theme' setting...") mà **không tiết lộ giá trị của `theme`** hay các thông tin nhạy cảm khác.
+- **Nguyên tắc xử lý khi `apply`:** `mcp_register.py` phát hiện việc mất khóa `theme`, lập tức hủy bỏ đăng ký (`RegisterError: setting 'theme' was removed`) và hoàn tác file trở về nguyên vẹn từng byte từ `config.bak`.
 - **Đường đi không phá hủy:** Để giữ tính toàn vẹn dữ liệu tuyệt đối, công cụ **không âm thầm xóa** khóa `theme` và không hạ chuẩn kiểm tra tính toàn vẹn. Người dùng muốn đăng ký Claude Code pilot cần đảm bảo cấu hình không chứa khóa `theme` (hoặc chờ bản cập nhật chính thức từ Claude Code).
 
 ### 9.4. Bảng kiểm tra trước Pilot M3.2 (Read-only Pilot Checklist)
@@ -203,16 +207,19 @@ Kết quả gia cố an toàn chuẩn bị cho thử nghiệm M3.2 (đăng ký t
 | **Thay đổi dự kiến** | Thêm 1 entry `omniagent-brain` (command: `python`, args: trỏ tới `.local/runtime/brain-<hash>.py`) |
 | **Vị trí sao lưu** | `.local/backups/mcp-<timestamp>-<hash>-claude/config.bak` (ngoài git, bảo mật token) |
 | **Chiến lược hoàn tác** | Chạy `rollback` (hoàn tác từng byte nếu file chưa đổi) hoặc `rollback --entry-only` |
-| **Điều kiện dừng ngay (Stop Conditions)** | 1. `plan` báo có `theme` trong `~/.claude.json`.<br>2. Tên `omniagent-brain` đã tồn tại.<br>3. File cấu hình bị khóa bởi tiến trình khác hoặc đang có phiên `apply` dở dang.<br>4. Hash file thay đổi giữa bước `plan` và `apply`. |
+| **Điều kiện dừng ngay (Stop Conditions)** | 1. `plan` báo có `theme` trong `~/.claude.json` (hiển thị trong `warnings`).<br>2. Tên `omniagent-brain` đã tồn tại.<br>3. File cấu hình bị khóa bởi tiến trình khác hoặc đang có phiên `apply` dở dang.<br>4. Hash file thay đổi giữa bước `plan` và `apply`. |
 
 ### 9.5. Phân loại trạng thái kịch bản
 
 - **TESTED (Đã kiểm chứng đạt PASS):**
   - Môi trường sandbox dùng một lần với CLI thật (Claude Code 2.1.246, Codex 0.163.0): plan, apply, handshake, serve project isolation, rollback byte-for-byte, và rollback entry-only.
   - Xử lý tiến trình con mồ côi qua `omniagent.process_alive` và tránh can thiệp khi writer còn sống hoặc chưa rõ trạng thái.
-  - Bảo toàn sửa đổi ngoài luồng đồng thời và gỡ bỏ đúng entry khi xác minh thất bại.
+  - Giữ khóa sở hữu và không cho phép `apply` mới khi writer ở trạng thái không xác định (`not child_pid`).
+  - Bảo toàn sửa đổi ngoài luồng đồng thời trong khi CLI chạy và sau khi CLI ghi, gỡ bỏ đúng entry khi xác minh thất bại mà không ghi đè `config.bak`.
+  - Bảo vệ chống ghi đè đồng thời trong `rollback_entry` khi phát hiện thay đổi giữa `mcp remove` và restore.
+  - Cảnh báo sớm khóa `theme` trong `plan` mà không lộ giá trị.
   - Từ chối an toàn và hoàn tác byte-for-byte khi Claude CLI xóa `theme`.
-  - Toàn bộ 257 unit/regression tests địa phương và trên CI.
+  - Toàn bộ 264 unit/regression tests địa phương và trên CI.
 
 - **NOT_VERIFIED (Chưa kiểm chứng):**
   - Đăng ký vào profile thật của người dùng trên máy thật (chờ phê duyệt M3.2).

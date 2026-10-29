@@ -37,6 +37,8 @@ import secrets
 import shutil
 import subprocess
 import sys
+import threading
+import time
 import tomllib
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -393,7 +395,8 @@ def safe_text(text: str) -> str:
     return "(output withheld: it looked like it contained a credential)" if brain.scan_secrets(text) else text
 
 
-def run_cli(cmd: list[str], cwd: Path | None, on_start=None) -> tuple[int, str]:
+def run_cli(cmd: list[str], cwd: Path | None, on_start=None, watch_file: Path | None = None,
+            watch_info: dict | None = None) -> tuple[int, str]:
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 text=True, encoding="utf-8", errors="replace",
@@ -407,12 +410,36 @@ def run_cli(cmd: list[str], cwd: Path | None, on_start=None) -> tuple[int, str]:
             proc.kill()
             proc.wait()
             raise RegisterError(f"could not record child writer PID ({exc}); process terminated") from exc
+    file_hashes = []
+    stop_event = threading.Event()
+    if watch_file is not None:
+        def _poll():
+            last = file_sha(watch_file)
+            file_hashes.append(last)
+            while not stop_event.is_set():
+                time.sleep(0.02)
+                cur = file_sha(watch_file)
+                if cur != last:
+                    file_hashes.append(cur)
+                    last = cur
+        t = threading.Thread(target=_poll, daemon=True)
+        t.start()
     try:
         stdout, stderr = proc.communicate(timeout=120)
     except subprocess.TimeoutExpired:
         proc.kill()
         stdout, stderr = proc.communicate()
         raise RegisterError(f"could not run the {Path(cmd[0]).name} command (TimeoutExpired)") from None
+    finally:
+        if watch_file is not None:
+            stop_event.set()
+            t.join(timeout=1.0)
+            cur = file_sha(watch_file)
+            if not file_hashes or cur != file_hashes[-1]:
+                file_hashes.append(cur)
+            if watch_info is not None:
+                watch_info["hashes"] = file_hashes
+                watch_info["concurrent_writes"] = len(file_hashes) > 2
     return proc.returncode, safe_text(stdout + "\n" + stderr)
 
 
@@ -436,6 +463,11 @@ def plan(agent: str, config: Path, cli: str | None, scope: str, project_dir: Pat
     snap = snapshot(agent, config, project_dir)
     if any(NAME in servers for servers in snap.values()):
         problems.append(f"an entry named {NAME} already exists; remove it first (agy 'add' would overwrite)")
+    warnings = []
+    current_settings = settings(agent, config)
+    if agent == "claude" and "theme" in current_settings:
+        warnings.append("Claude Code 2.1.246 drops the 'theme' setting when registering an MCP server; "
+                        "apply will fail closed and revert unless 'theme' is removed from the config or upstream fixes it")
     runtime = prepare_runtime(source, runtime_dir)
     command, args = server_command(runtime, brain_dir, project, agent)
     try:
@@ -452,7 +484,7 @@ def plan(agent: str, config: Path, cli: str | None, scope: str, project_dir: Pat
         "proposed_entry": {"name": NAME, "command": command, "args": args},
         "runtime": str(runtime), "handshake_tools": tools,
         "existing_entries": {s: sorted(v) for s, v in snap.items() if s == where or s == "user"},
-        "entry_count": len(flat(snap)), "setting_count": len(settings(agent, config)),
+        "entry_count": len(flat(snap)), "setting_count": len(current_settings),
         "changes": [f"add one entry {NAME!r} to scope {where} with the agent's own `mcp add`",
                     "the agent CLI rewrites the file (it may reformat it); every other MCP entry and every other "
                     "setting must compare equal after parsing, or the change is reverted; settings the CLI adds "
@@ -467,7 +499,7 @@ def plan(agent: str, config: Path, cli: str | None, scope: str, project_dir: Pat
             "and refuses if the entry itself was changed",
         ],
         "apply_with": f"apply --agent {agent} --scope {scope} --yes --expect-sha {original or ABSENT}",
-        "problems": problems, "writes_nothing": True,
+        "problems": problems, "warnings": warnings, "writes_nothing": True,
     }
 
 
@@ -542,8 +574,10 @@ def apply(agent: str, config: Path, cli: str, scope: str, project_dir: Path, bra
             journal["child_pid"] = pid
             journal["writer_status"] = "running"
             write_journal(folder, journal)
+        watch_info = {}
         try:
-            code, out = run_cli(add_command(agent, cli, scope, command, args), project_dir, on_start=_on_start)
+            code, out = run_cli(add_command(agent, cli, scope, command, args), project_dir,
+                                on_start=_on_start, watch_file=config, watch_info=watch_info)
             journal["writer_status"] = "exited"
             journal["writer_exit_code"] = code
         except RegisterError as exc:  # the CLI did not start or timed out: check what it left, like any failure
@@ -580,11 +614,13 @@ def apply(agent: str, config: Path, cli: str, scope: str, project_dir: Path, bra
                 problems.append(f"registered command failed the handshake: {exc}")
         if problems:
             current = file_sha(config)
+            concurrent_write = (current != written or watch_info.get("concurrent_writes", False))
+            can_restore_bytes = (current == written and not concurrent_write)
             if current == original:
                 removed = {"clean": True, "problems": []}  # the CLI wrote nothing
-            elif current == written:
+            elif can_restore_bytes:
                 removed = restore_original(config, folder, original or ABSENT)  # only the CLI wrote: undo all of it
-            else:  # something else wrote after the CLI: keep that, remove only our entry
+            else:  # something else wrote during or after the CLI: keep that, remove only our entry
                 expected_entry_sha = journal.get("written_entry_sha256")
                 entry_matcher = ((lambda e: entry_sha(e) == expected_entry_sha) if expected_entry_sha
                                  else (lambda e: is_proposed(e, proposed)))
@@ -630,10 +666,15 @@ def rollback_entry(agent: str, config: Path, cli: str, scope: str, project_dir: 
                 + _manual_steps(agent, cli, scope)]}
         start, start_settings = config.read_bytes(), settings(agent, config)
         code, out = run_cli(remove_command(agent, cli, scope), project_dir)
+        written = file_sha(config)
         if code != 0:
             problems.append(f"`mcp remove` exited with {code}: {out}")
         changed = settings_changes(start_settings, settings(agent, config))[0]
         if changed:
+            if file_sha(config) != written:
+                problems.append("`mcp remove` also changed other settings, and config changed concurrently "
+                                "after removal; left as it is; " + _manual_steps(agent, cli, scope))
+                return {"clean": False, "problems": problems}
             atomic_write(config, start)
             problems.append("`mcp remove` also changed other settings (" + "; ".join(changed) + "), so the file "
                             "was put back as it was before the remove; " + _manual_steps(agent, cli, scope))
@@ -761,6 +802,11 @@ def recover(state_dir: Path) -> list[dict]:
                 if outcome == "in-progress":
                     report.append({"backup_dir": folder.name, "outcome": "in-progress", "detail": detail})
                     continue
+                if journal["state"] == "writing" and journal.get("writer_status") != "exited":
+                    child_pid = journal.get("child_pid")
+                    if not child_pid or process_alive(child_pid) is not False:
+                        report.append({"backup_dir": folder.name, "outcome": outcome, "detail": detail})
+                        continue
                 journal["state"] = outcome if outcome != "needs-attention" else "failed-needs-attention"
                 write_journal(folder, journal)
                 owner = _owner_path(lid)

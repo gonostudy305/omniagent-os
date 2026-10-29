@@ -199,6 +199,16 @@ class PlanTests(Base):
             self.call_apply()
         self.assertEqual(sha(self.config), before)
 
+    def test_plan_warns_on_claude_theme_setting_without_leaking_value(self):
+        doc = json.loads(self.config.read_text(encoding="utf-8"))
+        THEME_SECRET = "custom-synthwave-neon-dark-88"
+        doc["theme"] = THEME_SECRET
+        self.config.write_text(json.dumps(doc, indent=2), encoding="utf-8")
+        result = self.call_plan()
+        self.assertIn("warnings", result)
+        self.assertTrue(any("theme" in w for w in result["warnings"]))
+        self.assertNotIn(THEME_SECRET, json.dumps(result))
+
 
 class ApplyClaudeTests(Base):
     def run_apply_and_rollback(self, scope):
@@ -666,7 +676,19 @@ class InterruptedTests(Base):
         self.assertEqual(entry["outcome"], "needs-attention")
         self.assertIn("without evidence that the child writer exited", entry["detail"])
         self.assertEqual(self.config.read_bytes(), original)
-        self.assertEqual(self.journal(folder)["state"], "failed-needs-attention")
+        # Lock and unsettled state MUST be preserved: journal remains 'writing', owner file remains in place
+        self.assertEqual(self.journal(folder)["state"], "writing")
+        self.assertEqual(len(self.locks()), 1)
+        # New apply runs must be refused because owner record is still held
+        with self.assertRaises(reg.RegisterError) as ctx:
+            self.call_apply("user")
+        self.assertIn("interrupted", str(ctx.exception))
+        # Repeating recover must continue to report needs-attention and keep the lock
+        report2 = reg.recover(self.state)
+        entry2 = next(r for r in report2 if r.get("backup_dir") == folder.name)
+        self.assertEqual(entry2["outcome"], "needs-attention")
+        self.assertEqual(self.journal(folder)["state"], "writing")
+        self.assertEqual(len(self.locks()), 1)
 
     def test_apply_cleanup_refuses_to_remove_entry_if_modified_by_external_actor(self):
         calls = []
@@ -705,7 +727,7 @@ class InterruptedTests(Base):
             content = self.config.read_text(encoding="utf-8")
             self.assertIn(SECRET_TOKEN, content)
 
-    def test_external_edit_during_cli_run_fails_closed_and_restores_original(self):
+    def test_external_edit_during_cli_run_preserves_external_edit_and_removes_entry(self):
         original = self.config.read_bytes()
         self.set_mode("block")
         done, err = [], []
@@ -735,11 +757,16 @@ class InterruptedTests(Base):
         self.assertFalse(t.is_alive())
 
         self.assertEqual(len(err), 1)
-        self.assertIn("was reverted", err[0])
+        self.assertIn("could not be fully reverted", err[0])
         self.assertIn("model", err[0])
         self.assertIn("changed", err[0])
-        # Because the edit occurred while CLI was running, CLI write completed and apply reverted the entire run to original bytes
-        self.assertEqual(self.config.read_bytes(), original)
+        # External edit is preserved (not overwritten by config.bak)
+        content = self.config.read_text(encoding="utf-8")
+        self.assertIn("externally-changed", content)
+        # omniagent-brain entry was removed by rollback_entry, not left active
+        self.assertNotIn(reg.NAME, self.names())
+        folder = next((self.state / "backups").glob("mcp-*"))
+        self.assertEqual(self.journal(folder)["state"], "failed-needs-attention")
 
     def test_external_edit_after_cli_write_preserves_external_edit_and_removes_entry(self):
         calls = []
@@ -1021,6 +1048,40 @@ class EntryOnlyTests(Base):
             self.assertFalse(rolled["clean"])
             self.assertIn("also changed other settings", rolled["problems"][0])
             self.assertEqual(self.config.read_bytes(), start_bytes)
+
+    def test_rollback_entry_preserves_concurrent_edit_between_remove_and_restore(self):
+        folder = Path(self.call_apply("user")["backup_dir"])
+        real_run_cli = reg.run_cli
+        def mutating_run_cli(cmd, cwd, **kwargs):
+            code, out = real_run_cli(cmd, cwd, **kwargs)
+            if self.kind == "codex":
+                text = self.config.read_text(encoding="utf-8")
+                self.config.write_text(text.replace('model = "x"', 'model = "remove-mutated"'), encoding="utf-8")
+            else:
+                doc = json.loads(self.config.read_text(encoding="utf-8"))
+                doc["model"] = "remove-mutated"
+                self.config.write_text(json.dumps(doc, indent=2), encoding="utf-8")
+            return code, out
+
+        real_settings_changes = reg.settings_changes
+        def concurrent_settings_changes(*args, **kwargs):
+            # Concurrent process modifies the file after mcp remove finished and recorded written hash
+            if self.kind == "codex":
+                self.config.write_text(self.config.read_text(encoding="utf-8") + "\n# concurrent write\n", encoding="utf-8")
+            else:
+                doc = json.loads(self.config.read_text(encoding="utf-8"))
+                doc["concurrent_key"] = "concurrent_val"
+                self.config.write_text(json.dumps(doc, indent=2), encoding="utf-8")
+            return real_settings_changes(*args, **kwargs)
+
+        with mock.patch.object(reg, "run_cli", mutating_run_cli):
+            with mock.patch.object(reg, "settings_changes", concurrent_settings_changes):
+                rolled = reg.rollback(folder, entry_only=True)
+                self.assertFalse(rolled["clean"])
+                self.assertIn("config changed concurrently", rolled["problems"][0])
+                # start was NOT restored over the file
+                content = self.config.read_text(encoding="utf-8")
+                self.assertTrue("concurrent_val" in content or "# concurrent write" in content)
 
     def test_recover_does_not_remove_an_entry_that_is_not_the_proposed_one(self):
         folder = InterruptedTests.crash(self, "handshake", nth=2)
