@@ -336,10 +336,17 @@ class Brain:
             return self._note(con, note_id)
 
     @_retry_busy
-    def recheck(self) -> list[dict]:
-        """Flag verified notes whose file evidence changed or disappeared."""
+    def recheck(self, apply: bool = False) -> list[dict]:
+        """Report verified notes whose file evidence changed or disappeared.
+
+        Read-only by default. Only with apply=True (the owner, after confirming at a terminal) are the
+        drifted notes moved to 'contested', so a trust change never happens as a side effect of a check.
+        """
         drifted = []
-        with closing(self._connect(True)) as con:
+        con = self._connect(apply)
+        if con is None:
+            return []
+        with closing(con):
             rows = con.execute("select e.note_id, e.ref, e.sha256 from evidence e join notes n on n.id=e.note_id "
                                "where e.type='file' and n.status='verified'").fetchall()
             for row in rows:
@@ -351,10 +358,13 @@ class Brain:
                     reason = "file changed"
                 if reason:
                     drifted.append({"id": row["note_id"], "ref": row["ref"], "reason": reason})
+                    if not apply:
+                        continue
                     con.execute("update notes set status='contested', updated_at=? where id=?",
                                 (now(), row["note_id"]))
                     self._audit(con, "user", "evidence_drift", row["note_id"], reason)
-            con.commit()
+            if apply:
+                con.commit()
         return drifted
 
     # -- reading
@@ -517,7 +527,8 @@ class Brain:
 
 # MCP tool annotations (hints for clients such as Codex that decide which calls need approval).
 READ_ONLY = {"readOnlyHint": True, "openWorldHint": False}
-PROPOSE = {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False}
+# Not idempotent: an identical repeat returns the same note but still adds a "duplicate" audit row.
+PROPOSE = {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False}
 
 TOOLS = [
     {"name": "brain_search",
@@ -649,9 +660,8 @@ def register_plan(project: str, brain_dir: Path | None) -> str:
     script = str(Path(__file__).resolve())
     lines = ["# Not applied. Review, then add by hand or with a backed-up, previewed change.", ""]
     for agent in ("claude", "codex", "antigravity"):
-        args = [script, "serve", "--project", project, "--agent", agent]
-        if brain_dir:
-            args += ["--brain-dir", str(brain_dir)]
+        # --brain-dir and --project belong to the top-level parser, so they must come before "serve".
+        args = [script] + (["--brain-dir", str(brain_dir)] if brain_dir else []) +             ["--project", project, "serve", "--agent", agent]
         entry = {"command": sys.executable, "args": args}
         lines.append(f"## {agent}")
         if agent == "claude":
@@ -718,7 +728,8 @@ def cli(argv: list[str] | None = None) -> int:
     v = sub.add_parser("verify", help="mark a note verified (project owner only)")
     v.add_argument("id")
     v.add_argument("--detail", default="confirmed by the project owner")
-    sub.add_parser("recheck", help="flag verified notes whose file evidence changed")
+    rc = sub.add_parser("recheck", help="report verified notes whose file evidence changed (read-only)")
+    rc.add_argument("--apply", action="store_true", help="mark the drifted notes contested (project owner only)")
     a = sub.add_parser("audit")
     a.add_argument("--limit", type=int, default=50)
     e = sub.add_parser("export")
@@ -760,7 +771,14 @@ def cli(argv: list[str] | None = None) -> int:
                              f"  {note['title']}\n  {note['body'][:200]}{extra}", note["id"])
             _print(brain.verify(args.id, "user", args.detail))
         elif args.command == "recheck":
-            _print(brain.recheck())
+            drifted = brain.recheck()
+            if args.apply and drifted:
+                confirm_as_owner(f"Mark {len(drifted)} verified note(s) in project '{args.project}' contested "
+                                 "because their file evidence drifted:\n" +
+                                 "\n".join(f"  {d['id']}: {d['ref']} ({d['reason']})" for d in drifted),
+                                 args.project)
+                drifted = brain.recheck(apply=True)
+            _print(drifted)
         elif args.command == "audit":
             _print(brain.audit_log(args.limit))
         elif args.command == "export":

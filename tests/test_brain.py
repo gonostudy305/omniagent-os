@@ -173,12 +173,23 @@ class StoreTests(unittest.TestCase):
         self.brain.verify(note["id"])
         self.assertEqual(self.brain.recheck(), [])
         evidence.write_text("v2", encoding="utf-8")
+        audit_before = self.brain.audit_log()
         drift = self.brain.recheck()
         self.assertEqual(drift[0]["reason"], "file changed")
+        # A check only reports: trust and the audit trail stay as they were.
+        self.assertEqual(self.brain.read(note["id"])["status"], "verified")
+        self.assertEqual(self.brain.audit_log(), audit_before)
+        self.assertEqual(self.brain.recheck(apply=True)[0]["reason"], "file changed")
         self.assertEqual(self.brain.read(note["id"])["status"], "contested")
+        self.assertEqual(self.brain.audit_log(1)[0]["action"], "evidence_drift")
         evidence.unlink()
         self.brain.verify(note["id"])
         self.assertEqual(self.brain.recheck()[0]["reason"], "file missing")
+        self.assertEqual(self.brain.read(note["id"])["status"], "verified")
+
+    def test_recheck_on_a_project_without_a_database_creates_nothing(self):
+        self.assertEqual(self.brain.recheck(), [])
+        self.assertFalse(self.dir.exists())
 
     def test_bad_input_is_refused(self):
         cases = [("nobody", "fact", "t", "b"), ("claude", "gossip", "t", "b"), ("claude", "fact", "", "b"),
@@ -335,6 +346,7 @@ class McpTests(unittest.TestCase):
             self.assertIs(hints[name]["readOnlyHint"], True, name)
         self.assertIs(hints["brain_propose"]["readOnlyHint"], False)
         self.assertIs(hints["brain_propose"]["destructiveHint"], False)
+        self.assertIs(hints["brain_propose"]["idempotentHint"], False)
         self.assertTrue(all(h["openWorldHint"] is False for h in hints.values()))
 
     def test_malformed_tool_calls_are_errors_not_crashes(self):
@@ -480,6 +492,79 @@ class McpTests(unittest.TestCase):
         for expected in ("claude mcp add omniagent-brain", "[mcp_servers.omniagent-brain]", '"mcpServers"', "Not applied"):
             self.assertIn(expected, out.stdout)
         self.assertEqual(set(self.dir.rglob("*")) if self.dir.exists() else set(), before)
+
+    def test_an_identical_proposal_returns_the_same_note_but_is_still_audited(self):
+        # Why brain_propose declares idempotentHint=false: the note is not duplicated, but the
+        # environment still changes (an audit row per call).
+        c = self.client("codex")
+        first = c.tool("brain_propose", kind="fact", title="Same", body="Same text.")
+        rows = len(Brain(self.dir, "demo").audit_log(1000))
+        again = c.tool("brain_propose", kind="fact", title="Same", body="Same text.")
+        self.assertEqual(again["id"], first["id"])
+        self.assertEqual(len(Brain(self.dir, "demo").search(include_unverified=True)), 1)
+        log = Brain(self.dir, "demo").audit_log(1000)
+        self.assertEqual(len(log), rows + 1)
+        self.assertEqual((log[0]["agent"], log[0]["action"], log[0]["note_id"]), ("codex", "duplicate", first["id"]))
+
+    def test_registration_snippets_actually_start_a_working_server(self):
+        # Parse each printed snippet the way the agent would, run exactly that command, and talk MCP to it.
+        import shlex
+        import tomllib
+        out = self.owner("register-plan")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        sections = {}
+        for block in out.stdout.split("## ")[1:]:
+            name, _, body = block.partition("\n")
+            sections[name.strip()] = body.strip()
+        claude_line = sections["claude"]
+        self.assertTrue(claude_line.startswith("claude mcp add omniagent-brain -- "))
+        launched = {
+            "claude": shlex.split(claude_line.split(" -- ", 1)[1]),
+            "codex": (lambda e: [e["command"], *e["args"]])(
+                tomllib.loads(sections["codex"])["mcp_servers"]["omniagent-brain"]),
+            "antigravity": (lambda e: [e["command"], *e["args"]])(
+                json.loads(sections["antigravity"])["mcpServers"]["omniagent-brain"]),
+        }
+        for agent, cmd in launched.items():
+            with self.subTest(agent=agent):
+                proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                        text=True, encoding="utf-8")
+                messages = [{"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                             "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                                        "clientInfo": {"name": "t", "version": "0"}}},
+                            {"jsonrpc": "2.0", "method": "notifications/initialized"},
+                            {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                             "params": {"name": "brain_propose",
+                                        "arguments": {"kind": "fact", "title": f"From {agent}", "body": "Hello."}}}]
+                stdout, stderr = proc.communicate("".join(json.dumps(m) + "\n" for m in messages), timeout=60)
+                self.assertEqual(proc.returncode, 0, stderr)
+                replies = [json.loads(line) for line in stdout.splitlines()]
+                self.assertEqual(replies[0]["result"]["serverInfo"]["name"], "omniagent-brain")
+                self.assertFalse(replies[1]["result"].get("isError"), replies[1])
+        # Every server wrote to the brain dir and project in the plan, under the identity in its snippet.
+        notes = Brain(self.dir, "demo").search(include_unverified=True)
+        self.assertEqual(sorted((n["title"], n["source_agent"]) for n in notes),
+                         [("From antigravity", "antigravity"), ("From claude", "claude"), ("From codex", "codex")])
+
+    def test_recheck_only_reports_unless_the_owner_confirms_apply(self):
+        evidence = Path(self.temp.name) / "spec.md"
+        evidence.write_text("v1", encoding="utf-8")
+        note = Brain(self.dir, "demo").propose("user", "fact", "Spec", "v1.", [{"type": "file", "ref": str(evidence)}])
+        evidence.write_text("v2", encoding="utf-8")
+        plain = self.owner("recheck")
+        self.assertEqual(plain.returncode, 0, plain.stderr)
+        self.assertEqual(json.loads(plain.stdout)[0]["id"], note["id"])
+        refused = self.owner("recheck", "--apply")  # through a pipe, like an agent's shell tool
+        self.assertEqual(refused.returncode, 2)
+        self.assertIn("interactive terminal", refused.stderr)
+        self.assertEqual(Brain(self.dir, "demo").read(note["id"])["status"], "verified")
+        code, _, err, _ = self.run_cli(["recheck", "--apply"], typed="nope")
+        self.assertEqual(code, 2)
+        self.assertEqual(Brain(self.dir, "demo").read(note["id"])["status"], "verified")
+        code, _, err, asked = self.run_cli(["recheck", "--apply"], typed="demo")
+        self.assertEqual(code, 0, err)
+        asked.assert_called_once()
+        self.assertEqual(Brain(self.dir, "demo").read(note["id"])["status"], "contested")
 
     def test_owner_actions_are_refused_without_an_interactive_terminal(self):
         # Through a pipe (how an agent's shell tool runs commands) the trust-changing commands are refused.
