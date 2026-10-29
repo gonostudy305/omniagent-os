@@ -68,6 +68,7 @@ flowchart TD
 ├── audit_skills.py           # Fast SHA-256 hash & line-level unified diff auditor
 ├── generate_report.py        # Generates markdown audit reports
 ├── omniagent.py              # Safe discover / plan / adopt / apply / rollback CLI
+├── brain.py                  # v0.4 shared second brain: SQLite notes + stdio MCP server
 ├── path_adapter.py           # v0.3 per-agent template render, adapter-aware plan and adopt
 ├── adapters.example.json     # Public example; private manifest belongs in .local/
 ├── scripts/smoke_beta.ps1    # Windows beta smoke test (read-only by default)
@@ -186,6 +187,7 @@ existing agent stores yet.
 - [docs/PATH_ADAPTER.md](docs/PATH_ADAPTER.md): v0.3 template preview, guarded fixture apply and rollback
 - [docs/QUICKSTART.md](docs/QUICKSTART.md): 10-minute Windows start, smoke test and troubleshooting
 - [docs/BETA.md](docs/BETA.md): controlled beta guide, release criteria and evidence
+- [docs/BRAIN.md](docs/BRAIN.md): shared second brain MVP (trust model, usage, what is verified and what is not)
 - [docs/RELEASE_NOTES_v0.3.0-beta.1.md](docs/RELEASE_NOTES_v0.3.0-beta.1.md): release notes for the published pre-release
 
 ---
@@ -201,7 +203,7 @@ existing agent stores yet.
 - [x] Phase 4b hardening (released as v0.3.0-beta.1): adapter-aware adoption, journaled apply and rollback, `recover`, `fsync`, junction detection.
 - [ ] Phase 4b remaining: drift reconciliation for partially converted installs, dependency-aware validation, execution compatibility checks on Codex/Antigravity.
 - [ ] Phase 5: Automated dependency hydration for skills with package requirements.
-- [ ] Phase 6: Cross-Agent Memory Integration via MCP (Memorix / Local Knowledge Graph).
+- [~] Phase 6: Cross-Agent Memory Integration via MCP. MVP store and stdio MCP server done (`brain.py`); signed-in Claude Code and Codex used it through per-run flags in a temp project (see docs/BRAIN.md). Registration into the real agents is not applied yet; Antigravity is not verified.
 - [ ] Phase 7: Multi-agent coordination: handoff, context sharing, permissions and conflict avoidance (git worktrees).
 - [ ] Phase 8: Windows Local Agent OS v1.0: installer/CLI, dependency hydration, health checks, onboarding and release testing.
 
@@ -212,7 +214,7 @@ existing agent stores yet.
 | v0.2.0 | 4a | Skill Manager MVP | Đã phát hành (tag `v0.2.0`) |
 | v0.3.0-beta.1 | 4b | Path Adapter, adopt theo adapter, phục hồi giao dịch | Đã phát hành (pre-release, tag `v0.3.0-beta.1`); 3 skill pilot do chủ dự án tự xác nhận |
 | v0.3.x | 4b còn lại, 5 | Hòa giải skill lệch, hydration dependency | Chưa bắt đầu |
-| v0.4 | 6 | Shared Second Brain qua MCP | Chưa bắt đầu |
+| v0.4 | 6 | Shared Second Brain qua MCP | MVP hoàn thành trong PR #9; tích hợp cấu hình thật và Antigravity chưa kiểm chứng |
 | v0.5 | 7 | Điều phối nhiều agent | Chưa bắt đầu |
 | v1.0 | 8 | Windows Local Agent OS | Chưa bắt đầu |
 
