@@ -397,6 +397,12 @@ def safe_text(text: str) -> str:
 
 def run_cli(cmd: list[str], cwd: Path | None, on_start=None, watch_file: Path | None = None,
             watch_info: dict | None = None) -> tuple[int, str]:
+    """Execute an agent CLI command.
+
+    `watch_file` provides best-effort diagnostic monitoring during execution. Polling cannot guarantee
+    exclusivity or detect all interleaved writes. Exact safety is enforced by snapshot diffing and
+    fail-closed rules against full-file restore.
+    """
     file_hashes = []
     stop_event = threading.Event()
     watcher_error = False
@@ -651,6 +657,7 @@ def apply(agent: str, config: Path, cli: str, scope: str, project_dir: Path, bra
             current = file_sha(config)
             external_risk = (
                 other_settings_changed
+                or bool(added)
                 or other_entry_problems
                 or watch_info.get("concurrent_writes", False)
                 or watch_info.get("watcher_error", False)
@@ -668,6 +675,8 @@ def apply(agent: str, config: Path, cli: str, scope: str, project_dir: Path, bra
                 removed = rollback_entry(agent, config, cli, scope, project_dir, before, matches=entry_matcher)
                 if other_settings_changed:
                     removed["problems"] += ["setting changes detected; file preserved on disk for review"]
+                if added:
+                    removed["problems"] += [f"new setting(s) added outside MCP ({', '.join(added)}); file preserved on disk for review"]
                 if watch_info.get("concurrent_writes"):
                     removed["problems"] += ["concurrent writes detected during registration"]
                 if watch_info.get("watcher_error"):

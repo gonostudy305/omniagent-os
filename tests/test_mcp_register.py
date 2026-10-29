@@ -1165,9 +1165,9 @@ class SettingsTests(Base):
         self.assertNotEqual(self.config.read_bytes(), start)
         self.assertEqual(self.journal(folder)["state"], "applied")
 
-    def test_two_writes_between_polling_intervals_preserves_external_edit_and_removes_entry(self):
-        # Even if polling watcher observed <= 2 states (e.g. interval missed intermediary write),
-        # detection of setting mutation must prevent blind full-file restore from config.bak.
+    def test_watcher_missed_concurrency_with_setting_mutation_preserves_file_and_removes_entry(self):
+        # Even if diagnostic watcher reports no concurrency (e.g. interval missed intermediary write, len(hashes) <= 2),
+        # snapshot diffing detects setting mutation, refuses blind full-file restore from config.bak, and fails closed.
         real_run_cli = reg.run_cli
         def missed_poll_run_cli(cmd, cwd, on_start=None, watch_file=None, watch_info=None):
             code, out = real_run_cli(cmd, cwd, on_start=on_start, watch_file=watch_file, watch_info=watch_info)
@@ -1194,6 +1194,41 @@ class SettingsTests(Base):
             content = self.config.read_text(encoding="utf-8")
             self.assertIn("concurrent-setting", content)
             self.assertEqual(self.journal()["state"], "failed-needs-attention")
+
+    def test_external_setting_added_during_registration_with_failed_handshake_preserves_new_key_and_fails_closed(self):
+        # A new setting added by an external actor during registration must be treated as unknown-origin
+        # risk during automatic failure cleanup: restore_original is forbidden, file is preserved, entry removed.
+        real_run_cli = reg.run_cli
+        def add_setting_run_cli(cmd, cwd, on_start=None, watch_file=None, watch_info=None):
+            code, out = real_run_cli(cmd, cwd, on_start=on_start, watch_file=watch_file, watch_info=watch_info)
+            if "add" in cmd:
+                if self.kind == "codex":
+                    text = self.config.read_text(encoding="utf-8")
+                    self.config.write_text("customPreference = \"dark_mode\"\n" + text, encoding="utf-8")
+                else:
+                    doc = json.loads(self.config.read_text(encoding="utf-8"))
+                    doc["customPreference"] = "dark_mode"
+                    self.config.write_text(json.dumps(doc, indent=2), encoding="utf-8")
+                if watch_info is not None:
+                    cur = reg.file_sha(self.config)
+                    watch_info["hashes"] = [watch_info["hashes"][0], cur]
+                    watch_info["concurrent_writes"] = False
+                    watch_info["watcher_error"] = False
+            return code, out
+
+        with mock.patch.object(reg, "run_cli", add_setting_run_cli):
+            with mock.patch.object(reg, "is_proposed", return_value=False):
+                with self.assertRaises(reg.RegisterError) as ctx:
+                    self.call_apply("user")
+                self.assertIn("could not be fully reverted", str(ctx.exception))
+                self.assertIn("new setting(s) added outside MCP", str(ctx.exception))
+                # omniagent-brain was removed
+                after_snap = reg.snapshot(self.agent, self.config, self.project_dir)
+                self.assertNotIn((("user"), reg.NAME), reg.flat(after_snap).keys())
+                # The newly added setting customPreference was preserved on disk, not deleted by restore_original
+                content = self.config.read_text(encoding="utf-8")
+                self.assertIn("customPreference", content)
+                self.assertEqual(self.journal()["state"], "failed-needs-attention")
 
     def test_watcher_read_error_fails_closed_without_blind_restore(self):
         # If watcher encounters read/hashing errors, apply must fail closed and NOT do restore_original
