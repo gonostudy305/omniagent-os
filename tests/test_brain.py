@@ -459,5 +459,35 @@ class McpTests(unittest.TestCase):
         asked.assert_not_called()
 
 
+class ConcurrencyTests(unittest.TestCase):
+    """Three agents each run their own MCP server process against one database file."""
+
+    CHILD = """
+import sys
+sys.path.insert(0, sys.argv[1])
+import brain
+from pathlib import Path
+b = brain.Brain(Path(sys.argv[2]), "stress")
+errors = 0
+for i in range(int(sys.argv[4])):
+    try:
+        b.propose(sys.argv[3], "fact", f"{sys.argv[3]} {i}", f"body {i}")
+        b.search(None, None, True, 5)
+    except Exception as exc:
+        errors += 1
+        print(type(exc).__name__, exc, file=sys.stderr)
+sys.exit(1 if errors else 0)
+"""
+
+    def test_parallel_servers_do_not_hit_database_is_locked(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            agents = ["claude", "codex", "antigravity"] * 2  # two processes per identity, as with several sessions
+            procs = [subprocess.Popen([sys.executable, "-c", self.CHILD, str(ROOT), tmp, a, "20"],
+                                      stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True) for a in agents]
+            failures = [err for p in procs for err in [p.communicate(timeout=120)[1]] if p.returncode != 0]
+            self.assertEqual(failures, [])
+            self.assertEqual(len(Brain(Path(tmp), "stress").search(None, None, True, 100)), 60)
+
+
 if __name__ == "__main__":
     unittest.main()

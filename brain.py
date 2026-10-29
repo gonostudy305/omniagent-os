@@ -41,6 +41,7 @@ ACTIVE = ("inbox", "verified", "contested")
 PROJECT = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 MAX_TITLE, MAX_BODY, MAX_DETAIL, MAX_EVIDENCE = 200, 20_000, 500, 10
 MAX_EVIDENCE_FILE = 50_000_000
+BUSY_SECONDS = 30
 
 SECRET_PATTERNS = [
     ("private key", re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")),
@@ -152,15 +153,27 @@ class Brain:
             if not write:
                 return None
             self.dir.mkdir(parents=True, exist_ok=True)
-        con = sqlite3.connect(self.path, timeout=5)
+        # Several MCP servers (one per agent) share this file, so wait for locks instead of failing.
+        con = sqlite3.connect(self.path, timeout=BUSY_SECONDS)
         con.row_factory = sqlite3.Row
+        con.execute(f"pragma busy_timeout={BUSY_SECONDS * 1000}")
         con.execute("pragma foreign_keys=on")
-        con.execute("pragma journal_mode=wal")
-        con.executescript(SCHEMA)
+        # Schema and WAL mode are set up once; doing it on every connection makes concurrent
+        # processes fight for a write lock before they have read anything.
+        ready = con.execute("select 1 from sqlite_master where name='meta'").fetchone()
+        if ready is None:
+            con.execute("pragma journal_mode=wal")
+            con.executescript(SCHEMA)
+        if write:
+            con.execute("begin immediate")  # take the write lock up front so it cannot deadlock on upgrade
         row = con.execute("select value from meta where key='project'").fetchone()
         if row is None:
+            if not write:
+                con.close()
+                return None
             con.execute("insert into meta values('project', ?)", (self.project,))
             con.commit()
+            con.execute("begin immediate")
         elif row["value"] != self.project:
             con.close()
             raise BrainError("this database belongs to another project")
