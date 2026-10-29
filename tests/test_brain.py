@@ -1,6 +1,7 @@
 """Shared second brain: store rules, secret handling, provenance and the stdio MCP server."""
 
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -519,7 +520,9 @@ class McpTests(unittest.TestCase):
         claude_line = sections["claude"]
         self.assertTrue(claude_line.startswith("claude mcp add omniagent-brain -- "))
         launched = {
-            "claude": shlex.split(claude_line.split(" -- ", 1)[1]),
+            # The line is quoted for the Windows command line (subprocess.list2cmdline), where a backslash
+            # is an ordinary character; POSIX splitting would eat it.
+            "claude": [part.strip('"') for part in shlex.split(claude_line.split(" -- ", 1)[1], posix=os.name != "nt")],
             "codex": (lambda e: [e["command"], *e["args"]])(
                 tomllib.loads(sections["codex"])["mcp_servers"]["omniagent-brain"]),
             "antigravity": (lambda e: [e["command"], *e["args"]])(
