@@ -63,7 +63,7 @@ In ra lệnh `claude mcp add ...`, khối `[mcp_servers.omniagent-brain]` cho Co
 
 ## Đã kiểm chứng
 
-- 37 test trong `tests/test_brain.py` (148 test toàn repo, chạy trong CI trên Windows và Ubuntu) cho kho, quét bí mật, danh tính, mâu thuẫn, sao lưu, máy chủ MCP qua tiến trình thật, ghi đồng thời từ nhiều tiến trình, 9 dạng yêu cầu MCP sai kiểu, và nhãn "dữ liệu, không phải chỉ dẫn".
+- 38 test trong `tests/test_brain.py` (149 test toàn repo, chạy trong CI trên Windows và Ubuntu) cho kho, quét bí mật, danh tính, mâu thuẫn, sao lưu, máy chủ MCP qua tiến trình thật, ghi đồng thời từ nhiều tiến trình, 9 dạng yêu cầu MCP sai kiểu, và nhãn "dữ liệu, không phải chỉ dẫn".
 - **Vertical slice** (`test_vertical_slice_claude_writes_codex_reads_gemini_retrieves`), ba tiến trình MCP riêng với danh tính `claude`, `codex`, `antigravity`: Claude ghi một quyết định kiến trúc kèm bằng chứng; Codex đọc lại được, gắn nhãn chưa kiểm chứng; chủ dự án xác nhận; Antigravity truy xuất được dưới dạng đã kiểm chứng; một đề xuất mâu thuẫn hiện ra trong `brain_conflicts`; nhật ký nêu đủ các tác nhân; chủ dự án duyệt bản thay thế, bản cũ thành `superseded` nhưng vẫn đọc được và có trong nhật ký; dự án khác không thấy gì; backup, khôi phục sang thư mục mới và khởi động lại server cho ra đúng trạng thái đó.
 - Kiểm tra đột biến: khi tạm tắt quét bí mật, cho phép ai cũng `verify`, cho agent tự `supersedes`, bỏ cổng terminal hoặc bỏ việc giữ lại ghi chú mâu thuẫn, các test tương ứng fail.
 - Lỗi tin cậy được phát hiện khi review PR (một agent có thể làm ghi chú đã xác nhận biến mất khỏi tìm kiếm bằng `supersedes` hoặc bằng một ghi chú trái ngược) đã được sửa kèm test hồi quy.
@@ -85,22 +85,30 @@ Kết quả chạy ngày 29/10/2026 trên máy chủ dự án (Windows 11, Pytho
 | Client MCP giả: handshake, liệt kê, gọi tool, xác nhận, mâu thuẫn | PASS | PASS | PASS |
 | CLI thật nhận cấu hình (`mcp add`, `mcp list`, `mcp remove`) | PASS | PASS | NOT_VERIFIED (không có CLI trên PATH) |
 | CLI thật khởi động server và handshake MCP | PASS (`claude mcp list` báo `Connected`) | NOT_VERIFIED (`codex mcp list` không khởi động server) | NOT_VERIFIED |
-| Model của agent tự gọi `brain_search` | NOT_VERIFIED | NOT_VERIFIED | NOT_VERIFIED |
-| Agent thật này đề xuất, agent thật khác đọc được bản đã xác nhận | NOT_VERIFIED | NOT_VERIFIED | NOT_VERIFIED |
+| Model của agent (đã đăng nhập) tự gọi tool | NOT_VERIFIED (phiên OAuth hết hạn, xem dưới) | PASS | NOT_VERIFIED |
+| Vòng đề xuất → chưa xác nhận → chủ dự án xác nhận → tìm mặc định → mâu thuẫn bị giữ, qua model thật | NOT_VERIFIED | PASS (mỗi bước là một tiến trình `codex exec` riêng) | NOT_VERIFIED |
+| Agent thật này đề xuất, agent thật *khác* đọc được bản đã xác nhận | NOT_VERIFIED | NOT_VERIFIED | NOT_VERIFIED |
 | Cấu hình thật không đổi trong lúc chạy | PASS | PASS | — |
 
-Ba dòng NOT_VERIFIED cuối cần một agent đã đăng nhập. Làm vậy thì dùng tài khoản, lượt gọi model và ghi lịch sử phiên thật của bạn, nên chưa làm khi chưa có sự đồng ý. Cách kiểm tay không đụng cấu hình lâu dài, chạy trong một thư mục dự án tạm:
+**Lần chạy có đăng nhập (29/10/2026, chủ dự án cho phép):** chỉ dùng cờ cho từng lần chạy, không sửa cấu hình lâu dài. Kết quả:
+
+- **Codex CLI 0.163.0, model thật:** `brain_propose` tạo ghi chú `inbox`; `brain_search` với `include_unverified` trả `verified:false`; sau khi chủ dự án xác nhận (bước này gọi `Brain.verify()` thay cho CLI vì CLI cần terminal tương tác), `brain_search` mặc định trả đúng ID ngẫu nhiên của ghi chú đã xác nhận; đề xuất trái ngược nhận `contested` và ghi chú cũ vẫn `verified`. Nhật ký ghi tác nhân `codex` lấy từ lúc khởi chạy server. Các file `~/.codex/config.toml`, `auth.json`, `~/.claude.json`, `~/.claude/settings.json`, `.credentials.json` giữ nguyên kích thước và thời điểm sửa.
+- **Phát hiện tương thích:** Codex hỏi duyệt **mọi** lời gọi tool MCP; với `approval_policy="never"`, cả `brain_search` cũng bị từ chối. Vì vậy các tool chỉ đọc nay khai báo `annotations.readOnlyHint=true` theo đặc tả MCP, và Codex cho chạy chúng không cần duyệt. `brain_propose` vẫn cần duyệt; lần chạy này cho phép riêng nó qua `-c` bằng khóa `tools.brain_propose.approval_mode="approve"`. Khóa này tìm thấy trong binary Codex 0.163.0 và hoạt động, nhưng **không có trong tài liệu chính thức**, có thể đổi ở bản sau.
+- **Giới hạn cô lập:** ghi đè `mcp_servers` qua `-c` thay được danh sách server MCP cục bộ, nhưng Codex vẫn khởi động các connector từ xa của plugin trong cấu hình người dùng (thất bại vì chưa đăng nhập) và chạy hook của plugin. Không có file cấu hình nào bị đổi, nhưng đây không phải môi trường sạch hoàn toàn.
+- **Claude Code 2.1.246:** `Failed to authenticate: OAuth session expired and could not be refreshed`. Cần bạn đăng nhập lại bằng `claude` rồi chạy lại; không ai khác đăng nhập thay bạn.
+
+Lệnh để tự chạy lại, trong một thư mục dự án tạm:
 
 ```powershell
 # Claude Code: nạp server chỉ cho lần chạy này (--strict-mcp-config bỏ qua cấu hình MCP khác)
 '{"mcpServers":{"omniagent-brain":{"command":"python","args":["-I","<repo>\\brain.py","--brain-dir","<tạm>\\brain","--project","sandbox-demo","serve","--agent","claude"]}}}' | Set-Content brain-mcp.json -Encoding utf8
 claude -p "Call brain_search with include_unverified=true and print the raw result" --mcp-config brain-mcp.json --strict-mcp-config --allowedTools mcp__omniagent-brain__brain_search
 
-# Codex: ghi đè cấu hình chỉ cho lần chạy này
-codex exec -c 'mcp_servers.omniagent-brain.command="python"' -c 'mcp_servers.omniagent-brain.args=["-I","<repo>\\brain.py","--brain-dir","<tạm>\\brain","--project","sandbox-demo","serve","--agent","codex"]' "Call the brain_search tool and print the raw result"
+# Codex: chỉ server này, chỉ cho lần chạy này; --ephemeral không lưu phiên, sandbox chỉ đọc
+codex exec --skip-git-repo-check --ephemeral -s read-only -c 'approval_policy="never"' -c 'mcp_servers={omniagent-brain={command="python",args=["-I","<repo>/brain.py","--brain-dir","<tạm>/brain","--project","sandbox-demo","serve","--agent","codex"],tools={brain_propose={approval_mode="approve"}}}}' "Call the brain_search MCP tool and print the raw result"
 ```
 
-Đạt khi kết quả có trường `notice` và danh sách `notes` khớp với `python brain.py --brain-dir <tạm>\brain --project sandbox-demo list --all`. Các cờ dùng ở trên có trong `--help` của Claude Code 2.1.246 và Codex CLI 0.163.0, nhưng hai lệnh này chưa được chạy thật. Antigravity không có CLI: thêm server qua giao diện MCP của IDE trong một workspace tạm, rồi gỡ ra.
+Đạt khi kết quả có trường `notice` và danh sách `notes` khớp với `python brain.py --brain-dir <tạm>\brain --project sandbox-demo list --all`. Lệnh Codex đã chạy thật như trên. Lệnh Claude Code dùng các cờ có trong `--help` của bản 2.1.246 nhưng chưa chạy được vì phiên đăng nhập hết hạn. Bỏ `tools={...}` nếu chỉ muốn thử đọc. Antigravity không có CLI: thêm server qua giao diện MCP của IDE trong một workspace tạm, rồi gỡ ra.
 
 ## Chưa làm
 

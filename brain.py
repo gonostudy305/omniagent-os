@@ -481,15 +481,21 @@ class Brain:
 
 # ---------------------------------------------------------------- MCP server (stdio)
 
+# MCP tool annotations (hints for clients such as Codex that decide which calls need approval).
+READ_ONLY = {"readOnlyHint": True, "openWorldHint": False}
+PROPOSE = {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False}
+
 TOOLS = [
     {"name": "brain_search",
      "description": "Search the shared project notes. By default only VERIFIED notes are returned; "
                     "set include_unverified to also see proposals (they are labelled unverified).",
      "inputSchema": {"type": "object", "properties": {
          "query": {"type": "string"}, "kind": {"type": "string", "enum": sorted(KINDS)},
-         "include_unverified": {"type": "boolean"}, "limit": {"type": "integer", "minimum": 1, "maximum": 100}}}},
+         "include_unverified": {"type": "boolean"}, "limit": {"type": "integer", "minimum": 1, "maximum": 100}}},
+     "annotations": READ_ONLY},
     {"name": "brain_read", "description": "Read one note with its evidence and trust label.",
-     "inputSchema": {"type": "object", "properties": {"id": {"type": "string"}}, "required": ["id"]}},
+     "inputSchema": {"type": "object", "properties": {"id": {"type": "string"}}, "required": ["id"]},
+     "annotations": READ_ONLY},
     {"name": "brain_propose",
      "description": "Propose a note (decision, fact, lesson, handoff, procedure, warning). It stays unverified "
                     "until the project owner confirms it. Never include secrets.",
@@ -498,9 +504,10 @@ TOOLS = [
          "evidence": {"type": "array", "items": {"type": "object", "properties": {
              "type": {"type": "string", "enum": ["file", "note"]}, "ref": {"type": "string"},
              "detail": {"type": "string"}}, "required": ["type"]}},
-         "supersedes": {"type": "string"}}, "required": ["kind", "title", "body"]}},
+         "supersedes": {"type": "string"}}, "required": ["kind", "title", "body"]},
+     "annotations": PROPOSE},
     {"name": "brain_conflicts", "description": "List contested notes that need the owner to choose.",
-     "inputSchema": {"type": "object", "properties": {}}},
+     "inputSchema": {"type": "object", "properties": {}}, "annotations": READ_ONLY},
 ]
 
 

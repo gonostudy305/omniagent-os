@@ -326,6 +326,17 @@ class McpTests(unittest.TestCase):
         self.assertIn("unknown tool", c.tool("brain_delete"))
         self.assertEqual(c.request("ping")["result"], {})
 
+    def test_tools_declare_which_ones_only_read(self):
+        # Codex CLI 0.163 asks for approval on every MCP call unless the tool is marked read-only;
+        # with approval_policy=never an unannotated brain_search was refused (29/10/2026 run).
+        c = self.client("codex")
+        hints = {t["name"]: t["annotations"] for t in c.request("tools/list")["result"]["tools"]}
+        for name in ("brain_search", "brain_read", "brain_conflicts"):
+            self.assertIs(hints[name]["readOnlyHint"], True, name)
+        self.assertIs(hints["brain_propose"]["readOnlyHint"], False)
+        self.assertIs(hints["brain_propose"]["destructiveHint"], False)
+        self.assertTrue(all(h["openWorldHint"] is False for h in hints.values()))
+
     def test_malformed_tool_calls_are_errors_not_crashes(self):
         c = self.client("claude")
         c.tool("brain_propose", kind="fact", title="Seed", body="so the database exists")
