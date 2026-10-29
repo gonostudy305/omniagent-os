@@ -8,7 +8,9 @@ import os
 import shutil
 import stat
 import subprocess
+import textwrap
 import threading
+import time
 import sys
 import tempfile
 import unittest
@@ -53,12 +55,18 @@ class Base(unittest.TestCase):
         self.brain_dir = self.tmp / "brain"
         self.cli = make_cli(self.tmp, "fakecli")
         self.config = self.tmp / ("config.toml" if self.kind == "codex" else "config.json")
+        self.started, self.release = self.tmp / "cli-started", self.tmp / "cli-release"
+        self.addCleanup(self.release.touch)  # never leave a blocked fake CLI waiting
+        home = mock.patch.dict(os.environ, {"HOME": str(self.tmp / "user"), "USERPROFILE": str(self.tmp / "user")})
+        home.start()  # the per-user lock folder lives under the home folder
+        self.addCleanup(home.stop)
         self.write_config()
         self.set_mode("ok")
 
     def set_mode(self, mode):
         patcher = mock.patch.dict(os.environ, {"FAKE_KIND": self.kind, "FAKE_MODE": mode, "FAKE_CONFIG": str(self.config),
-                                               "FAKE_TOKEN": TOKEN})
+                                               "FAKE_TOKEN": TOKEN, "FAKE_STARTED": str(self.started),
+                                               "FAKE_RELEASE": str(self.release)})
         patcher.start()
         self.addCleanup(patcher.stop)
 
@@ -69,7 +77,7 @@ class Base(unittest.TestCase):
                 f'[mcp_servers.hub]\nurl = "https://example.invalid/mcp"\nbearer_token = "{TOKEN}"\n\n'
                 '[mcp_servers.other]\ncommand = "node"\nargs = ["--flag"]\n', encoding="utf-8")
         else:
-            doc = {"theme": "dark", "mcpServers": {
+            doc = {"theme": "dark", "model": "m", "hooks": {"PreToolUse": []}, "mcpServers": {
                 "hub": {"type": "http", "url": "https://example.invalid/mcp", "headers": {"Authorization": "Bearer " + TOKEN}},
                 "other": {"command": "node", "args": ["--flag"]}}}
             self.config.write_text(json.dumps(doc, indent=2), encoding="utf-8")
@@ -78,9 +86,37 @@ class Base(unittest.TestCase):
         return reg.plan(self.agent, self.config, self.cli, scope, self.project_dir, self.brain_dir, "demo",
                         self.state / "runtime", ROOT / "brain.py")
 
-    def call_apply(self, scope="local"):
+    def call_apply(self, scope="local", state=None):
         return reg.apply(self.agent, self.config, self.cli, scope, self.project_dir, self.brain_dir, "demo",
-                         self.state / "runtime", ROOT / "brain.py", self.state)
+                         self.state / "runtime", ROOT / "brain.py", state or self.state)
+
+    def wait_for(self, path: Path, what: str):
+        deadline = time.time() + 60
+        while not path.exists():
+            self.assertLess(time.time(), deadline, f"timed out waiting for {what}")
+            time.sleep(0.05)
+
+    def start_blocked_apply(self, state=None):
+        """An apply whose CLI has written the entry and then hangs. Returns finish(), which lets it end."""
+        self.set_mode("block")
+        outcome = {}
+
+        def run():
+            try:
+                outcome["result"] = self.call_apply("user", state)
+            except BaseException as exc:  # reported to the test through `outcome`
+                outcome["error"] = exc
+        thread = threading.Thread(target=run)
+        thread.start()
+        self.wait_for(self.started, "the blocked CLI")
+        self.set_mode("ok")  # the blocked CLI keeps its own environment; everything after this runs normally
+
+        def finish():
+            self.release.touch()
+            thread.join(timeout=120)
+            return outcome
+        self.addCleanup(finish)
+        return finish
 
     def external_edit(self) -> bytes:
         """Another program changes the config: one new server."""
@@ -98,7 +134,8 @@ class Base(unittest.TestCase):
         return json.loads((Path(folder) / "journal.json").read_text(encoding="utf-8"))
 
     def locks(self):
-        return list((self.state / "locks").glob("*.lock")) if (self.state / "locks").exists() else []
+        """Owner records of unsettled runs (the OS lock files themselves stay, empty, by design)."""
+        return list(reg.lock_dir().glob("*.owner.json")) if reg.lock_dir().exists() else []
 
     def names(self):
         return {(s, n) for s, servers in reg.snapshot(self.agent, self.config, self.project_dir).items() for n in servers}
@@ -256,7 +293,7 @@ class FailureTests(Base):
         self.assert_unchanged_after_failure("noop", "not in the config")
 
     def test_an_entry_whose_command_cannot_start_is_caught_and_removed(self):
-        self.assert_unchanged_after_failure("bad-command", "handshake")
+        self.assert_unchanged_after_failure("bad-command", "does not run the proposed command")
 
     def test_a_corrupt_config_is_refused_without_quoting_it(self):
         self.config.write_text(("= not valid " if self.kind == "codex" else "{ not valid ") + TOKEN, encoding="utf-8")
@@ -493,8 +530,8 @@ class PermissionTests(Base):
 
 
 class InterruptedTests(Base):
-    def crash(self, target: str, nth: int = 1):
-        """Kill the run on the nth call of `target`, leaving the lock behind as a dead process would."""
+    def crash(self, target: str, nth: int = 1, state=None):
+        """Kill the run on the nth call of `target`. The OS lock goes with the "process"; the owner record stays."""
         real, calls = getattr(reg, target), []
 
         def fake(*args, **kwargs):
@@ -502,11 +539,11 @@ class InterruptedTests(Base):
             if len(calls) == nth:
                 raise Crash()
             return real(*args, **kwargs)
-        with mock.patch.object(reg, target, fake), mock.patch.object(reg, "_release"):
+        with mock.patch.object(reg, target, fake):
             with self.assertRaises(Crash):
-                self.call_apply("user")
+                self.call_apply("user", state)
         self.assertEqual(len(self.locks()), 1)
-        return next((self.state / "backups").glob("mcp-*"))
+        return next(((state or self.state) / "backups").glob("mcp-*"))
 
     def test_a_crash_after_the_entry_was_written_is_reverted_by_recover(self):
         before = self.names()
@@ -520,7 +557,6 @@ class InterruptedTests(Base):
         report = reg.recover(self.state)
         outcomes = {r.get("backup_dir") or r.get("lock"): r["outcome"] for r in report}
         self.assertEqual(outcomes[folder.name], "recovered-entry-removed")
-        self.assertIn("released", outcomes.values())
         self.assertEqual(self.names(), before)
         self.assertEqual(self.locks(), [])
         self.assertNotIn(TOKEN, json.dumps(report) + self.all_state_text())
@@ -562,20 +598,21 @@ class InterruptedTests(Base):
         self.assertEqual(self.config.read_bytes(), original)
 
     def test_a_lock_left_before_any_journal_is_released_by_recover(self):
-        lock = reg._lock_path(self.state, self.config)
-        lock.parent.mkdir(parents=True)
-        lock.write_text(json.dumps({"backup_dir": str(self.state / "backups" / "mcp-never")}), encoding="utf-8")
-        self.assertEqual(reg.recover(self.state), [{"lock": lock.name, "outcome": "released", "detail": "run state never-started"}])
-        self.assertFalse(lock.exists())
+        lid = reg.lock_id(self.config)
+        owner = reg._owner_path(lid)
+        owner.parent.mkdir(parents=True)
+        owner.write_text(json.dumps({"backup_dir": str(self.state / "backups" / "mcp-never")}), encoding="utf-8")
+        self.assertEqual(reg.recover(self.state), [{"lock": lid, "outcome": "released", "detail": "run state never-started"}])
+        self.assertFalse(owner.exists())
 
 
 class ConcurrencyTests(Base):
     def test_a_held_lock_refuses_a_second_run(self):
         original = self.config.read_bytes()
-        with reg.config_lock(self.state, self.config, self.state / "other-run"):
-            with self.assertRaises(reg.RegisterError) as ctx:
+        with reg.config_lock(self.config, self.state / "other-run"):
+            with self.assertRaises(reg.LockBusy) as ctx:
                 self.call_apply("user")
-        self.assertIn("running or was interrupted", str(ctx.exception))
+        self.assertIn("running right now", str(ctx.exception))
         self.assertEqual(self.config.read_bytes(), original)
         self.assertEqual(self.locks(), [])
 
@@ -598,6 +635,279 @@ class ConcurrencyTests(Base):
         self.assertEqual(len(outcomes), 4)
         self.assertEqual(sum(1 for _, n in self.names() if n == reg.NAME), 1)
         self.assertEqual(self.locks(), [])
+
+
+class LivenessTests(Base):
+    """A. recover never touches a run whose owner is alive, and liveness never comes from a PID or a file's age."""
+
+    def assert_left_alone(self, report, folder, config_bytes, state):
+        self.assertIn({"backup_dir": folder.name, "outcome": "in-progress"},
+                      [{k: r[k] for k in ("backup_dir", "outcome")} for r in report if "backup_dir" in r])
+        self.assertEqual(self.config.read_bytes(), config_bytes)
+        self.assertEqual(self.journal(folder)["state"], state)
+        self.assertEqual(len(self.locks()), 1)
+
+    def test_recover_leaves_a_live_blocked_apply_alone(self):
+        finish = self.start_blocked_apply()
+        folder = next((self.state / "backups").glob("mcp-*"))
+        written = self.config.read_bytes()
+        self.assertIn(("user", reg.NAME), self.names())  # the stuck CLI already wrote the entry
+        self.assert_left_alone(reg.recover(self.state), folder, written, "writing")
+        outcome = finish()
+        self.assertTrue(outcome["result"]["applied"], outcome)  # the live run finishes normally afterwards
+        self.assertEqual(self.journal(folder)["state"], "applied")
+        self.assertEqual(self.locks(), [])
+
+    def test_a_live_apply_in_another_process_is_left_alone_and_settled_after_it_is_killed(self):
+        before = self.names()
+        self.set_mode("block")
+        child = textwrap.dedent(f"""
+            import sys
+            from pathlib import Path
+            sys.path.insert(0, {str(ROOT)!r})
+            import mcp_register as reg
+            reg.apply({self.agent!r}, Path({str(self.config)!r}), {self.cli!r}, "user", Path({str(self.project_dir)!r}),
+                      Path({str(self.brain_dir)!r}), "demo", Path({str(self.state / "runtime")!r}),
+                      Path({str(ROOT / "brain.py")!r}), Path({str(self.state)!r}))
+        """)
+        proc = subprocess.Popen([sys.executable, "-c", child], env=dict(os.environ))
+        self.addCleanup(lambda: proc.poll() is None and proc.kill())
+        self.wait_for(self.started, "the child's blocked CLI")
+        self.set_mode("ok")
+        folder = next((self.state / "backups").glob("mcp-*"))
+        self.assert_left_alone(reg.recover(self.state), folder, self.config.read_bytes(), "writing")
+        proc.kill()  # a genuine crash: no finally blocks, no cleanup
+        proc.wait(timeout=60)
+        report = reg.recover(self.state)
+        self.assertIn({"backup_dir": folder.name, "outcome": "recovered-entry-removed", "detail": ""}, report)
+        self.assertEqual(self.names(), before)
+        self.assertEqual(self.locks(), [])
+
+    def test_a_dead_run_is_settled_even_though_its_recorded_pid_is_alive(self):
+        folder = InterruptedTests.crash(self, "handshake", nth=2)
+        owner = json.loads(self.locks()[0].read_text(encoding="utf-8"))
+        self.assertEqual(owner["pid"], os.getpid())  # this test process: alive, yet the run is dead
+        report = reg.recover(self.state)
+        self.assertIn({"backup_dir": folder.name, "outcome": "recovered-entry-removed", "detail": ""}, report)
+        self.assertEqual(self.locks(), [])
+
+    def test_a_held_lock_is_respected_even_though_its_recorded_pid_is_dead(self):
+        folder = InterruptedTests.crash(self, "handshake", nth=2)
+        owner = self.locks()[0]
+        record = json.loads(owner.read_text(encoding="utf-8"))
+        owner.write_text(json.dumps(dict(record, pid=2 ** 22 + 12345, at="2000-01-01T00:00:00Z")), encoding="utf-8")
+        written = self.config.read_bytes()
+        with reg.held(reg.lock_id(self.config)):  # a live holder: a separate handle, as another process would have
+            report = reg.recover(self.state)
+        self.assert_left_alone(report, folder, written, "verifying")
+        self.assertIn("in-progress", {r["outcome"] for r in report if "lock" in r})
+
+    def test_a_lock_state_that_cannot_be_determined_fails_closed(self):
+        folder = InterruptedTests.crash(self, "handshake", nth=2)
+        written = self.config.read_bytes()
+        with mock.patch.object(reg, "_lock_region", side_effect=OSError(5, "I/O error")):
+            self.assert_left_alone(reg.recover(self.state), folder, written, "verifying")
+            with self.assertRaises(reg.LockBusy):
+                reg.apply(self.agent, self.config, self.cli, "user", self.project_dir, self.brain_dir, "demo",
+                          self.state / "runtime", ROOT / "brain.py", self.tmp / "state2")
+        self.assertFalse((self.tmp / "state2" / "backups").exists())
+
+    def test_an_exception_mid_run_keeps_new_runs_out_until_recover(self):
+        folder = InterruptedTests.crash(self, "handshake", nth=2)  # a Python exception, not a kill: same rule
+        with self.assertRaises(reg.RegisterError) as ctx:
+            self.call_apply("user")
+        self.assertIn("interrupted", str(ctx.exception))
+        self.assertEqual(self.journal(folder)["state"], "verifying")
+
+
+class LockIdentityTests(Base):
+    """B. One lock per config file and user, whatever --state-dir each caller uses."""
+
+    def test_a_second_state_dir_cannot_start_while_a_run_is_live(self):
+        finish = self.start_blocked_apply(self.tmp / "state1")
+        original_lock_files = sorted(p.name for p in reg.lock_dir().iterdir())
+        with self.assertRaises(reg.LockBusy) as ctx:
+            self.call_apply("user", self.tmp / "state2")
+        self.assertIn("running right now", str(ctx.exception))
+        self.assertFalse((self.tmp / "state2" / "backups").exists())
+        self.assertTrue(finish()["result"]["applied"])
+        self.assertEqual(sum(1 for _, n in self.names() if n == reg.NAME), 1)
+        self.assertEqual(sorted(p.name for p in reg.lock_dir().iterdir() if p.suffix == ".lock"),
+                         [n for n in original_lock_files if n.endswith(".lock")])
+
+    def test_parallel_registrations_from_different_state_dirs_add_exactly_one_entry(self):
+        barrier, outcomes = threading.Barrier(4), []
+
+        def worker(i):
+            barrier.wait()
+            try:
+                self.call_apply("user", self.tmp / f"state{i}")
+                outcomes.append("applied")
+            except reg.RegisterError as exc:
+                outcomes.append(str(exc))
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(4)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=120)
+        self.assertEqual(outcomes.count("applied"), 1, outcomes)
+        self.assertEqual(len(outcomes), 4)
+        self.assertEqual(sum(1 for _, n in self.names() if n == reg.NAME), 1)
+        self.assertEqual(self.locks(), [])
+
+    def test_other_spellings_of_the_same_config_share_the_lock(self):
+        spellings = [self.config, self.tmp / "proj" / ".." / self.config.name, Path(f"{self.tmp}{os.sep}.{os.sep}{self.config.name}")]
+        if os.name == "nt":
+            spellings.append(Path(str(self.config).upper()))
+        self.assertEqual({reg.lock_id(p) for p in spellings}, {reg.lock_id(self.config)})
+        with reg.config_lock(spellings[1], self.tmp / "other-run"):
+            with self.assertRaises(reg.LockBusy):
+                self.call_apply("user", self.tmp / "state2")
+
+    def test_an_interrupted_run_in_one_state_dir_blocks_another_until_its_own_recover(self):
+        state1, state2 = self.tmp / "state1", self.tmp / "state2"
+        folder = InterruptedTests.crash(self, "handshake", nth=2, state=state1)
+        with self.assertRaises(reg.RegisterError) as ctx:
+            self.call_apply("user", state2)
+        self.assertIn("interrupted", str(ctx.exception))
+        report = reg.recover(state2)  # cannot see that journal: reports it, settles nothing, releases nothing
+        self.assertEqual([r["outcome"] for r in report], ["needs-attention"])
+        self.assertIn("run recover with that --state-dir", report[0]["detail"])
+        self.assertEqual(len(self.locks()), 1)
+        self.assertIn({"backup_dir": folder.name, "outcome": "recovered-entry-removed", "detail": ""}, reg.recover(state1))
+        self.assertTrue(self.call_apply("user", state2)["applied"])
+
+
+class EntryOnlyTests(Base):
+    """C. rollback --entry-only (and recover) remove our entry only while it is the entry that was registered."""
+
+    def edit_our_entry(self):
+        """The user points the same-name entry somewhere else and gives it a credential."""
+        if self.kind == "codex":
+            text = self.config.read_text(encoding="utf-8").replace(
+                f"[mcp_servers.{reg.NAME}]\n", f'[mcp_servers.{reg.NAME}]\nenv = {{ API_KEY = "{TOKEN}" }}\n')
+            self.config.write_text(text, encoding="utf-8")
+        else:
+            doc = json.loads(self.config.read_text(encoding="utf-8"))
+            doc["mcpServers"][reg.NAME]["env"] = {"API_KEY": TOKEN}
+            self.config.write_text(json.dumps(doc, indent=2), encoding="utf-8")
+        return self.config.read_bytes()
+
+    def test_a_user_modified_entry_is_refused_and_kept(self):
+        folder = Path(self.call_apply("user")["backup_dir"])
+        edited = self.edit_our_entry()
+        rolled = reg.rollback(folder, entry_only=True)
+        self.assertFalse(rolled["clean"])
+        self.assertEqual(rolled["mode"], "entry-only")
+        text = json.dumps(rolled)
+        self.assertIn("not the one this tool registered", text)
+        self.assertIn(f"mcp remove", text)
+        self.assertNotIn(TOKEN, text)
+        self.assertEqual(self.config.read_bytes(), edited)
+        self.assertEqual(self.journal(folder)["state"], "applied")
+        self.assertEqual(self.locks(), [])
+
+    def test_an_unchanged_entry_is_removed_while_other_changes_are_kept(self):
+        folder = Path(self.call_apply("user")["backup_dir"])
+        self.external_edit()
+        rolled = reg.rollback(folder, entry_only=True)
+        self.assertTrue(rolled["clean"], rolled)
+        self.assertNotIn(("user", reg.NAME), self.names())
+        self.assertIn(("user", "late"), self.names())
+        self.assertEqual(self.journal(folder)["state"], "rolled-back-entry")
+
+    def test_a_journal_without_the_entry_hash_is_refused(self):
+        folder = Path(self.call_apply("user")["backup_dir"])
+        journal = self.journal(folder)
+        del journal["applied_entry_sha256"]  # as written by the M3.1 version
+        (folder / "journal.json").write_text(json.dumps(journal), encoding="utf-8")
+        before = self.config.read_bytes()
+        rolled = reg.rollback(folder, entry_only=True)
+        self.assertFalse(rolled["clean"])
+        self.assertIn("older version", rolled["problems"][0])
+        self.assertEqual(self.config.read_bytes(), before)
+
+    def test_recover_does_not_remove_an_entry_that_is_not_the_proposed_one(self):
+        folder = InterruptedTests.crash(self, "handshake", nth=2)
+        edited = self.edit_our_entry()
+        report = reg.recover(self.state)
+        entry = next(r for r in report if r.get("backup_dir") == folder.name)
+        self.assertEqual(entry["outcome"], "needs-attention")
+        self.assertIn("not the one this tool registered", entry["detail"])
+        self.assertNotIn(TOKEN, json.dumps(report))
+        self.assertEqual(self.config.read_bytes(), edited)
+
+
+class EntryOnlyCodexTests(EntryOnlyTests):
+    kind = "codex"
+    agent = "codex"
+
+
+class SettingsTests(Base):
+    """D. Settings outside the MCP tables: kept, or the change is detected, reported by name and reverted."""
+    dropped, changed, added = "model", "hooks", "newKey"
+
+    def test_unrelated_settings_are_unchanged_by_a_normal_apply(self):
+        before = reg.settings(self.agent, self.config)
+        self.assertGreaterEqual(len(before), 2)
+        result = self.call_apply("user")
+        self.assertEqual(reg.settings(self.agent, self.config), before)
+        self.assertEqual(result["settings_added"], [])
+
+    def assert_reverted(self, mode, fragment):
+        self.set_mode(mode)
+        original = self.config.read_bytes()
+        with self.assertRaises(reg.RegisterError) as ctx:
+            self.call_apply("user")
+        self.assertIn(fragment, str(ctx.exception))
+        self.assertIn("was reverted", str(ctx.exception))
+        self.assertNotIn(TOKEN, str(ctx.exception))
+        self.assertEqual(self.config.read_bytes(), original)
+        self.assertEqual(self.journal()["state"], "failed-rolled-back")
+        self.assertEqual(self.locks(), [])
+
+    def test_a_cli_that_removes_a_setting_is_reverted_byte_for_byte(self):
+        self.assert_reverted("drop-setting", f"setting {self.dropped!r} was removed")
+
+    def test_a_cli_that_changes_a_setting_is_reverted_byte_for_byte(self):
+        self.assert_reverted("change-setting", f"setting {self.changed!r} changed")
+
+    def test_a_setting_the_cli_adds_is_reported_not_refused(self):
+        self.set_mode("add-setting")
+        original = self.config.read_bytes()
+        result = self.call_apply("user")
+        self.assertEqual(result["settings_added"], [self.added])
+        self.assertTrue(reg.rollback(Path(result["backup_dir"]))["clean"])
+        self.assertEqual(self.config.read_bytes(), original)
+
+    def test_a_setting_changed_by_mcp_remove_is_put_back(self):
+        folder = Path(self.call_apply("user")["backup_dir"])
+        self.external_edit()
+        self.set_mode("drop-setting")
+        start = self.config.read_bytes()
+        rolled = reg.rollback(folder, entry_only=True)
+        self.assertFalse(rolled["clean"])
+        self.assertIn(f"setting {self.dropped!r} was removed", rolled["problems"][0])
+        self.assertIn("put back", rolled["problems"][0])
+        self.assertEqual(self.config.read_bytes(), start)
+        self.assertEqual(self.journal(folder)["state"], "applied")
+
+    def test_recover_leaves_a_config_alone_when_a_setting_changed(self):
+        folder = InterruptedTests.crash(self, "handshake", nth=2)
+        self.set_mode("drop-setting")
+        reg.run_cli(reg.add_command(self.agent, self.cli, "user", "x", []), self.project_dir)  # drops it, as a CLI might
+        edited = self.config.read_bytes()
+        report = reg.recover(self.state)
+        entry = next(r for r in report if r.get("backup_dir") == folder.name)
+        self.assertEqual(entry["outcome"], "needs-attention")
+        self.assertIn(repr(self.dropped), entry["detail"])
+        self.assertEqual(self.config.read_bytes(), edited)
+
+
+class SettingsCodexTests(SettingsTests):
+    kind = "codex"
+    agent = "codex"
+    dropped, changed, added = "projects", "model", "new_key"
 
 
 class EndToEndTests(Base):
