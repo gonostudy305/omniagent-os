@@ -83,15 +83,16 @@ Ba lớp ở mục 1 vẫn là tầm nhìn dài hạn; thứ tự ưu tiên và 
 | Mốc | Nội dung | Trạng thái |
 |---|---|---|
 | v0.1 | Audit, SSOT, script portable, test | Xong |
-| v0.2 | Skill Manager: discover, plan, adopt, apply, rollback | Xong (PR #1, draft) |
-| v0.3 | Path Adapter: biến đường dẫn chuẩn, render theo agent, diff, kiểm tra tham chiếu | Chưa làm |
-| v0.3 | Giải quyết drift cho các skill `blocked_unmanaged` | Chưa làm |
+| v0.2 | Skill Manager: discover, plan, adopt, apply, rollback | Xong (tag `v0.2.0`) |
+| v0.3 | Path Adapter: biến đường dẫn chuẩn, render theo agent, diff, kiểm tra tham chiếu | Xong trong `v0.3.0-beta.1` |
+| v0.3 | Giải quyết drift cho các skill `blocked_unmanaged` | Một phần: 15 skill `agents` khớp bản render nhưng chưa adopt vào state chính; 11 skill lệch chưa xử lý |
 | v0.4 | Shared Brain qua MCP, có nguồn gốc và quy tắc xung đột | Chưa làm |
 | v0.5 | Điều phối: handoff, worktree, kiểm thử tương thích đa agent | Chưa làm |
+| v1.0 | Windows Local Agent OS: cài đặt, hydration dependency, kiểm tra sức khỏe | Chưa làm |
 
 ## 8. Rủi ro đã biết
 
-- Rollback chưa bảo đảm khôi phục hoàn toàn nếu máy tắt đột ngột giữa thao tác (cần journal phục hồi).
+- Rollback và apply đã có journal và `recover`, đã kiểm bằng test kill tiến trình thật; chưa thử mất điện thật.
 - Số liệu audit lớn (60.000 file, 81,6% drift là đường dẫn) là quan sát trên một máy; cần phương pháp tái lập trước khi trích dẫn rộng rãi.
 - 181/181 skill được đồng bộ file không có nghĩa là 100% chạy được trên mọi agent: cần kiểm thử đường dẫn, lệnh gọi tool, MCP và dependency.
 - Metadata commit công khai có email tác giả; lịch sử đã viết lại nhưng commit cũ có thể còn truy cập được qua hash trực tiếp.

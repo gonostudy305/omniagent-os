@@ -75,7 +75,7 @@ values reject shell metacharacters and parent-directory traversal.
 Use a **copy** of one source skill in a temporary folder under `.local/`,
 manually replace only verified path references with placeholders there, and
 add that skill to a private copy of the manifest. Do **not** modify the live
-`ssot/skills/` yet: v0.2 tools and adapter-aware adoption are not complete.
+`ssot/skills/`: template a copy, and treat adopting skills into the main state as a separate step that needs explicit approval.
 
 ```powershell
 New-Item -ItemType Directory -Force .local | Out-Null
