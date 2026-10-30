@@ -11,7 +11,7 @@ Owner yêu cầu “Làm cả 3 đi”: review PR #13, merge PR #13 và bắt đ
 - Nhánh Stage A: `codex/issue-14-sandbox-e2e`, tạo từ commit merge trên. Stage A ban đầu đã commit/push tại `788894586bc3f47736919ff7fd2ebdd220e19276`, mở [Draft PR #15](https://github.com/gonostudy305/omniagent-os/pull/15). Không gán kết quả harness mới cho SHA PR #13 nguyên bản.
 - Review không thấy lỗi chặn merge. Watcher chỉ chẩn đoán; khóa chỉ điều phối writer dùng cùng cơ chế. Writer ngoài vẫn có thể ghi giữa hash check và replace.
 - Bộ test trước merge: `python -m unittest discover -s tests -p 'test_*.py'`, Windows Python 3.13.14: **271 PASS**, 173.592 giây, exit 0. Có `ResourceWarning` về BufferedWriter chưa đóng trong cleanup.
-- CI cuối PR #13: Python 3.11 Windows và Ubuntu cùng GitGuardian đều SUCCESS, kiểm tra ngay trước merge. [CI của HEAD cuối](https://github.com/gonostudy305/omniagent-os/actions/runs/40859504075). CI này không kiểm tra các thay đổi Stage A chưa push.
+- CI cuối PR #13: Python 3.11 Windows và Ubuntu cùng GitGuardian đều SUCCESS, kiểm tra ngay trước merge. [CI của HEAD cuối](https://github.com/gonostudy305/omniagent-os/actions/runs/40859504075). CI này kiểm tra PR #13, không phải các thay đổi Stage A.
 - [CI trên `main` sau merge](https://github.com/gonostudy305/omniagent-os/actions/runs/41016599042): Windows và Ubuntu SUCCESS tại `7e9c913`.
 - [CI nhánh Stage A tại `7888945`](https://github.com/gonostudy305/omniagent-os/actions/runs/41018989160): Windows 275 PASS; Ubuntu 262 PASS và 13 skipped, cả hai job SUCCESS; GitGuardian SUCCESS tại cùng HEAD. CI này chạy unit/regression tests, không chạy native E2E. Các kết quả dưới đây từ lần chạy cục bộ trước review PR #15 được giữ làm lịch sử; sửa đổi theo review được ghi riêng.
 
@@ -73,6 +73,10 @@ Size/mtime của bảy file profile thật được theo dõi và trạng thái 
 Raw JSON nằm ngoài Git ở `.local/reports/issue-14-pr15-e2e.json`. Bộ quét `brain.scan_secrets` báo `high-entropy string` trong các danh sách tên cache/backup do CLI tạo ở profile tạm; không được ghi là raw report sạch scan. Bản `.local/reports/issue-14-pr15-e2e-redacted.json` chỉ lược bốn trường detail của INFO listing đó, giữ nguyên trạng thái kiểm tra, và scan trả 0 phát hiện. Thư mục home thật không xuất hiện ở dạng thường hoặc JSON-escaped trong cả hai bản. Không commit raw JSON, credential hay backup cấu hình.
 
 Bộ đầy đủ trên mã sửa: `python -m unittest discover -s tests -p 'test_*.py'` → **277 PASS, 0 fail, 0 skip**, exit 0, **121.530 giây** trên Windows Python **3.13.14**. Vẫn có `ResourceWarning` về BufferedWriter trong cleanup; không làm test fail. Log và metadata ở `.local/reports/issue-14-pr15-*`, đều được Git bỏ qua.
+
+Revision đã commit/push thông thường tại **`9f7f3edc701779bb60cca58a0e082a5fe8b35b0d`**. [CI PR #15 của revision](https://github.com/gonostudy305/omniagent-os/actions/runs/41019987210) và [CI push cùng SHA](https://github.com/gonostudy305/omniagent-os/actions/runs/41019980144) đều SUCCESS: Python 3.11 Windows **277 PASS** (94.978 giây ở PR run), Ubuntu **264 PASS + 13 skipped** (277 discovered, 25.811 giây); GitGuardian SUCCESS tại cùng SHA. Native E2E 40 PASS là bằng chứng cục bộ trên cùng mã Python, không được CI tự xác minh. Commit chỉ bổ sung liên kết CI vào tài liệu sau revision này không đổi mã Python hoặc test.
+
+PR #15 giữ Draft để owner/Leader quyết định chuyển sang Ready for Review. Không merge, không bật auto-merge, không force push và không mở Stage B.
 
 ## Kế hoạch Stage B — chỉ đọc, chưa được phép chạy apply
 
