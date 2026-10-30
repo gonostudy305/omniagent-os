@@ -77,7 +77,7 @@ class Base(unittest.TestCase):
                 f'[mcp_servers.hub]\nurl = "https://example.invalid/mcp"\nbearer_token = "{TOKEN}"\n\n'
                 '[mcp_servers.other]\ncommand = "node"\nargs = ["--flag"]\n', encoding="utf-8")
         else:
-            doc = {"theme": "dark", "model": "m", "hooks": {"PreToolUse": []}, "mcpServers": {
+            doc = {"model": "m", "hooks": {"PreToolUse": []}, "mcpServers": {
                 "hub": {"type": "http", "url": "https://example.invalid/mcp", "headers": {"Authorization": "Bearer " + TOKEN}},
                 "other": {"command": "node", "args": ["--flag"]}}}
             self.config.write_text(json.dumps(doc, indent=2), encoding="utf-8")
@@ -198,6 +198,30 @@ class PlanTests(Base):
         with self.assertRaises(reg.RegisterError):
             self.call_apply()
         self.assertEqual(sha(self.config), before)
+
+    def test_plan_warns_on_claude_theme_setting_without_leaking_value(self):
+        doc = json.loads(self.config.read_text(encoding="utf-8"))
+        THEME_SECRET = "custom-synthwave-neon-dark-88"
+        doc["theme"] = THEME_SECRET
+        self.config.write_text(json.dumps(doc, indent=2), encoding="utf-8")
+        result = self.call_plan()
+        self.assertIn("warnings", result)
+        self.assertTrue(any("theme" in w for w in result["warnings"]))
+        self.assertTrue(any("theme" in p for p in result["problems"]))
+        self.assertNotIn(THEME_SECRET, json.dumps(result))
+
+    def test_apply_blocks_before_popen_when_claude_theme_present(self):
+        doc = json.loads(self.config.read_text(encoding="utf-8"))
+        THEME_SECRET = "custom-synthwave-neon-dark-88"
+        doc["theme"] = THEME_SECRET
+        self.config.write_text(json.dumps(doc, indent=2), encoding="utf-8")
+        with mock.patch("subprocess.Popen") as mock_popen:
+            with self.assertRaises(reg.RegisterError) as ctx:
+                self.call_apply("user")
+            self.assertIn("theme", str(ctx.exception))
+            self.assertIn("stopped before running the CLI", str(ctx.exception))
+            self.assertNotIn(THEME_SECRET, str(ctx.exception))
+            mock_popen.assert_not_called()
 
 
 class ApplyClaudeTests(Base):
@@ -425,7 +449,7 @@ class MalformedCodexTests(MalformedConfigTests):
 
 class ByteExactTests(Base):
     def test_bom_and_crlf_come_back_byte_for_byte(self):
-        doc = {"theme": "dark", "mcpServers": {"other": {"command": "node", "args": ["--flag"]}}}
+        doc = {"model": "m", "mcpServers": {"other": {"command": "node", "args": ["--flag"]}}}
         raw = b"\xef\xbb\xbf" + json.dumps(doc, indent=4).replace("\n", "\r\n").encode("utf-8")
         self.config.write_bytes(raw)
         result = self.call_apply("user")
@@ -564,16 +588,24 @@ class InterruptedTests(Base):
         self.assertTrue(self.call_apply("user")["applied"])  # a fresh run works again
 
     def test_a_crash_before_the_cli_ran_changes_nothing(self):
-        for target, state in (("backup_config", "prepared"), ("run_cli", "writing")):
-            with self.subTest(target=target):
-                original = self.config.read_bytes()
-                folder = self.crash(target)
-                self.assertEqual(self.journal(folder)["state"], state)
-                report = reg.recover(self.state)
-                self.assertIn({"backup_dir": folder.name, "outcome": "aborted-unchanged", "detail": ""}, report)
-                self.assertEqual(self.config.read_bytes(), original)
-                self.assertEqual(self.locks(), [])
-                shutil.rmtree(self.state / "backups")
+        original = self.config.read_bytes()
+        # A crash before writing stage (at backup_config): state is prepared, settled as aborted-unchanged
+        folder = self.crash("backup_config")
+        self.assertEqual(self.journal(folder)["state"], "prepared")
+        report = reg.recover(self.state)
+        self.assertIn({"backup_dir": folder.name, "outcome": "aborted-unchanged", "detail": ""}, report)
+        self.assertEqual(self.config.read_bytes(), original)
+        self.assertEqual(self.locks(), [])
+        shutil.rmtree(self.state / "backups")
+
+        # A crash when entering run_cli: state is writing without PID evidence; fail-closed as needs-attention
+        folder = self.crash("run_cli")
+        self.assertEqual(self.journal(folder)["state"], "writing")
+        report = reg.recover(self.state)
+        entry = next(r for r in report if r.get("backup_dir") == folder.name)
+        self.assertEqual(entry["outcome"], "needs-attention")
+        self.assertIn("without evidence that the child writer exited", entry["detail"])
+        self.assertEqual(self.config.read_bytes(), original)
 
     def test_recover_leaves_a_config_alone_when_other_entries_changed(self):
         folder = self.crash("handshake", nth=2)
@@ -596,6 +628,186 @@ class InterruptedTests(Base):
                                    "detail": "cannot read the journal in mcp-broken"}])
         self.assertEqual((folder / "journal.json").read_text(encoding="utf-8"), "{ not json")
         self.assertEqual(self.config.read_bytes(), original)
+
+    def test_recover_leaves_running_child_writer_alone(self):
+        proc = subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()"],
+                                stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.addCleanup(lambda: (proc.kill() if proc.poll() is None else None, proc.wait()))
+
+        folder = self.state / "backups" / "mcp-test-child"
+        folder.mkdir(parents=True)
+        lid = reg.lock_id(self.config)
+        reg.lock_dir().mkdir(parents=True, exist_ok=True)
+        owner_file = reg._owner_path(lid)
+        owner_file.write_text(json.dumps({"config": str(self.config), "backup_dir": str(folder),
+                                          "pid": os.getpid(), "at": brain.now()}), encoding="utf-8")
+        original = self.config.read_bytes()
+        journal = {"agent": self.agent, "scope": "user", "config": str(self.config), "cli": self.cli,
+                   "project_dir": str(self.project_dir), "name": reg.NAME,
+                   "before_entries": reg.snapshot(self.agent, self.config, self.project_dir),
+                   "before_settings": reg.settings(self.agent, self.config),
+                   "original_sha256": reg.file_sha(self.config), "written_entry_sha256": None,
+                   "applied_sha256": None, "applied_entry_sha256": None,
+                   "child_pid": proc.pid, "state": "writing", "at": brain.now()}
+        reg.write_journal(folder, journal)
+
+        report = reg.recover(self.state)
+        entry = next(r for r in report if r.get("backup_dir") == folder.name)
+        self.assertEqual(entry["outcome"], "in-progress")
+        self.assertIn(str(proc.pid), entry["detail"])
+        self.assertEqual(self.config.read_bytes(), original)
+        self.assertTrue(owner_file.exists())
+
+        proc.kill()
+        proc.wait()
+
+        report2 = reg.recover(self.state)
+        entry2 = next(r for r in report2 if r.get("backup_dir") == folder.name)
+        self.assertEqual(entry2["outcome"], "aborted-unchanged")
+        self.assertFalse(owner_file.exists())
+
+    def test_recover_refuses_writing_stage_without_child_pid_and_leaves_file_alone(self):
+        folder = self.state / "backups" / "mcp-test-no-pid"
+        folder.mkdir(parents=True)
+        lid = reg.lock_id(self.config)
+        reg.lock_dir().mkdir(parents=True, exist_ok=True)
+        owner_file = reg._owner_path(lid)
+        owner_file.write_text(json.dumps({"config": str(self.config), "backup_dir": str(folder),
+                                          "pid": os.getpid(), "at": brain.now()}), encoding="utf-8")
+        original = self.config.read_bytes()
+        # Simulated interruption between Popen and writing child_pid: state is "writing", writer_status is "spawning", child_pid is None
+        journal = {"agent": self.agent, "scope": "user", "config": str(self.config), "cli": self.cli,
+                   "project_dir": str(self.project_dir), "name": reg.NAME,
+                   "before_entries": reg.snapshot(self.agent, self.config, self.project_dir),
+                   "before_settings": reg.settings(self.agent, self.config),
+                   "original_sha256": reg.file_sha(self.config), "written_entry_sha256": None,
+                   "applied_sha256": None, "applied_entry_sha256": None,
+                   "child_pid": None, "writer_status": "spawning", "state": "writing", "at": brain.now()}
+        reg.write_journal(folder, journal)
+
+        report = reg.recover(self.state)
+        entry = next(r for r in report if r.get("backup_dir") == folder.name)
+        self.assertEqual(entry["outcome"], "needs-attention")
+        self.assertIn("without evidence that the child writer exited", entry["detail"])
+        self.assertEqual(self.config.read_bytes(), original)
+        # Lock and unsettled state MUST be preserved: journal remains 'writing', owner file remains in place
+        self.assertEqual(self.journal(folder)["state"], "writing")
+        self.assertEqual(len(self.locks()), 1)
+        # New apply runs must be refused because owner record is still held
+        with self.assertRaises(reg.RegisterError) as ctx:
+            self.call_apply("user")
+        self.assertIn("interrupted", str(ctx.exception))
+        # Repeating recover must continue to report needs-attention and keep the lock
+        report2 = reg.recover(self.state)
+        entry2 = next(r for r in report2 if r.get("backup_dir") == folder.name)
+        self.assertEqual(entry2["outcome"], "needs-attention")
+        self.assertEqual(self.journal(folder)["state"], "writing")
+        self.assertEqual(len(self.locks()), 1)
+
+    def test_apply_cleanup_refuses_to_remove_entry_if_modified_by_external_actor(self):
+        calls = []
+        real_handshake = reg.handshake
+        SECRET_TOKEN = "super-secret-token-12345"
+
+        def fake_handshake(*args, **kwargs):
+            calls.append(1)
+            if len(calls) == 2:
+                # 1st call is in plan; 2nd call is in apply after CLI wrote entry
+                # External actor modifies the omniagent-brain entry directly (e.g. adds secret env)
+                if self.kind == "codex":
+                    text = self.config.read_text(encoding="utf-8")
+                    text = text.replace(f"[mcp_servers.{reg.NAME}]\n",
+                                        f'[mcp_servers.{reg.NAME}]\nenv = {{ API_KEY = "{SECRET_TOKEN}" }}\n')
+                    self.config.write_text(text, encoding="utf-8")
+                else:
+                    doc = json.loads(self.config.read_text(encoding="utf-8"))
+                    doc["mcpServers"][reg.NAME]["env"] = {"API_KEY": SECRET_TOKEN}
+                    self.config.write_text(json.dumps(doc, indent=2), encoding="utf-8")
+                # Now simulate handshake failure to trigger apply error cleanup
+                raise reg.RegisterError("simulated handshake failure")
+            return real_handshake(*args, **kwargs)
+
+        with mock.patch.object(reg, "handshake", fake_handshake):
+            with self.assertRaises(reg.RegisterError) as ctx:
+                self.call_apply("user")
+            err_msg = str(ctx.exception)
+            # Must fail closed with cannot be fully reverted
+            self.assertIn("could not be fully reverted", err_msg)
+            self.assertIn("not the one this tool registered", err_msg)
+            # Secret token must NOT be leaked in error message
+            self.assertNotIn(SECRET_TOKEN, err_msg)
+            # The modified entry MUST NOT be removed!
+            self.assertIn(("user", reg.NAME), self.names())
+            content = self.config.read_text(encoding="utf-8")
+            self.assertIn(SECRET_TOKEN, content)
+
+    def test_external_edit_during_cli_run_preserves_external_edit_and_removes_entry(self):
+        original = self.config.read_bytes()
+        self.set_mode("block")
+        done, err = [], []
+
+        def worker():
+            try:
+                self.call_apply("user")
+                done.append(1)
+            except reg.RegisterError as exc:
+                err.append(str(exc))
+
+        t = threading.Thread(target=worker)
+        t.start()
+        self.wait_for(self.started, "fake CLI to block")
+
+        # An external process changes an existing setting while the CLI is executing
+        if self.kind == "codex":
+            text = self.config.read_text(encoding="utf-8")
+            self.config.write_text(text.replace('model = "x"', 'model = "externally-changed"'), encoding="utf-8")
+        else:
+            doc = json.loads(self.config.read_text(encoding="utf-8"))
+            doc["model"] = "externally-changed"
+            self.config.write_text(json.dumps(doc, indent=2), encoding="utf-8")
+
+        self.release.touch()
+        t.join(timeout=10)
+        self.assertFalse(t.is_alive())
+
+        self.assertEqual(len(err), 1)
+        self.assertIn("could not be fully reverted", err[0])
+        self.assertIn("model", err[0])
+        self.assertIn("changed", err[0])
+        # External edit is preserved (not overwritten by config.bak)
+        content = self.config.read_text(encoding="utf-8")
+        self.assertIn("externally-changed", content)
+        # omniagent-brain entry was removed by rollback_entry, not left active
+        self.assertNotIn(reg.NAME, self.names())
+        folder = next((self.state / "backups").glob("mcp-*"))
+        self.assertEqual(self.journal(folder)["state"], "failed-needs-attention")
+
+    def test_external_edit_after_cli_write_preserves_external_edit_and_removes_entry(self):
+        calls = []
+        real_handshake = reg.handshake
+        def fake_handshake(*args, **kwargs):
+            calls.append(1)
+            if len(calls) == 2:
+                # 1st call is in plan; 2nd call is in apply after CLI wrote (current != written)
+                if self.kind == "codex":
+                    self.config.write_bytes(self.config.read_bytes() + b"\n# external write\n")
+                else:
+                    doc = json.loads(self.config.read_text(encoding="utf-8"))
+                    doc["external_marker"] = "keep_me"
+                    self.config.write_text(json.dumps(doc, indent=2), encoding="utf-8")
+                raise reg.RegisterError("simulated handshake failure")
+            return real_handshake(*args, **kwargs)
+
+        with mock.patch.object(reg, "handshake", fake_handshake):
+            with self.assertRaises(reg.RegisterError) as ctx:
+                self.call_apply("user")
+            self.assertIn("registration failed and could not be fully reverted", str(ctx.exception))
+            self.assertIn("simulated handshake failure", str(ctx.exception))
+            # External edit is preserved (not overwritten by config.bak)
+            content = self.config.read_text(encoding="utf-8")
+            self.assertTrue("# external write" in content or "external_marker" in content)
+            # omniagent-brain entry was removed by rollback_entry, not left active!
+            self.assertNotIn(reg.NAME, self.names())
 
     def test_a_lock_left_before_any_journal_is_released_by_recover(self):
         lid = reg.lock_id(self.config)
@@ -678,6 +890,9 @@ class LivenessTests(Base):
         self.assert_left_alone(reg.recover(self.state), folder, self.config.read_bytes(), "writing")
         proc.kill()  # a genuine crash: no finally blocks, no cleanup
         proc.wait(timeout=60)
+        self.release.touch()  # release the orphaned writer CLI so it can exit
+        # wait a moment for the writer CLI to exit
+        time.sleep(0.5)
         report = reg.recover(self.state)
         self.assertIn({"backup_dir": folder.name, "outcome": "recovered-entry-removed", "detail": ""}, report)
         self.assertEqual(self.names(), before)
@@ -827,6 +1042,62 @@ class EntryOnlyTests(Base):
         self.assertIn("older version", rolled["problems"][0])
         self.assertEqual(self.config.read_bytes(), before)
 
+    def test_rollback_entry_leaves_file_as_is_if_cli_remove_mutates_settings(self):
+        folder = Path(self.call_apply("user")["backup_dir"])
+        real_run_cli = reg.run_cli
+        def mutating_run_cli(cmd, cwd, on_start=None, **kwargs):
+            code, out = real_run_cli(cmd, cwd, on_start=on_start, **kwargs)
+            if self.kind == "codex":
+                text = self.config.read_text(encoding="utf-8")
+                self.config.write_text(text.replace('model = "x"', 'model = "remove-mutated"'), encoding="utf-8")
+            else:
+                doc = json.loads(self.config.read_text(encoding="utf-8"))
+                doc["model"] = "remove-mutated"
+                self.config.write_text(json.dumps(doc, indent=2), encoding="utf-8")
+            return code, out
+
+        with mock.patch.object(reg, "run_cli", mutating_run_cli):
+            rolled = reg.rollback(folder, entry_only=True)
+            self.assertFalse(rolled["clean"])
+            self.assertIn("also changed other settings", rolled["problems"][0])
+            self.assertIn("left as-is to avoid overwriting concurrent edits", rolled["problems"][0])
+            content = self.config.read_text(encoding="utf-8")
+            self.assertIn("remove-mutated", content)
+
+    def test_rollback_entry_preserves_concurrent_edit_between_remove_and_restore(self):
+        folder = Path(self.call_apply("user")["backup_dir"])
+        real_run_cli = reg.run_cli
+        def mutating_run_cli(cmd, cwd, **kwargs):
+            code, out = real_run_cli(cmd, cwd, **kwargs)
+            if self.kind == "codex":
+                text = self.config.read_text(encoding="utf-8")
+                self.config.write_text(text.replace('model = "x"', 'model = "remove-mutated"'), encoding="utf-8")
+            else:
+                doc = json.loads(self.config.read_text(encoding="utf-8"))
+                doc["model"] = "remove-mutated"
+                self.config.write_text(json.dumps(doc, indent=2), encoding="utf-8")
+            return code, out
+
+        real_settings_changes = reg.settings_changes
+        def concurrent_settings_changes(*args, **kwargs):
+            # Concurrent process modifies the file after mcp remove finished and recorded written hash
+            if self.kind == "codex":
+                self.config.write_text(self.config.read_text(encoding="utf-8") + "\n# concurrent write\n", encoding="utf-8")
+            else:
+                doc = json.loads(self.config.read_text(encoding="utf-8"))
+                doc["concurrent_key"] = "concurrent_val"
+                self.config.write_text(json.dumps(doc, indent=2), encoding="utf-8")
+            return real_settings_changes(*args, **kwargs)
+
+        with mock.patch.object(reg, "run_cli", mutating_run_cli):
+            with mock.patch.object(reg, "settings_changes", concurrent_settings_changes):
+                rolled = reg.rollback(folder, entry_only=True)
+                self.assertFalse(rolled["clean"])
+                self.assertIn("also changed other settings", rolled["problems"][0])
+                # start was NOT restored over the file
+                content = self.config.read_text(encoding="utf-8")
+                self.assertTrue("concurrent_val" in content or "# concurrent write" in content)
+
     def test_recover_does_not_remove_an_entry_that_is_not_the_proposed_one(self):
         folder = InterruptedTests.crash(self, "handshake", nth=2)
         edited = self.edit_our_entry()
@@ -844,7 +1115,7 @@ class EntryOnlyCodexTests(EntryOnlyTests):
 
 
 class SettingsTests(Base):
-    """D. Settings outside the MCP tables: kept, or the change is detected, reported by name and reverted."""
+    """D. Settings outside the MCP tables: kept, or the change is detected, reported by name and fails closed."""
     dropped, changed, added = "model", "hooks", "newKey"
 
     def test_unrelated_settings_are_unchanged_by_a_normal_apply(self):
@@ -854,23 +1125,25 @@ class SettingsTests(Base):
         self.assertEqual(reg.settings(self.agent, self.config), before)
         self.assertEqual(result["settings_added"], [])
 
-    def assert_reverted(self, mode, fragment):
+    def assert_setting_change_fails_closed(self, mode, fragment):
         self.set_mode(mode)
-        original = self.config.read_bytes()
+        before_apply = self.config.read_bytes()
         with self.assertRaises(reg.RegisterError) as ctx:
             self.call_apply("user")
         self.assertIn(fragment, str(ctx.exception))
-        self.assertIn("was reverted", str(ctx.exception))
+        self.assertIn("could not be fully reverted", str(ctx.exception))
         self.assertNotIn(TOKEN, str(ctx.exception))
-        self.assertEqual(self.config.read_bytes(), original)
-        self.assertEqual(self.journal()["state"], "failed-rolled-back")
+        after_snap = reg.snapshot(self.agent, self.config, self.project_dir)
+        self.assertNotIn((("user"), reg.NAME), reg.flat(after_snap).keys())
+        self.assertNotEqual(self.config.read_bytes(), before_apply)
+        self.assertEqual(self.journal()["state"], "failed-needs-attention")
         self.assertEqual(self.locks(), [])
 
-    def test_a_cli_that_removes_a_setting_is_reverted_byte_for_byte(self):
-        self.assert_reverted("drop-setting", f"setting {self.dropped!r} was removed")
+    def test_a_cli_that_removes_a_setting_is_reverted_with_needs_attention(self):
+        self.assert_setting_change_fails_closed("drop-setting", f"setting {self.dropped!r} was removed")
 
-    def test_a_cli_that_changes_a_setting_is_reverted_byte_for_byte(self):
-        self.assert_reverted("change-setting", f"setting {self.changed!r} changed")
+    def test_a_cli_that_changes_a_setting_is_reverted_with_needs_attention(self):
+        self.assert_setting_change_fails_closed("change-setting", f"setting {self.changed!r} changed")
 
     def test_a_setting_the_cli_adds_is_reported_not_refused(self):
         self.set_mode("add-setting")
@@ -880,7 +1153,7 @@ class SettingsTests(Base):
         self.assertTrue(reg.rollback(Path(result["backup_dir"]))["clean"])
         self.assertEqual(self.config.read_bytes(), original)
 
-    def test_a_setting_changed_by_mcp_remove_is_put_back(self):
+    def test_a_setting_changed_by_mcp_remove_leaves_file_as_is(self):
         folder = Path(self.call_apply("user")["backup_dir"])
         self.external_edit()
         self.set_mode("drop-setting")
@@ -888,9 +1161,93 @@ class SettingsTests(Base):
         rolled = reg.rollback(folder, entry_only=True)
         self.assertFalse(rolled["clean"])
         self.assertIn(f"setting {self.dropped!r} was removed", rolled["problems"][0])
-        self.assertIn("put back", rolled["problems"][0])
-        self.assertEqual(self.config.read_bytes(), start)
+        self.assertIn("left as-is to avoid overwriting concurrent edits", rolled["problems"][0])
+        self.assertNotEqual(self.config.read_bytes(), start)
         self.assertEqual(self.journal(folder)["state"], "applied")
+
+    def test_watcher_missed_concurrency_with_setting_mutation_preserves_file_and_removes_entry(self):
+        # Even if diagnostic watcher reports no concurrency (e.g. interval missed intermediary write, len(hashes) <= 2),
+        # snapshot diffing detects setting mutation, refuses blind full-file restore from config.bak, and fails closed.
+        real_run_cli = reg.run_cli
+        def missed_poll_run_cli(cmd, cwd, on_start=None, watch_file=None, watch_info=None):
+            code, out = real_run_cli(cmd, cwd, on_start=on_start, watch_file=watch_file, watch_info=watch_info)
+            if self.kind == "codex":
+                text = self.config.read_text(encoding="utf-8")
+                self.config.write_text(text.replace('model = "x"', 'model = "concurrent-setting"'), encoding="utf-8")
+            else:
+                doc = json.loads(self.config.read_text(encoding="utf-8"))
+                doc["model"] = "concurrent-setting"
+                self.config.write_text(json.dumps(doc, indent=2), encoding="utf-8")
+            if watch_info is not None:
+                cur = reg.file_sha(self.config)
+                watch_info["hashes"] = [watch_info["hashes"][0], cur]
+                watch_info["concurrent_writes"] = False
+                watch_info["watcher_error"] = False
+            return code, out
+
+        with mock.patch.object(reg, "run_cli", missed_poll_run_cli):
+            with self.assertRaises(reg.RegisterError) as ctx:
+                self.call_apply("user")
+            self.assertIn("could not be fully reverted", str(ctx.exception))
+            after_snap = reg.snapshot(self.agent, self.config, self.project_dir)
+            self.assertNotIn((("user"), reg.NAME), reg.flat(after_snap).keys())
+            content = self.config.read_text(encoding="utf-8")
+            self.assertIn("concurrent-setting", content)
+            self.assertEqual(self.journal()["state"], "failed-needs-attention")
+
+    def test_external_setting_added_during_registration_with_failed_handshake_preserves_new_key_and_fails_closed(self):
+        # A new setting added by an external actor during registration must be treated as unknown-origin
+        # risk during automatic failure cleanup: restore_original is forbidden, file is preserved, entry removed.
+        real_run_cli = reg.run_cli
+        def add_setting_run_cli(cmd, cwd, on_start=None, watch_file=None, watch_info=None):
+            code, out = real_run_cli(cmd, cwd, on_start=on_start, watch_file=watch_file, watch_info=watch_info)
+            if "add" in cmd:
+                if self.kind == "codex":
+                    text = self.config.read_text(encoding="utf-8")
+                    self.config.write_text("customPreference = \"dark_mode\"\n" + text, encoding="utf-8")
+                else:
+                    doc = json.loads(self.config.read_text(encoding="utf-8"))
+                    doc["customPreference"] = "dark_mode"
+                    self.config.write_text(json.dumps(doc, indent=2), encoding="utf-8")
+                if watch_info is not None:
+                    cur = reg.file_sha(self.config)
+                    watch_info["hashes"] = [watch_info["hashes"][0], cur]
+                    watch_info["concurrent_writes"] = False
+                    watch_info["watcher_error"] = False
+            return code, out
+
+        with mock.patch.object(reg, "run_cli", add_setting_run_cli):
+            with mock.patch.object(reg, "is_proposed", return_value=False):
+                with self.assertRaises(reg.RegisterError) as ctx:
+                    self.call_apply("user")
+                self.assertIn("could not be fully reverted", str(ctx.exception))
+                self.assertIn("new setting(s) added outside MCP", str(ctx.exception))
+                # omniagent-brain was removed
+                after_snap = reg.snapshot(self.agent, self.config, self.project_dir)
+                self.assertNotIn((("user"), reg.NAME), reg.flat(after_snap).keys())
+                # The newly added setting customPreference was preserved on disk, not deleted by restore_original
+                content = self.config.read_text(encoding="utf-8")
+                self.assertIn("customPreference", content)
+                self.assertEqual(self.journal()["state"], "failed-needs-attention")
+
+    def test_watcher_read_error_fails_closed_without_blind_restore(self):
+        # If watcher encounters read/hashing errors, apply must fail closed and NOT do restore_original
+        real_run_cli = reg.run_cli
+        def error_watcher_run_cli(cmd, cwd, on_start=None, watch_file=None, watch_info=None):
+            code, out = real_run_cli(cmd, cwd, on_start=on_start, watch_file=watch_file, watch_info=watch_info)
+            if watch_info is not None:
+                watch_info["watcher_error"] = True
+            return code, out
+
+        with mock.patch.object(reg, "run_cli", error_watcher_run_cli):
+            with mock.patch.object(reg, "is_proposed", return_value=False):
+                with self.assertRaises(reg.RegisterError) as ctx:
+                    self.call_apply("user")
+                self.assertIn("could not be fully reverted", str(ctx.exception))
+                self.assertIn("file watcher encountered read error", str(ctx.exception))
+                after_snap = reg.snapshot(self.agent, self.config, self.project_dir)
+                self.assertNotIn((("user"), reg.NAME), reg.flat(after_snap).keys())
+                self.assertEqual(self.journal()["state"], "failed-needs-attention")
 
     def test_recover_leaves_a_config_alone_when_a_setting_changed(self):
         folder = InterruptedTests.crash(self, "handshake", nth=2)

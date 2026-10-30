@@ -37,12 +37,15 @@ import secrets
 import shutil
 import subprocess
 import sys
+import threading
+import time
 import tomllib
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
 import brain
+from omniagent import process_alive
 
 if os.name == "nt":
     import msvcrt
@@ -392,13 +395,80 @@ def safe_text(text: str) -> str:
     return "(output withheld: it looked like it contained a credential)" if brain.scan_secrets(text) else text
 
 
-def run_cli(cmd: list[str], cwd: Path | None) -> tuple[int, str]:
+def run_cli(cmd: list[str], cwd: Path | None, on_start=None, watch_file: Path | None = None,
+            watch_info: dict | None = None) -> tuple[int, str]:
+    """Execute an agent CLI command.
+
+    `watch_file` provides best-effort diagnostic monitoring during execution. Polling cannot guarantee
+    exclusivity or detect all interleaved writes. Exact safety is enforced by snapshot diffing and
+    fail-closed rules against full-file restore.
+    """
+    file_hashes = []
+    stop_event = threading.Event()
+    watcher_error = False
+    t = None
+    if watch_file is not None:
+        try:
+            initial_sha = file_sha(watch_file)
+        except Exception:
+            initial_sha = None
+            watcher_error = True
+        if initial_sha is not None:
+            file_hashes.append(initial_sha)
+        def _poll():
+            nonlocal watcher_error
+            last = initial_sha
+            while not stop_event.is_set():
+                time.sleep(0.01)
+                try:
+                    cur = file_sha(watch_file)
+                except Exception:
+                    watcher_error = True
+                    break
+                if cur is not None and cur != last:
+                    file_hashes.append(cur)
+                    last = cur
+        t = threading.Thread(target=_poll, daemon=True)
+        t.start()
     try:
-        done = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
-                              timeout=120, cwd=cwd, stdin=subprocess.DEVNULL)
-    except (OSError, subprocess.TimeoutExpired) as exc:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True, encoding="utf-8", errors="replace",
+                                cwd=cwd, stdin=subprocess.DEVNULL)
+    except OSError as exc:
+        if t is not None:
+            stop_event.set()
         raise RegisterError(f"could not run the {Path(cmd[0]).name} command ({type(exc).__name__})") from None
-    return done.returncode, safe_text(done.stdout + "\n" + done.stderr)
+    if on_start is not None:
+        try:
+            on_start(proc.pid)
+        except Exception as exc:
+            if t is not None:
+                stop_event.set()
+            proc.kill()
+            proc.wait()
+            raise RegisterError(f"could not record child writer PID ({exc}); process terminated") from exc
+    try:
+        stdout, stderr = proc.communicate(timeout=120)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        stdout, stderr = proc.communicate()
+        raise RegisterError(f"could not run the {Path(cmd[0]).name} command (TimeoutExpired)") from None
+    finally:
+        if t is not None:
+            stop_event.set()
+            t.join(timeout=1.0)
+            try:
+                cur = file_sha(watch_file)
+            except Exception:
+                cur = None
+                watcher_error = True
+            if cur is not None and (not file_hashes or cur != file_hashes[-1]):
+                file_hashes.append(cur)
+            if watch_info is not None:
+                watch_info["hashes"] = file_hashes
+                watch_info["concurrent_writes"] = len(file_hashes) > 2
+                watch_info["watcher_error"] = watcher_error
+    return proc.returncode, safe_text(stdout + "\n" + stderr)
 
 
 # ---------------------------------------------------------------- plan / apply / rollback / recover
@@ -421,6 +491,13 @@ def plan(agent: str, config: Path, cli: str | None, scope: str, project_dir: Pat
     snap = snapshot(agent, config, project_dir)
     if any(NAME in servers for servers in snap.values()):
         problems.append(f"an entry named {NAME} already exists; remove it first (agy 'add' would overwrite)")
+    warnings = []
+    current_settings = settings(agent, config)
+    if agent == "claude" and "theme" in current_settings:
+        msg = ("Claude Code drops the 'theme' setting when registering an MCP server; "
+               "registration is blocked to prevent data loss")
+        problems.append(msg)
+        warnings.append(msg)
     runtime = prepare_runtime(source, runtime_dir)
     command, args = server_command(runtime, brain_dir, project, agent)
     try:
@@ -437,7 +514,7 @@ def plan(agent: str, config: Path, cli: str | None, scope: str, project_dir: Pat
         "proposed_entry": {"name": NAME, "command": command, "args": args},
         "runtime": str(runtime), "handshake_tools": tools,
         "existing_entries": {s: sorted(v) for s, v in snap.items() if s == where or s == "user"},
-        "entry_count": len(flat(snap)), "setting_count": len(settings(agent, config)),
+        "entry_count": len(flat(snap)), "setting_count": len(current_settings),
         "changes": [f"add one entry {NAME!r} to scope {where} with the agent's own `mcp add`",
                     "the agent CLI rewrites the file (it may reformat it); every other MCP entry and every other "
                     "setting must compare equal after parsing, or the change is reverted; settings the CLI adds "
@@ -452,7 +529,7 @@ def plan(agent: str, config: Path, cli: str | None, scope: str, project_dir: Pat
             "and refuses if the entry itself was changed",
         ],
         "apply_with": f"apply --agent {agent} --scope {scope} --yes --expect-sha {original or ABSENT}",
-        "problems": problems, "writes_nothing": True,
+        "problems": problems, "warnings": warnings, "writes_nothing": True,
     }
 
 
@@ -489,6 +566,9 @@ def restore_original(config: Path, folder: Path, original_sha: str) -> dict:
 def apply(agent: str, config: Path, cli: str, scope: str, project_dir: Path, brain_dir: Path, project: str,
           runtime_dir: Path, source: Path, state_dir: Path, confirm=None, expected_sha: str | None = None) -> dict:
     """Register our entry. `expected_sha` is the plan's `original_sha256`; the run stops if the file differs."""
+    if agent == "claude" and "theme" in settings(agent, config):
+        raise RegisterError("Claude Code drops the 'theme' setting when registering an MCP server; "
+                            "apply stopped before running the CLI to prevent data loss")
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     folder = Path(state_dir) / "backups" / f"mcp-{stamp}-{secrets.token_hex(3)}-{agent}"
     with config_lock(config, folder):  # first, so the checks below see the file no other run of ours is changing
@@ -520,23 +600,46 @@ def apply(agent: str, config: Path, cli: str, scope: str, project_dir: Path, bra
             write_journal(folder, journal)
             raise RegisterError(f"{config.name} changed while preparing; nothing was written")
         journal["state"] = "writing"
+        journal["writer_status"] = "spawning"
+        journal["child_pid"] = None
         write_journal(folder, journal)
+        def _on_start(pid):
+            journal["child_pid"] = pid
+            journal["writer_status"] = "running"
+            write_journal(folder, journal)
+        watch_info = {}
         try:
-            code, out = run_cli(add_command(agent, cli, scope, command, args), project_dir)
+            code, out = run_cli(add_command(agent, cli, scope, command, args), project_dir,
+                                on_start=_on_start, watch_file=config, watch_info=watch_info)
+            journal["writer_status"] = "exited"
+            journal["writer_exit_code"] = code
         except RegisterError as exc:  # the CLI did not start or timed out: check what it left, like any failure
             code, out = -1, str(exc)
+            journal["writer_status"] = "failed"
+            journal["writer_exit_code"] = -1
+        finally:
+            journal["child_pid"] = None
+            write_journal(folder, journal)
         written = file_sha(config)
         problems, added = [], []
         if code != 0:
             problems.append(f"`mcp add` exited with {code}: {out}")
+        other_settings_changed = False
+        other_entry_problems = False
         try:
             entry = read_entries(agent, config, project_dir).get(where, {}).get(NAME)
             after = snapshot(agent, config, project_dir)
-            problems += compare(before, after, (where, NAME))
+            entry_problems = compare(before, after, (where, NAME))
+            if entry_problems:
+                other_entry_problems = True
+                problems += entry_problems
             changed, added = settings_changes(before_settings, settings(agent, config))
-            problems += [f"{p} (by the agent CLI, or by another program while it ran)" for p in changed]
+            if changed:
+                other_settings_changed = True
+                problems += [f"{p} (by the agent CLI, or by another program while it ran)" for p in changed]
         except RegisterError as exc:
             after, entry = {}, None
+            other_entry_problems = True
             problems.append(str(exc))
         journal["written_entry_sha256"] = entry_sha(entry) if entry is not None else None  # what recover may remove
         journal["state"] = "verifying"
@@ -552,14 +655,35 @@ def apply(agent: str, config: Path, cli: str, scope: str, project_dir: Path, bra
                 problems.append(f"registered command failed the handshake: {exc}")
         if problems:
             current = file_sha(config)
+            external_risk = (
+                other_settings_changed
+                or bool(added)
+                or other_entry_problems
+                or watch_info.get("concurrent_writes", False)
+                or watch_info.get("watcher_error", False)
+                or current != written
+            )
+            can_restore_bytes = (current == written and not external_risk)
             if current == original:
                 removed = {"clean": True, "problems": []}  # the CLI wrote nothing
-            elif current == written:
-                removed = restore_original(config, folder, original or ABSENT)  # only the CLI wrote: undo all of it
-            else:  # something else wrote after the CLI: keep that, remove only our entry
-                removed = rollback_entry(agent, config, cli, scope, project_dir, before)
-                removed["problems"] += settings_changes(before_settings, settings(agent, config))[0]
-                removed["clean"] = not removed["problems"]
+            elif can_restore_bytes:
+                removed = restore_original(config, folder, original or ABSENT)  # only our entry was touched by CLI
+            else:  # changes outside our entry exist or cannot be ruled out: preserve file, remove ONLY our entry if fingerprint matches
+                expected_entry_sha = journal.get("written_entry_sha256")
+                entry_matcher = ((lambda e: entry_sha(e) == expected_entry_sha) if expected_entry_sha
+                                 else (lambda e: is_proposed(e, proposed)))
+                removed = rollback_entry(agent, config, cli, scope, project_dir, before, matches=entry_matcher)
+                if other_settings_changed:
+                    removed["problems"] += ["setting changes detected; file preserved on disk for review"]
+                if added:
+                    removed["problems"] += [f"new setting(s) added outside MCP ({', '.join(added)}); file preserved on disk for review"]
+                if watch_info.get("concurrent_writes"):
+                    removed["problems"] += ["concurrent writes detected during registration"]
+                if watch_info.get("watcher_error"):
+                    removed["problems"] += ["file watcher encountered read error during registration"]
+                if current != written:
+                    removed["problems"] += ["file changed after writer exited"]
+                removed["clean"] = False
             journal["state"] = "failed-rolled-back" if removed["clean"] else "failed-needs-attention"
             write_journal(folder, journal)
             raise RegisterError("registration failed and was reverted: " + "; ".join(problems) if removed["clean"]
@@ -585,7 +709,7 @@ def rollback_entry(agent: str, config: Path, cli: str, scope: str, project_dir: 
     """Remove only our entry with the agent's own CLI; every other entry must match `before` afterwards.
 
     `matches(entry)` must accept the entry found, or it is left alone (someone changed it since we wrote it).
-    A setting the CLI removed or changed while removing is reverted by restoring the bytes it started from.
+    If `mcp remove` mutates other settings, the file is left as-is to avoid overwriting concurrent edits (TOCTOU).
     """
     where = _scope_name(agent, scope, project_dir)
     problems = []
@@ -597,19 +721,16 @@ def rollback_entry(agent: str, config: Path, cli: str, scope: str, project_dir: 
                 f"scope) is not the one this tool registered (its command, arguments or "
                 f"other properties changed since), so it was left in place and nothing was changed; "
                 + _manual_steps(agent, cli, scope)]}
-        start, start_settings = config.read_bytes(), settings(agent, config)
+        start_settings = settings(agent, config)
         code, out = run_cli(remove_command(agent, cli, scope), project_dir)
         if code != 0:
             problems.append(f"`mcp remove` exited with {code}: {out}")
-        written = file_sha(config)
         changed = settings_changes(start_settings, settings(agent, config))[0]
         if changed:
-            if written == file_sha(config):
-                atomic_write(config, start)
-                problems.append("`mcp remove` also changed other settings (" + "; ".join(changed) + "), so the file "
-                                "was put back as it was before the remove; " + _manual_steps(agent, cli, scope))
-                return {"clean": False, "problems": problems}
-            problems += changed
+            problems.append(f"`mcp remove` also changed other settings ({'; '.join(changed)}); "
+                            "the file was left as-is to avoid overwriting concurrent edits; "
+                            + _manual_steps(agent, cli, scope))
+            return {"clean": False, "problems": problems}
     after = snapshot(agent, config, project_dir)
     if (where, NAME) in flat(after):
         problems.append("the entry is still present")
@@ -670,6 +791,19 @@ def _settle(folder: Path, journal: dict) -> tuple[str, str]:
     """Decide and do what an interrupted run needs. The caller holds the config's lock."""
     config, agent, project_dir = Path(journal["config"]), journal["agent"], Path(journal["project_dir"])
     where = _scope_name(agent, journal["scope"], project_dir)
+    if journal["state"] == "writing":
+        writer_status = journal.get("writer_status")
+        child_pid = journal.get("child_pid")
+        if writer_status != "exited":
+            if child_pid and process_alive(child_pid) is True:
+                return "in-progress", (f"writer process (PID {child_pid}) is still running; wait for it to exit "
+                                      f"before recovering (or terminate it manually with taskkill/kill); left alone")
+            if child_pid and process_alive(child_pid) is None:
+                return "in-progress", (f"writer process (PID {child_pid}) status cannot be determined; "
+                                      f"wait for it to exit or terminate it manually; left alone")
+            if not child_pid:
+                return "needs-attention", ("interrupted during 'writing' stage without evidence that the child writer "
+                                          "exited; writer status is unknown; left alone for manual resolution (config.bak holds original)")
     if (file_sha(config) or ABSENT) == journal["original_sha256"]:
         return "aborted-unchanged", ""
     if journal["state"] in ("prepared", "backed-up"):
@@ -717,6 +851,14 @@ def recover(state_dir: Path) -> list[dict]:
                     outcome, detail = _settle(folder, journal)
                 except RegisterError as exc:
                     outcome, detail = "needs-attention", str(exc)
+                if outcome == "in-progress":
+                    report.append({"backup_dir": folder.name, "outcome": "in-progress", "detail": detail})
+                    continue
+                if journal["state"] == "writing" and journal.get("writer_status") != "exited":
+                    child_pid = journal.get("child_pid")
+                    if not child_pid or process_alive(child_pid) is not False:
+                        report.append({"backup_dir": folder.name, "outcome": outcome, "detail": detail})
+                        continue
                 journal["state"] = outcome if outcome != "needs-attention" else "failed-needs-attention"
                 write_journal(folder, journal)
                 owner = _owner_path(lid)
