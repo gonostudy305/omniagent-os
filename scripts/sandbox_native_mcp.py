@@ -1,7 +1,7 @@
 """Register omniagent-brain in REAL Claude Code / Codex CLIs, but only inside a throwaway profile.
 
-Every profile variable (USERPROFILE, HOME, APPDATA, LOCALAPPDATA, CLAUDE_CONFIG_DIR, CODEX_HOME) points
-into a temporary folder, so the CLIs read and write only there. The real profile files are compared by
+Profile, cache and temporary-directory variables point into a temporary folder. This environment
+redirection is not an OS sandbox and cannot constrain an arbitrary CLI. The real profile files are compared by
 size and modification time before and after (their content is never read). Nothing here signs in,
 calls a model or invokes a tool: it shows whether each native CLI accepts, lists and (Claude Code)
 health-checks the server. Usage: python -I scripts/sandbox_native_mcp.py
@@ -35,15 +35,30 @@ def fingerprint() -> dict:
 
 
 def sandbox_env(home: Path) -> dict:
-    env = {k: v for k, v in os.environ.items()
-           if k.upper() not in {"USERPROFILE", "HOME", "APPDATA", "LOCALAPPDATA", "CLAUDE_CONFIG_DIR",
-                                "CODEX_HOME", "ANTHROPIC_API_KEY", "OPENAI_API_KEY"}}
-    for sub in ("AppData/Roaming", "AppData/Local", ".claude", ".codex"):
+    # Inherit only the OS/runtime essentials: credentials, provider switches, injected
+    # startup code and unknown config redirects must not reach the native clients.
+    allowed = {"PATH", "PATHEXT", "SYSTEMROOT", "WINDIR", "SYSTEMDRIVE", "COMSPEC",
+               "PROCESSOR_ARCHITECTURE", "PROCESSOR_IDENTIFIER", "NUMBER_OF_PROCESSORS", "LANG"}
+    env = {k.upper(): v for k, v in os.environ.items() if k.upper() in allowed}
+    for sub in ("AppData/Roaming", "AppData/Local", ".claude", ".codex", "tmp", ".config", ".cache", ".data", ".state", ".git-template"):
         (home / sub).mkdir(parents=True, exist_ok=True)
     env.update(USERPROFILE=str(home), HOME=str(home), APPDATA=str(home / "AppData/Roaming"),
                LOCALAPPDATA=str(home / "AppData/Local"), CLAUDE_CONFIG_DIR=str(home / ".claude"),
-               CODEX_HOME=str(home / ".codex"))
+               CODEX_HOME=str(home / ".codex"), TEMP=str(home / "tmp"), TMP=str(home / "tmp"),
+               TMPDIR=str(home / "tmp"), XDG_CONFIG_HOME=str(home / ".config"),
+               XDG_CACHE_HOME=str(home / ".cache"), XDG_DATA_HOME=str(home / ".data"),
+               XDG_STATE_HOME=str(home / ".state"), GIT_CONFIG_NOSYSTEM="1",
+               GIT_CONFIG_GLOBAL=str(home / ".gitconfig"), GIT_TEMPLATE_DIR=str(home / ".git-template"))
+    if os.name == "nt":
+        env.update(HOMEDRIVE=home.drive, HOMEPATH=str(home)[len(home.drive):])
     return env
+
+
+def temporary_profile(prefix: str):
+    """Keep disposable profiles inside the ignored workspace directory."""
+    parent = ROOT / ".local" / "sandbox"
+    parent.mkdir(parents=True, exist_ok=True)
+    return tempfile.TemporaryDirectory(prefix=prefix, dir=parent)
 
 
 def run(cmd: list[str], env: dict, cwd: Path) -> tuple[int, str]:
@@ -55,6 +70,17 @@ def run(cmd: list[str], env: dict, cwd: Path) -> tuple[int, str]:
     return done.returncode, (done.stdout + done.stderr).strip()
 
 
+def create_project(project: Path, env: dict) -> None:
+    """An independent Git root prevents Claude from selecting the containing workspace."""
+    project.mkdir(parents=True)
+    code, out = run(["git", "init", "--quiet", str(project)], env, project)
+    if code != 0:
+        raise RuntimeError(f"cannot initialize disposable Git project: {out}")
+    code, root = run(["git", "rev-parse", "--show-toplevel"], env, project)
+    if code != 0 or Path(root).resolve() != project.resolve():
+        raise RuntimeError("disposable project did not resolve to its own Git root")
+
+
 def tree(home: Path) -> dict:
     return {p.relative_to(home).as_posix(): p.read_bytes() for p in home.rglob("*") if p.is_file()}
 
@@ -62,11 +88,11 @@ def tree(home: Path) -> dict:
 def main() -> int:
     before = fingerprint()
     results = []
-    with tempfile.TemporaryDirectory(prefix="omniagent-native-") as temp:
+    with temporary_profile("omniagent-native-") as temp:
         base = Path(temp)
         home, project, brain_dir = base / "home", base / "project", base / "brain"
-        project.mkdir()
         env = sandbox_env(home)
+        create_project(project, env)
         server = [sys.executable, "-I", str(BRAIN), "--brain-dir", str(brain_dir), "--project", "sandbox-demo",
                   "serve", "--agent"]
         clients = {"claude": shutil.which("claude"), "codex": shutil.which("codex")}

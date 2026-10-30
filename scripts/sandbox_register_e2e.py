@@ -4,11 +4,12 @@ For each agent, twice (no config yet; a config with unrelated custom settings): 
 plan's hash) -> unrelated settings compared -> the agent's own CLI lists the entry -> start the registered
 command and propose a note -> check project and identity -> rollback -> config bytes compared with the
 original -> apply again, then `rollback --entry-only` refuses a same-name entry the user changed and removes the
-unchanged one. For Claude also a config holding `theme`, which Claude Code 2.1.246 drops on `mcp add`: the run
-must be refused and reverted (or, with a CLI that keeps it, succeed with it kept).
+unchanged one. A config holding `theme` must be blocked before invoking the Claude CLI,
+without creating a backup or changing the config. An already-present entry must also be refused.
 
-Every profile variable points into a temporary folder (see sandbox_native_mcp.py); the real profile files are
-compared by size and modification time only. No sign-in, no model call.
+Profile variables point into a temporary folder (see sandbox_native_mcp.py); this is environment
+redirection, not an OS sandbox. Real profile files are compared by size and modification time only.
+No sign-in, no model call; the script itself invokes the registered MCP command.
 Usage: python -I scripts/sandbox_register_e2e.py
 """
 
@@ -20,8 +21,8 @@ import os
 import shutil
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -68,8 +69,8 @@ def propose_through(entry: dict, title: str) -> int:
 
 def scenario(agent: str, exe: str, seed: str | None, base: Path) -> list[dict]:
     home, project_dir, brain_dir, state = base / "home", base / "project", base / "brain", base / "state"
-    project_dir.mkdir(parents=True)
     env = sandbox.sandbox_env(home)  # built from the current environment, so before clearing it
+    sandbox.create_project(project_dir, env)
     os.environ.clear()
     os.environ.update(env)  # the CLIs started by mcp_register inherit this
     config = reg.default_config(agent)
@@ -87,29 +88,40 @@ def scenario(agent: str, exe: str, seed: str | None, base: Path) -> list[dict]:
 
     scope = "local" if agent == "claude" else "user"
     preview = reg.plan(agent, config, exe, scope, project_dir, brain_dir, "sandbox-demo", state / "runtime", ROOT / "brain.py")
-    row("plan: no problems, nothing written", not preview["problems"] and tree(home) == tree_before,
-        f"original_sha256={preview['original_sha256'][:12]} entries={preview['entry_count']} settings={preview['setting_count']}")
-
-    def do_apply():
+    def do_apply(reviewed):
         return reg.apply(agent, config, exe, scope, project_dir, brain_dir, "sandbox-demo", state / "runtime",
-                         ROOT / "brain.py", state, expected_sha=reg.file_sha(config) or reg.ABSENT)
+                         ROOT / "brain.py", state, expected_sha=reviewed["original_sha256"])
     if seed == "claude-theme":
-        try:
-            result = do_apply()
-        except reg.RegisterError as exc:
-            after = config.read_bytes() if config.exists() else None
-            row("a CLI that drops an unrelated setting: refused and reverted byte for byte",
-                "'theme' was removed" in str(exc) and "was reverted" in str(exc) and after == original, str(exc)[:160])
-            return rows
-        kept = reg.settings(agent, config)
-        row("a CLI that drops an unrelated setting: this CLI kept it", all(kept.get(k) == v for k, v in settings_before.items()),
-            f"settings_added={result['settings_added']}")
+        row("plan blocks theme and leaves the profile unchanged",
+            any("theme" in p for p in preview["problems"]) and tree(home) == tree_before)
+        with mock.patch.object(reg, "run_cli", side_effect=AssertionError("theme must block before native CLI")) as cli:
+            try:
+                do_apply(preview)
+            except reg.RegisterError as exc:
+                row("apply blocks theme before native CLI, without backup or config changes",
+                    "before running the CLI" in str(exc) and not cli.called
+                    and config.read_bytes() == original and not (state / "backups").exists(), str(exc))
+            else:
+                row("apply blocks theme before native CLI, without backup or config changes", False)
         return rows
-    result = do_apply()
+    row("plan: no problems, config unchanged", not preview["problems"] and tree(home) == tree_before,
+        f"original_sha256={preview['original_sha256'][:12]} entries={preview['entry_count']} settings={preview['setting_count']}")
+    result = do_apply(preview)
     row("apply with the plan's hash", result["applied"], f"entries {result['entries_before']} -> {result['entries_after']}")
     kept = reg.settings(agent, config)
     row("every earlier setting is unchanged after apply", all(kept.get(k) == v for k, v in settings_before.items()),
         f"settings_added={result['settings_added'] or 'none'}")
+    applied = config.read_bytes()
+    collision = reg.plan(agent, config, exe, scope, project_dir, brain_dir, "sandbox-demo", state / "runtime", ROOT / "brain.py")
+    with mock.patch.object(reg, "run_cli", side_effect=AssertionError("collision must block before native CLI")) as cli:
+        try:
+            do_apply(collision)
+        except reg.RegisterError as exc:
+            row("existing omniagent-brain entry is refused without invoking native CLI",
+                any("already exists" in p for p in collision["problems"]) and "already exists" in str(exc)
+                and not cli.called and config.read_bytes() == applied)
+        else:
+            row("existing omniagent-brain entry is refused without invoking native CLI", False)
     where = reg._scope_name(agent, result["scope"], project_dir)
     entry = reg.read_entries(agent, config, project_dir)[where][reg.NAME]
     listed = subprocess.run([exe, "mcp", "get" if agent == "codex" else "list", *([reg.NAME] if agent == "codex" else [])],
@@ -127,7 +139,8 @@ def scenario(agent: str, exe: str, seed: str | None, base: Path) -> list[dict]:
     after = config.read_bytes() if config.exists() else None
     row("rollback restores the config byte for byte", rolled["clean"] and after == original,
         f"mode={rolled.get('mode')} problems={rolled['problems']}")
-    again = Path(do_apply()["backup_dir"])
+    second_preview = reg.plan(agent, config, exe, scope, project_dir, brain_dir, "sandbox-demo", state / "runtime", ROOT / "brain.py")
+    again = Path(do_apply(second_preview)["backup_dir"])
     applied_bytes, applied_settings = config.read_bytes(), reg.settings(agent, config)
     edit_our_entry(agent, config, project_dir)
     edited = config.read_bytes()
@@ -159,10 +172,15 @@ def main() -> int:
             if not exe:
                 results.append({"scenario": agent, "check": "cli present", "status": "NOT_VERIFIED", "detail": "not on PATH"})
                 continue
-            version = subprocess.run([exe, "--version"], capture_output=True, text=True, timeout=60).stdout.strip()
-            results.append({"scenario": agent, "check": "version", "status": "INFO", "detail": version})
+            with sandbox.temporary_profile("omniagent-version-") as temp:
+                base = Path(temp)
+                project = base / "project"
+                env = sandbox.sandbox_env(base / "home")
+                sandbox.create_project(project, env)
+                code, version = sandbox.run([exe, "--version"], env, project)
+            results.append({"scenario": agent, "check": "version", "status": "INFO" if code == 0 else "FAIL", "detail": version})
             for seed in ((None, "claude", "claude-theme") if agent == "claude" else (None, "codex")):
-                with tempfile.TemporaryDirectory(prefix="omniagent-reg-") as temp:
+                with sandbox.temporary_profile("omniagent-reg-") as temp:
                     try:
                         results += scenario(agent, exe, seed, Path(temp))
                     except reg.RegisterError as exc:
@@ -170,6 +188,8 @@ def main() -> int:
                     finally:
                         os.environ.clear()
                         os.environ.update(saved_env)
+            results.append({"scenario": agent, "check": "actual model invokes brain_search / brain_propose",
+                            "status": "NOT_VERIFIED", "detail": "No sign-in or credentials copied; direct scripted MCP calls are not model calls."})
     finally:
         os.environ.clear()
         os.environ.update(saved_env)
