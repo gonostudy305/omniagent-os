@@ -59,12 +59,12 @@ def tree(home: Path) -> dict:
     return {p.relative_to(home).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest() for p in home.rglob("*") if p.is_file()}
 
 
-def propose_through(entry: dict, title: str) -> int:
+def propose_through(entry: dict, title: str, *, env: dict, cwd: Path) -> int:
     messages = [{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18"}},
                 {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
                  "params": {"name": "brain_propose", "arguments": {"kind": "fact", "title": title, "body": "From the registered entry."}}}]
     return subprocess.run([entry["command"], *entry["args"]], input="".join(json.dumps(m) + "\n" for m in messages),
-                          capture_output=True, text=True, encoding="utf-8", timeout=60).returncode
+                          env=env, cwd=cwd, capture_output=True, text=True, encoding="utf-8", timeout=60).returncode
 
 
 def scenario(agent: str, exe: str, seed: str | None, base: Path) -> list[dict]:
@@ -125,13 +125,13 @@ def scenario(agent: str, exe: str, seed: str | None, base: Path) -> list[dict]:
     where = reg._scope_name(agent, result["scope"], project_dir)
     entry = reg.read_entries(agent, config, project_dir)[where][reg.NAME]
     listed = subprocess.run([exe, "mcp", "get" if agent == "codex" else "list", *([reg.NAME] if agent == "codex" else [])],
-                            cwd=project_dir, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                            env=env, cwd=project_dir, capture_output=True, text=True, encoding="utf-8", errors="replace",
                             stdin=subprocess.DEVNULL, timeout=120)
     seen = listed.returncode == 0 and reg.NAME in listed.stdout
     connected = agent != "claude" or "Connected" in listed.stdout.split(reg.NAME, 1)[-1].splitlines()[0]
     row(f"agent's own `mcp {'get' if agent == 'codex' else 'list'}` sees the entry"
         + (" and connects" if agent == "claude" else ""), seen and connected)
-    code = propose_through(entry, f"E2E {agent}")
+    code = propose_through(entry, f"E2E {agent}", env=env, cwd=project_dir)
     notes = brain.Brain(brain_dir, "sandbox-demo").search(include_unverified=True)
     row("registered command serves project 'sandbox-demo' as this agent", code == 0 and
         [(n["source_agent"], n["status"]) for n in notes] == [(agent, "inbox")], f"notes={len(notes)}")

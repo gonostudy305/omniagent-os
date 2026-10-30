@@ -8,11 +8,12 @@ Owner yêu cầu “Làm cả 3 đi”: review PR #13, merge PR #13 và bắt đ
 
 - PR #13 đã merge lúc 13:51:57, commit `7e9c913f49f74e772ec11bd6d7da89be29a6c01a`.
 - HEAD được review và kiểm thử trước merge: `25b236c43cec09d965cc6802b035f1fc6c4a65d4`.
-- Nhánh Stage A: `codex/issue-14-sandbox-e2e`, tạo từ commit merge trên. Báo cáo này đi cùng thay đổi chưa commit của nhánh; không gán kết quả harness mới cho SHA PR #13 nguyên bản.
+- Nhánh Stage A: `codex/issue-14-sandbox-e2e`, tạo từ commit merge trên. Stage A ban đầu đã commit/push tại `788894586bc3f47736919ff7fd2ebdd220e19276`, mở [Draft PR #15](https://github.com/gonostudy305/omniagent-os/pull/15). Không gán kết quả harness mới cho SHA PR #13 nguyên bản.
 - Review không thấy lỗi chặn merge. Watcher chỉ chẩn đoán; khóa chỉ điều phối writer dùng cùng cơ chế. Writer ngoài vẫn có thể ghi giữa hash check và replace.
 - Bộ test trước merge: `python -m unittest discover -s tests -p 'test_*.py'`, Windows Python 3.13.14: **271 PASS**, 173.592 giây, exit 0. Có `ResourceWarning` về BufferedWriter chưa đóng trong cleanup.
 - CI cuối PR #13: Python 3.11 Windows và Ubuntu cùng GitGuardian đều SUCCESS, kiểm tra ngay trước merge. [CI của HEAD cuối](https://github.com/gonostudy305/omniagent-os/actions/runs/40859504075). CI này không kiểm tra các thay đổi Stage A chưa push.
 - [CI trên `main` sau merge](https://github.com/gonostudy305/omniagent-os/actions/runs/41016599042): Windows và Ubuntu SUCCESS tại `7e9c913`.
+- [CI nhánh Stage A tại `7888945`](https://github.com/gonostudy305/omniagent-os/actions/runs/41018989160): Windows 275 PASS; Ubuntu 262 PASS và 13 skipped, cả hai job SUCCESS; GitGuardian SUCCESS tại cùng HEAD. CI này chạy unit/regression tests, không chạy native E2E. Các kết quả dưới đây từ lần chạy cục bộ trước review PR #15 được giữ làm lịch sử; sửa đổi theo review được ghi riêng.
 
 ## Cách chạy và giới hạn bằng chứng
 
@@ -29,7 +30,7 @@ Các thư mục nằm dưới `.local/sandbox/`, được dọn sau mỗi kịch
 
 ## Kết quả và ma trận kiểm chứng
 
-Native E2E cuối: **exit 0, 26.005 giây**, stderr rỗng; **40 PASS, 0 FAIL, 6 INFO, 3 NOT_VERIFIED**. Claude Code **2.1.246**, Codex CLI **0.163.0**. Dữ liệu chi tiết lưu cục bộ tại `.local/reports/issue-14-stage-a.json`.
+Native E2E trước review PR #15: **exit 0, 26.005 giây**, stderr rỗng; **40 PASS, 0 FAIL, 6 INFO, 3 NOT_VERIFIED**. Claude Code **2.1.246**, Codex CLI **0.163.0**. Dữ liệu chi tiết lưu cục bộ tại `.local/reports/issue-14-stage-a.json`. Ma trận bên dưới mô tả phạm vi các kiểm tra; kết quả của revision theo review được ghi riêng.
 
 | Trường hợp | Claude Code | Codex |
 |---|---|---|
@@ -47,7 +48,7 @@ Native E2E cuối: **exit 0, 26.005 giây**, stderr rỗng; **40 PASS, 0 FAIL, 6
 
 Antigravity native/IDE: **NOT_VERIFIED**, chỉ có fake-CLI tests. Các dòng `NOT_VERIFIED` trong bảng diễn giải phạm vi rộng hơn ba dòng máy đếm trong JSON.
 
-Ở lần chạy cuối, size/mtime của cả bảy file profile thật được theo dõi không đổi; trạng thái tồn tại thư mục khóa thật không đổi. Đây chỉ là bằng chứng metadata trong lần chạy này.
+Ở lần chạy thành công trước review, size/mtime của cả bảy file profile thật được theo dõi không đổi; trạng thái tồn tại thư mục khóa thật không đổi. Đây chỉ là bằng chứng metadata trong lần chạy này.
 
 Sau exact rollback, CLI có thể để lại log/backup/init files trong **profile tạm**. Entry-only giữ thiết lập CLI đã thêm, không đòi toàn bộ file trở về byte gốc. JSON liệt kê file thừa/đổi theo từng scenario; TemporaryDirectory dọn profile sau đó. Không áp dụng kết luận này cho thư mục profile thật.
 
@@ -57,7 +58,21 @@ Lần đầu sau khi chuyển thư mục tạm vào workspace: **exit 1, 24.726 
 
 Lần đầu còn thấy metadata `.codex/config.toml` thật thay đổi. **Chưa xác định writer hay nội dung thay đổi**, không đọc hoặc hoàn tác file thật. Lần chạy lại giữ metadata không đổi không xóa bỏ quan sát này và không chứng minh nguồn gây thay đổi lần đầu. Bằng chứng đầu được giữ nguyên tại `.local/reports/issue-14-stage-a-first-run.json`.
 
-Kiểm thử hồi quy: bộ đầy đủ sau cập nhật harness ban đầu **274 PASS**, 172.362 giây, exit 0. Sau sửa Git root fixture, nhóm test sandbox **6 PASS**, 0.483 giây. Bộ đầy đủ trên code cuối: **275 PASS, 0 fail, 0 skip**, 120.862 giây, exit 0 trên Windows Python 3.13.14. Log: `.local/reports/issue-14-tests.log`. Vẫn có `ResourceWarning` về BufferedWriter chưa đóng trong cleanup; không làm test fail. Không đồng nhất kết quả này với 271 test của PR #13; CI Linux của thay đổi Stage A chưa chạy vì nhánh chưa commit/push.
+Kiểm thử hồi quy trước review PR #15: bộ đầy đủ sau cập nhật harness ban đầu **274 PASS**, 172.362 giây, exit 0. Sau sửa Git root fixture, nhóm test sandbox **6 PASS**, 0.483 giây. Bộ đầy đủ sau đó: **275 PASS, 0 fail, 0 skip**, 120.862 giây, exit 0 trên Windows Python 3.13.14. Log: `.local/reports/issue-14-tests.log`. Vẫn có `ResourceWarning` về BufferedWriter chưa đóng trong cleanup; không làm test fail. Không đồng nhất kết quả này với 271 test của PR #13; CI nhánh tại `7888945` đã chạy, xem liên kết ở trên.
+
+## Revision theo review PR #15: subprocess nhận sandbox context tường minh
+
+`propose_through()` bắt buộc `env` và `cwd` dạng keyword-only. Cả subprocess gọi registered MCP command và `claude mcp list` / `codex mcp get` đều được truyền môi trường đã lọc và project tạm tường minh. Các lời gọi qua `mcp_register` vẫn chạy trong môi trường scenario đã chuyển hướng; không thay đổi API hoặc hành vi đăng ký profile thật.
+
+Hai regression test mới tiêm token và config path giả vào môi trường cha **sau** khi scenario giữ bản môi trường sandbox, kiểm tra cả kwargs `env`/`cwd` và đường dẫn sandbox ở subprocess. Trước sửa: 2 failure và 1 error; sau sửa: nhóm sandbox **8 PASS**, 0.382 giây. Test chạy cả nhánh Claude list và Codex get, cùng lời gọi MCP trực tiếp; không chỉ dựa vào `os.environ` đã bị thay trong scenario.
+
+Native E2E sau sửa: **40 PASS, 0 FAIL, 6 INFO, 3 NOT_VERIFIED**, exit 0 trong **23.801 giây**, stderr rỗng; Claude Code **2.1.246**, Codex CLI **0.163.0**. Lệnh tái lập vẫn là `python -I scripts/sandbox_register_e2e.py`, không cần credential. Kết quả này là lần chạy cục bộ với CLI thật; GitHub CI chỉ chạy unit/regression tests.
+
+Size/mtime của bảy file profile thật được theo dõi và trạng thái tồn tại thư mục khóa thật không đổi trong lần này. Không đọc nội dung profile thật để điều tra mtime ở lần thất bại lịch sử; không suy luận nguồn gây thay đổi từ metadata. Model thật gọi tool và Antigravity native vẫn **NOT_VERIFIED**.
+
+Raw JSON nằm ngoài Git ở `.local/reports/issue-14-pr15-e2e.json`. Bộ quét `brain.scan_secrets` báo `high-entropy string` trong các danh sách tên cache/backup do CLI tạo ở profile tạm; không được ghi là raw report sạch scan. Bản `.local/reports/issue-14-pr15-e2e-redacted.json` chỉ lược bốn trường detail của INFO listing đó, giữ nguyên trạng thái kiểm tra, và scan trả 0 phát hiện. Thư mục home thật không xuất hiện ở dạng thường hoặc JSON-escaped trong cả hai bản. Không commit raw JSON, credential hay backup cấu hình.
+
+Bộ đầy đủ trên mã sửa: `python -m unittest discover -s tests -p 'test_*.py'` → **277 PASS, 0 fail, 0 skip**, exit 0, **121.530 giây** trên Windows Python **3.13.14**. Vẫn có `ResourceWarning` về BufferedWriter trong cleanup; không làm test fail. Log và metadata ở `.local/reports/issue-14-pr15-*`, đều được Git bỏ qua.
 
 ## Kế hoạch Stage B — chỉ đọc, chưa được phép chạy apply
 

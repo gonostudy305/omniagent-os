@@ -76,6 +76,69 @@ class SandboxEnvTests(unittest.TestCase):
 
 
 class SandboxLifecycleTests(unittest.TestCase):
+    def test_propose_passes_explicit_clean_environment_and_project_directory(self):
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            project = base / "project"
+            env = sandbox.sandbox_env(base / "home")
+            poisoned = {"ANTHROPIC_API_KEY": "synthetic", "OPENAI_API_KEY": "synthetic",
+                        "CLAUDE_CONFIG_DIR": str(base / "ambient-claude"), "CODEX_HOME": str(base / "ambient-codex")}
+            with mock.patch.dict(os.environ, poisoned), mock.patch.object(lifecycle.subprocess, "run") as run:
+                run.return_value.returncode = 0
+                self.assertEqual(lifecycle.propose_through({"command": "python", "args": ["brain.py"]},
+                                                          "test", env=env, cwd=project), 0)
+                self.assertIs(run.call_args.kwargs["env"], env)
+                self.assertEqual(run.call_args.kwargs["cwd"], project)
+                self.assertNotIn("ANTHROPIC_API_KEY", run.call_args.kwargs["env"])
+                self.assertNotIn("OPENAI_API_KEY", run.call_args.kwargs["env"])
+
+    def test_native_list_get_and_propose_keep_explicit_scenario_environment(self):
+        for agent in ("claude", "codex"):
+            with self.subTest(agent=agent), tempfile.TemporaryDirectory() as temp, \
+                    mock.patch.dict(os.environ, dict(os.environ), clear=True):
+                base = Path(temp)
+                project = base / "project"
+                scope = "local" if agent == "claude" else "user"
+                where = lifecycle.reg._scope_name(agent, scope, project)
+                entry = {"command": "python", "args": ["brain.py"]}
+                poisoned = {"ANTHROPIC_API_KEY": "synthetic", "OPENAI_API_KEY": "synthetic",
+                            "CLAUDE_CONFIG_DIR": str(base / "ambient-claude"), "CODEX_HOME": str(base / "ambient-codex")}
+                plans = [dict(problems=[], original_sha256="reviewed", entry_count=0, setting_count=0),
+                         dict(problems=["already exists"], original_sha256="reviewed")]
+                calls = []
+
+                def plan(*args, **kwargs):
+                    # Poison ambient state after scenario captured its sanitized env.
+                    os.environ.update(poisoned)
+                    return plans.pop(0)
+
+                def run(cmd, **kwargs):
+                    calls.append(cmd)
+                    self.assertIn("env", kwargs)
+                    self.assertIn("cwd", kwargs)
+                    self.assertEqual(kwargs["cwd"], project)
+                    env = kwargs["env"]
+                    self.assertNotIn("ANTHROPIC_API_KEY", env)
+                    self.assertNotIn("OPENAI_API_KEY", env)
+                    self.assertEqual(Path(env["CLAUDE_CONFIG_DIR"]), base / "home" / ".claude")
+                    self.assertEqual(Path(env["CODEX_HOME"]), base / "home" / ".codex")
+                    if len(calls) == 1:
+                        self.assertEqual(cmd[1:3], ["mcp", "get" if agent == "codex" else "list"])
+                        return mock.Mock(returncode=0, stdout="omniagent-brain Connected\n")
+                    self.assertEqual(cmd, ["python", "brain.py"])
+                    raise RuntimeError("verified both subprocess calls")
+
+                with mock.patch.object(lifecycle.sandbox, "create_project"), \
+                        mock.patch.object(lifecycle.reg, "plan", side_effect=plan), \
+                        mock.patch.object(lifecycle.reg, "apply", side_effect=[
+                            dict(applied=True, entries_before=0, entries_after=1, settings_added=[], scope=scope),
+                            lifecycle.reg.RegisterError("already exists")]), \
+                        mock.patch.object(lifecycle.reg, "read_entries", return_value={where: {lifecycle.reg.NAME: entry}}), \
+                        mock.patch.object(lifecycle.subprocess, "run", side_effect=run):
+                    with self.assertRaisesRegex(RuntimeError, "verified both subprocess calls"):
+                        lifecycle.scenario(agent, "native-cli", agent, base)
+                self.assertEqual(len(calls), 2)
+
     def test_theme_scenario_expects_preflight_refusal_without_cli_or_backup(self):
         with tempfile.TemporaryDirectory() as temp, mock.patch.dict(os.environ, dict(os.environ), clear=True), \
                 mock.patch.object(lifecycle.reg, "handshake", return_value=sorted(lifecycle.reg.EXPECTED_TOOLS)):
