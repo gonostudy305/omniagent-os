@@ -10,7 +10,9 @@ one entry was added and every other entry is unchanged (compared after parsing, 
 their files), and that the registered command answers an MCP handshake. Each stage is journaled.
 
 Every setting outside the MCP tables is compared too (by hash of its parsed value, per top-level key and, for
-Claude, per project key): a setting the CLI removed or changed fails the run, which is then reverted.
+Claude, per project key): a setting the CLI removed or changed fails the run. Failure cleanup preserves
+such changes for manual review and removes only our matching entry when possible; it does not blindly
+restore the original file. Claude configs containing `theme` are blocked before starting the CLI.
 
 `rollback` restores the original bytes, but only while the config still has exactly the bytes recorded right
 after `apply`. If anything changed it since, it refuses and leaves the file alone; `rollback --entry-only`
@@ -400,8 +402,8 @@ def run_cli(cmd: list[str], cwd: Path | None, on_start=None, watch_file: Path | 
     """Execute an agent CLI command.
 
     `watch_file` provides best-effort diagnostic monitoring during execution. Polling cannot guarantee
-    exclusivity or detect all interleaved writes. Exact safety is enforced by snapshot diffing and
-    fail-closed rules against full-file restore.
+    exclusivity or detect all interleaved writes. Snapshot diffing and fail-closed restore rules
+    reduce risk but do not exclude independent writers between a hash check and file replacement.
     """
     file_hashes = []
     stop_event = threading.Event()
@@ -517,8 +519,8 @@ def plan(agent: str, config: Path, cli: str | None, scope: str, project_dir: Pat
         "entry_count": len(flat(snap)), "setting_count": len(current_settings),
         "changes": [f"add one entry {NAME!r} to scope {where} with the agent's own `mcp add`",
                     "the agent CLI rewrites the file (it may reformat it); every other MCP entry and every other "
-                    "setting must compare equal after parsing, or the change is reverted; settings the CLI adds "
-                    "are listed in the result"],
+                    "setting must compare equal after parsing, or registration fails; cleanup preserves changes "
+                    "outside our entry for manual review; settings the CLI adds are listed in the result"],
         "expected_output_sha256": None,
         "expected_output_note": "not predictable: the agent CLI writes the file; apply records the resulting "
                                 "hash, and rollback restores the original bytes only while the file still has it",
