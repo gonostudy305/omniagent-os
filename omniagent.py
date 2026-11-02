@@ -1087,6 +1087,87 @@ def discover(source: Path, targets: dict[str, Path]) -> None:
             print(f"{name:10}      (not found)  {root}")
 
 
+def _unverifiable(exc: Exception) -> str:
+    """Reason code for a tree that cannot be hashed; the message itself holds paths."""
+    text = str(exc)
+    if text.startswith("Potential credentials"):
+        return "credential_like_file"
+    if "ymlink" in text or text.startswith("Unexpected directory") or text.startswith("Extra directory"):
+        return "link_or_unexpected_dir"
+    if text.startswith("Non-regular"):
+        return "non_regular_file"
+    return "unverifiable"
+
+
+def _record_transaction(state_dir: Path, dest: str, record: dict) -> str | None:
+    """The applied journal that wrote exactly this record, if one can be proven."""
+    if record.get("origin") == "adopted":
+        return record.get("adopted_transaction")
+    directory = state_dir / "transactions"
+    found = None
+    if directory.is_dir():
+        for path in sorted(directory.glob("*.json")):
+            journal = read_json(path, {})
+            if (journal.get("status") == "applied" and journal.get("kind") != "adopt"
+                    and (journal.get("records") or {}).get(dest, {}).get("hash") == record.get("hash")):
+                found = path.stem
+    return found
+
+
+def inventory(state_dir: Path, targets: dict[str, Path]) -> dict:
+    """Read-only provenance: names, hashes and origin, never paths or file contents.
+
+    Anything that cannot be proven is `unknown`; nothing here is a safety verdict.
+    """
+    managed = state_at(state_dir)["managed"]
+    roots, entries = [], []
+    for target_name, root in targets.items():
+        if is_link(root):
+            roots.append({"target": target_name, "status": "link"})
+            continue
+        if not root.is_dir():
+            roots.append({"target": target_name, "status": "not_found"})
+            continue
+        roots.append({"target": target_name, "status": "ok"})
+        names = {child.name for child in root.iterdir()}
+        names |= {Path(key).name for key in managed if Path(key).parent == root}
+        for name in sorted(names):
+            dest = root / name
+            record = managed.get(str(dest))
+            entry = {"target": target_name, "name": name if SKILL_NAME.fullmatch(name) else "unknown",
+                     "kind": "skill", "origin": "unmanaged", "transaction": None,
+                     "hash": "unknown", "integrity": "no_record", "reason": None}
+            if record:
+                entry["origin"] = "adopted" if record.get("origin") == "adopted" else "installed"
+                entry["transaction"] = _record_transaction(state_dir, str(dest), record) or "unknown"
+                entry["integrity"] = "unknown"
+            if is_link(dest):
+                entry["kind"] = "link"
+            elif not dest.exists():
+                entry["kind"] = "missing"
+            elif not dest.is_dir():
+                entry["kind"] = "not_a_directory"
+            elif not (dest / "SKILL.md").is_file():
+                entry["kind"] = "not_a_skill"
+            else:
+                try:
+                    entry["hash"] = tree_digest(dest, source=False)
+                except SafetyError as exc:
+                    entry["reason"] = _unverifiable(exc)
+                except OSError:
+                    entry["reason"] = "unreadable"
+                if record and entry["hash"] != "unknown":
+                    entry["integrity"] = "matches_record" if entry["hash"] == record.get("hash") else "differs_from_record"
+            if entry["hash"] == "unknown":
+                entry["integrity"] = "unknown"  # an unhashed tree is never compared, so never "no_record"
+            entries.append(entry)
+    by_origin: dict[str, int] = {}
+    for e in entries:
+        by_origin[e["origin"]] = by_origin.get(e["origin"], 0) + 1
+    return {"version": 1, "targets": roots, "entries": entries,
+            "summary": {"entries": len(entries), "by_origin": dict(sorted(by_origin.items()))}}
+
+
 def load_adapter_module():
     """Load the adjacent adapter safely even when Python runs with -I."""
     sys.modules.setdefault("omniagent", sys.modules[__name__])
@@ -1140,8 +1221,26 @@ def cli(argv: list[str] | None = None) -> int:
     undo.add_argument("--state-dir", type=Path, default=DEFAULT_STATE)
     undo.add_argument("--transaction", required=True)
     undo.add_argument("--yes", action="store_true")
+    inv = sub.add_parser("inventory", help="read-only provenance of installed skills (no paths, no contents)")
+    inv.add_argument("--state-dir", type=Path, default=DEFAULT_STATE)
+    inv.add_argument("--target", action="append", metavar="NAME=PATH")
+    inv.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
     try:
+        if args.command == "inventory":
+            targets = parse_targets(args.target)
+            if not targets:
+                raise SafetyError("Specify at least one explicit --target NAME=PATH")
+            doc = inventory(args.state_dir.expanduser().absolute(), targets)
+            if args.json:
+                print(json.dumps(doc, indent=2, ensure_ascii=True))
+            else:
+                for e in doc["entries"]:
+                    print(f"{e['target']:10} {e['origin']:10} {e['integrity']:20} {e['name']}")
+                for t in doc["targets"]:
+                    if t["status"] != "ok":
+                        print(f"{t['target']:10} target {t['status']}")
+            return 0
         if args.command == "recover":
             steps = recover(args.state_dir.expanduser().absolute(), args.yes)
             for s in steps:
