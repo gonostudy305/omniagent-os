@@ -168,3 +168,10 @@ Trong bản sao `.local/experiments/` (không đụng SSOT thật), áp dụng h
 - Sửa: hoàn tác bằng `swap_skill` (như `recover` ở PR #16); đưa journal `committing` về `in_progress` trước khi hoàn tác; chỉ ghi `failed_reverted` khi mọi skill đã được hoàn tác, nếu không thì để journal mở cho `recover` (vốn từ chối và giữ nguyên bản sửa tay).
 - `tests/test_kill_apply_cleanup.py`: 7 test, process chết thật bằng `os._exit` trên fixture tạm. Kill khi xóa, khi dựng bản phục hồi, giữa hai lần rename, sau khi đưa bản phục hồi vào; lỗi khi ghi `state.json` rồi bị kill; sửa tay trong lúc `apply`; và một test đối chứng không kill. Trước khi sửa 6/7 fail; sau khi sửa pass. Mỗi lần phục hồi đều kiểm: stage dư được giữ và liệt kê, lần chạy thứ ba báo 0 bước. Bộ test đầy đủ trên Windows: **284 PASS**.
 - Sau khi cả PR này và PR #16 được merge, `remove_managed` sẽ không còn chỗ dùng.
+
+## Kiểm kê nguồn gốc chỉ đọc (02/11/2026, roadmap hạng mục 5)
+
+- Thêm lệnh `inventory [--json]`. Với mỗi mục trong thư mục đích, và mỗi mục `state.json` ghi nhận nhưng đã mất, lệnh báo: tên, target, `kind`, `origin` (`installed`/`adopted`/`unmanaged`), giao dịch đã ghi đúng bản ghi hiện tại, hash cây thư mục, `integrity` so với bản ghi, và lý do khi không băm được. Hướng dẫn trong [USAGE.md](USAGE.md).
+- Theo tiêu chí chấp nhận: không đường dẫn máy, không tên file, không nội dung; mục không chứng minh được là `unknown` và `unknown` không bao giờ thành khớp; không ghi gì, không tạo lock hay thư mục state; bắt buộc có `--target`; state hỏng thì dừng với lỗi.
+- `tests/test_inventory.py`: 12 test, trong đó có test đối kháng: skill có `.env` và `.pem` chứa chuỗi bí mật giả, kiểm rằng chuỗi bí mật và tên file không xuất hiện ở đầu ra, còn hash là `unknown`; skill đang được quản lý mà bị thêm file credential thì báo `unknown`, không báo khớp. Bộ test đầy đủ trên Windows: **302 PASS**.
+- Chưa làm: chạy `inventory` trên thư mục skill thật (chỉ đọc, nhưng vẫn cần chủ dự án đồng ý vì đọc cấu trúc profile thật).
