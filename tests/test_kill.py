@@ -98,6 +98,20 @@ elif mode == "rc_partial_remove":
         next(p for p in Path(path).rglob("*") if p.is_file()).unlink()
         die()
     shutil.rmtree = fake
+elif mode == "rc_after_old_moved":
+    def fake(self, target):
+        moved = real_rename(self, target)
+        if Path(target).name == "old":
+            die()
+        return moved
+    Path.rename = fake
+elif mode == "rc_after_swap_in":
+    def fake(self, target):
+        moved = real_rename(self, target)
+        if self.name == "skill" and self.parent.name.startswith(".omniagent-stage-"):
+            die()
+        return moved
+    Path.rename = fake
 elif mode == "after_state":
     def fake(path, data):
         if Path(path).parent.name == "transactions" and data.get("status") == "applied":
@@ -301,6 +315,60 @@ class KillTests(unittest.TestCase):
         self.assertEqual(self.journal_status(), "recovered_reverted")
         self.cli("apply", "--yes")
         self.assertEqual(self.status(), {"alpha": "unchanged", "beta": "unchanged"})
+
+    def stages(self):
+        return set(self.target.glob(".omniagent-stage-*"))
+
+    def assert_rerun_keeps_and_reports(self, leftovers):
+        done = self.recover("--yes")
+        self.assertTrue(leftovers <= self.stages(), "recover must not delete staging leftovers")
+        for stage in leftovers:
+            self.assertIn(f"leftover staging folder (inspect, then delete manually): {stage}", done.stdout)
+        self.assertEqual(self.journal_status(), "recovered_reverted")
+        self.assertIn("0 step(s)", self.recover("--yes").stdout)  # idempotent once finished
+
+    def test_recover_killed_between_renames_of_update_restores_backup(self):
+        self.interrupted_update()
+        before = self.stages()
+        self.recover("--yes", kill="rc_after_old_moved", expected=137)
+        self.assertFalse((self.target / "alpha").exists())
+        leftovers = self.stages() - before
+        self.assertEqual(len(leftovers), 1)
+        self.assertIn("v2", (next(iter(leftovers)) / "old" / "SKILL.md").read_text(encoding="utf-8"))
+        self.assert_rerun_keeps_and_reports(leftovers)
+        self.assertIn("v1", (self.target / "alpha" / "SKILL.md").read_text(encoding="utf-8"))
+        self.assertEqual(self.status(), {"alpha": "update", "beta": "update"})
+
+    def test_recover_killed_after_moving_fresh_install_aside_finishes(self):
+        make_skill(self.source, "alpha", "a")
+        make_skill(self.source, "beta", "b")
+        self.cli("apply", "--yes", kill="second_copy", expected=137)
+        before = self.stages()
+        self.recover("--yes", kill="rc_after_old_moved", expected=137)
+        self.assertFalse((self.target / "alpha").exists())
+        leftovers = self.stages() - before
+        self.assertEqual(len(leftovers), 1)
+        self.assert_rerun_keeps_and_reports(leftovers)
+        self.assertFalse((self.target / "alpha").exists())
+        self.assertEqual(self.managed(), {})
+
+    def test_recover_killed_after_swap_in_before_cleanup_finishes(self):
+        self.interrupted_update()
+        before = self.stages()
+        self.recover("--yes", kill="rc_after_swap_in", expected=137)
+        skill_md = self.target / "alpha" / "SKILL.md"
+        self.assertIn("v1", skill_md.read_text(encoding="utf-8"))
+        leftovers = self.stages() - before
+        self.assertEqual(len(leftovers), 1)
+        # An unexpected hash at dest is refused and left exactly as found.
+        original = skill_md.read_bytes()
+        skill_md.write_text("---\nname: alpha\n---\nhand edit\n", encoding="utf-8")
+        self.recover("--yes", expected=2)
+        self.assertIn("hand edit", skill_md.read_text(encoding="utf-8"))
+        skill_md.write_bytes(original)
+        self.assert_rerun_keeps_and_reports(leftovers)
+        self.assertIn("v1", skill_md.read_text(encoding="utf-8"))
+        self.assertEqual(self.status(), {"alpha": "update", "beta": "update"})
 
     def test_killed_after_state_write_is_finished(self):
         make_skill(self.source, "alpha", "a")
