@@ -153,3 +153,9 @@ Trong bản sao `.local/experiments/` (không đụng SSOT thật), áp dụng h
 - Native E2E sau sửa: **40 PASS, 0 FAIL**, 23.801 giây, Claude 2.1.246/Codex 0.163.0. Đây là bằng chứng cục bộ, không phải native E2E trên CI. Báo cáo Stage A liên kết CI nhánh tại `7888945` (Windows 275 PASS; Ubuntu 262 PASS + 13 skipped) và sẽ ghi CI revision riêng.
 - Raw report giữ ngoài Git; scan báo chuỗi entropy cao trong tên file tạm. Bản redacted chỉ bỏ detail của bốn INFO file listing, scan 0 phát hiện. Không đọc/sửa profile thật để xử lý mtime lịch sử, không mở Stage B; model calls và Antigravity native vẫn NOT_VERIFIED.
 - Đã commit/push revision `9f7f3ed` bình thường lên Draft PR #15. [CI PR](https://github.com/gonostudy305/omniagent-os/actions/runs/41019987210) và CI push cùng SHA xanh: Windows 277 PASS; Ubuntu 264 PASS + 13 skipped; GitGuardian xanh. Commit tài liệu tiếp theo chỉ thêm bằng chứng này; không đổi mã/test. Giữ Draft chờ Leader quyết định Ready for Review, không merge.
+
+## Đường dẫn dài trên Windows (02/11/2026, roadmap hạng mục 6)
+
+- Thử trên fixture tạm: thư mục đích 298 ký tự, file sâu nhất khoảng 460 ký tự (vượt MAX_PATH 260). Với `LongPathsEnabled=1` (máy chủ dự án), `plan`, `apply` cài mới, cập nhật, `rollback` và `recover` sau khi `apply` bị kill đều đúng, nội dung khôi phục khớp từng byte.
+- `tests/test_long_paths.py`: 2 test cố định cho các trường hợp trên. Trên Windows có `LongPathsEnabled` tắt, test **skip** kèm lý do `NOT_VERIFIED` chứ không báo pass.
+- Chưa kiểm: hành vi khi `LongPathsEnabled=0`. Muốn kiểm phải đổi cài đặt hệ thống, nằm ngoài phạm vi cho phép; trạng thái này vẫn NOT_VERIFIED. Bộ test đầy đủ trên Windows: **279 PASS**.
