@@ -169,6 +169,12 @@ Trong bản sao `.local/experiments/` (không đụng SSOT thật), áp dụng h
 - `tests/test_kill_apply_cleanup.py`: 7 test, process chết thật bằng `os._exit` trên fixture tạm. Kill khi xóa, khi dựng bản phục hồi, giữa hai lần rename, sau khi đưa bản phục hồi vào; lỗi khi ghi `state.json` rồi bị kill; sửa tay trong lúc `apply`; và một test đối chứng không kill. Trước khi sửa 6/7 fail; sau khi sửa pass. Mỗi lần phục hồi đều kiểm: stage dư được giữ và liệt kê, lần chạy thứ ba báo 0 bước. Bộ test đầy đủ trên Windows: **284 PASS**.
 - Sau khi cả PR này và PR #16 được merge, `remove_managed` sẽ không còn chỗ dùng.
 
+## Đường dẫn dài trên Windows (02/11/2026, roadmap hạng mục 6)
+
+- Thử trên fixture tạm: thư mục đích 298 ký tự, file sâu nhất khoảng 460 ký tự (vượt MAX_PATH 260). Với `LongPathsEnabled=1` (máy chủ dự án), `plan`, `apply` cài mới, cập nhật, `rollback` và `recover` sau khi `apply` bị kill đều đúng, nội dung khôi phục khớp từng byte.
+- `tests/test_long_paths.py`: 2 test cố định cho các trường hợp trên. Trên Windows có `LongPathsEnabled` tắt, test **skip** kèm lý do `NOT_VERIFIED` chứ không báo pass.
+- Chưa kiểm: hành vi khi `LongPathsEnabled=0`. Muốn kiểm phải đổi cài đặt hệ thống, nằm ngoài phạm vi cho phép; trạng thái này vẫn NOT_VERIFIED. Bộ test đầy đủ trên Windows: **279 PASS**.
+
 ## Kiểm kê nguồn gốc chỉ đọc (02/11/2026, roadmap hạng mục 5)
 
 - Thêm lệnh `inventory [--json]`. Với mỗi mục trong thư mục đích, và mỗi mục `state.json` ghi nhận nhưng đã mất, lệnh báo: tên, target, `kind`, `origin` (`installed`/`adopted`/`unmanaged`), giao dịch đã ghi đúng bản ghi hiện tại, hash cây thư mục, `integrity` so với bản ghi, và lý do khi không băm được. Hướng dẫn trong [USAGE.md](USAGE.md).
