@@ -837,12 +837,9 @@ def recover(state_dir: Path, apply_changes: bool) -> list[dict]:
             if not apply_changes:
                 continue
             for a, dest, backup, action in planned:
-                if action == "revert":
-                    remove_managed(dest)
-                if action in {"revert", "restore"} and backup is not None:
-                    shutil.copytree(backup, dest)
-                    if tree_digest(dest, source=False) != a["previous"]["hash"]:
-                        raise SafetyError(f"Restore verification failed: {dest}")
+                # Swap by rename so a kill mid-recover leaves dest whole or missing; a rerun finishes it.
+                if action in {"revert", "restore"}:
+                    swap_skill(dest, backup, a["previous"]["hash"] if backup is not None else None)
             journal["status"] = "recovered_reverted"
             save_json(journal_path, journal)
         return steps
