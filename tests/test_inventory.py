@@ -10,7 +10,8 @@ from pathlib import Path
 
 from test_explain import ROOT, SCRIPT, make_skill, snapshot
 
-SECRET = "sk-live-DO-NOT-LEAK-4242"
+# Low-entropy on purpose: a key-shaped literal trips secret scanners on this public repo.
+SECRET = "FAKE_SENTINEL_VALUE_FOR_LEAK_TEST"
 
 
 class InventoryTests(unittest.TestCase):
