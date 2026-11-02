@@ -999,16 +999,24 @@ def _apply_locked(source: Path, state_dir: Path, targets: dict[str, Path],
         state["managed"].update(records)
         save_json(state_dir / "state.json", state)
     except Exception:
+        journal_path = state_dir / "transactions" / f"{transaction}.json"
+        saved = read_json(journal_path, {}) if journal_path.exists() else {}
+        if saved.get("status") == "committing":
+            # The state write failed and files are reverted below: a kill now must be
+            # reverted by `recover`, not rolled forward.
+            saved["status"] = "in_progress"
+            save_json(journal_path, saved)
+        reverted = True
         for a in reversed(completed):
             dest = Path(a["destination"])
             if (dest.is_dir() and not is_link(dest)
                     and tree_digest(dest, source=False) == a.get("applied_hash", a["source_hash"])):
-                remove_managed(dest)
-                if a["backup"]:
-                    shutil.copytree(a["backup"], dest)
-        journal_path = state_dir / "transactions" / f"{transaction}.json"
-        if journal_path.exists():
-            saved = read_json(journal_path, {})
+                # Swap by rename so a kill here leaves dest whole or missing; `recover` finishes it.
+                swap_skill(dest, Path(a["backup"]) if a["backup"] else None,
+                           a["previous"]["hash"] if a["backup"] else None)
+            else:
+                reverted = False  # changed by someone else: keep it and leave the journal open
+        if saved and reverted:
             saved["status"] = "failed_reverted"
             save_json(journal_path, saved)
         raise
