@@ -837,12 +837,9 @@ def recover(state_dir: Path, apply_changes: bool) -> list[dict]:
             if not apply_changes:
                 continue
             for a, dest, backup, action in planned:
-                if action == "revert":
-                    remove_managed(dest)
-                if action in {"revert", "restore"} and backup is not None:
-                    shutil.copytree(backup, dest)
-                    if tree_digest(dest, source=False) != a["previous"]["hash"]:
-                        raise SafetyError(f"Restore verification failed: {dest}")
+                # Swap by rename so a kill mid-recover leaves dest whole or missing; a rerun finishes it.
+                if action in {"revert", "restore"}:
+                    swap_skill(dest, backup, a["previous"]["hash"] if backup is not None else None)
             journal["status"] = "recovered_reverted"
             save_json(journal_path, journal)
         return steps
@@ -877,12 +874,6 @@ def copy_rendered_skill(source: Path, destination: Path, source_hash: str,
             (destination / relative).write_bytes(body)
     if tree_digest(destination, source=False) != rendered_hash:
         raise SafetyError(f"Rendered staging hash mismatch: {name} ({target})")
-
-
-def remove_managed(path: Path) -> None:
-    if is_link(path) or not path.is_dir():
-        raise SafetyError(f"Refusing to remove unexpected destination: {path}")
-    shutil.rmtree(path)
 
 
 def apply(source: Path, state_dir: Path, targets: dict[str, Path],
