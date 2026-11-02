@@ -153,3 +153,10 @@ Trong bản sao `.local/experiments/` (không đụng SSOT thật), áp dụng h
 - Native E2E sau sửa: **40 PASS, 0 FAIL**, 23.801 giây, Claude 2.1.246/Codex 0.163.0. Đây là bằng chứng cục bộ, không phải native E2E trên CI. Báo cáo Stage A liên kết CI nhánh tại `7888945` (Windows 275 PASS; Ubuntu 262 PASS + 13 skipped) và sẽ ghi CI revision riêng.
 - Raw report giữ ngoài Git; scan báo chuỗi entropy cao trong tên file tạm. Bản redacted chỉ bỏ detail của bốn INFO file listing, scan 0 phát hiện. Không đọc/sửa profile thật để xử lý mtime lịch sử, không mở Stage B; model calls và Antigravity native vẫn NOT_VERIFIED.
 - Đã commit/push revision `9f7f3ed` bình thường lên Draft PR #15. [CI PR](https://github.com/gonostudy305/omniagent-os/actions/runs/41019987210) và CI push cùng SHA xanh: Windows 277 PASS; Ubuntu 264 PASS + 13 skipped; GitGuardian xanh. Commit tài liệu tiếp theo chỉ thêm bằng chứng này; không đổi mã/test. Giữ Draft chờ Leader quyết định Ready for Review, không merge.
+
+## `recover` bị kill giữa chừng (02/11/2026, roadmap hạng mục 6)
+
+- Lỗi tái hiện được: nhánh revert của `recover` xóa thư mục skill bằng `rmtree` rồi chép lại backup bằng `copytree`. Nếu tiến trình chết giữa hai bước này, thư mục bị xóa dở hoặc chép dở, hash không khớp bản mới lẫn bản cũ, nên mọi lần `recover` sau đều báo "destination was changed" và không bao giờ phục hồi được.
+- Sửa: dùng `swap_skill` (dựng bản sao ở thư mục stage, kiểm hash rồi đổi chỗ bằng rename), như `rollback` đã làm. Bị kill ở bất kỳ điểm nào thì thư mục đích hoặc còn nguyên, hoặc không còn; chạy lại `recover` sẽ làm nốt.
+- Thêm 3 test kill tiến trình thật trong `tests/test_kill.py`: kill khi chép backup, kill khi xóa bản mới (cập nhật), kill khi xóa bản cài mới. Trước khi sửa cả 3 fail với lỗi trên; sau khi sửa pass. Bộ test đầy đủ trên Windows, Python 3.13: **280 PASS**.
+- Chưa làm: kiểm đường dẫn dài trên Windows; nhánh dọn dẹp trong `apply` khi gặp exception vẫn dùng `remove_managed` + `copytree` (nếu bị kill đúng lúc đó cũng có thể kẹt như trên). Ubuntu sẽ có kết quả qua CI.

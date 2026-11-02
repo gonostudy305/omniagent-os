@@ -82,6 +82,22 @@ elif mode == "before_state":
             die()
         return real_save(path, data)
     omniagent.save_json = fake
+elif mode == "rc_partial_copy":
+    import shutil
+    real_tree = shutil.copytree
+    def fake(src, dst, *a, **k):
+        if "backups" in Path(src).parts:
+            real_tree(src, dst, *a, **k)
+            (Path(dst) / "SKILL.md").unlink()
+            die()
+        return real_tree(src, dst, *a, **k)
+    shutil.copytree = fake
+elif mode == "rc_partial_remove":
+    import shutil
+    def fake(path, *a, **k):
+        next(p for p in Path(path).rglob("*") if p.is_file()).unlink()
+        die()
+    shutil.rmtree = fake
 elif mode == "after_state":
     def fake(path, data):
         if Path(path).parent.name == "transactions" and data.get("status") == "applied":
@@ -181,9 +197,15 @@ class KillTests(unittest.TestCase):
         self.assertFalse((self.target / "beta").exists())
         self.assertEqual(self.managed(), {})
 
-    def recover(self, *extra, expected=0):
-        result = subprocess.run([sys.executable, "-I", str(SCRIPT), "recover", "--state-dir", str(self.state), *extra],
-                                capture_output=True, text=True, encoding="utf-8")
+    def recover(self, *extra, kill=None, expected=0):
+        args = ["recover", "--state-dir", str(self.state), *extra]
+        if kill:
+            cmd = [sys.executable, "-I", "-c", CHILD.format(root=str(ROOT)), *args]
+            env = {**os.environ, "KILL_MODE": kill}
+        else:
+            cmd = [sys.executable, "-I", str(SCRIPT), *args]
+            env = None
+        result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", env=env)
         self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
         return result
 
@@ -242,6 +264,43 @@ class KillTests(unittest.TestCase):
         self.recover("--yes")
         self.assertIn(str(self.target / "alpha"), self.managed())
         self.assertEqual(self.status()["alpha"], "unchanged")
+
+    def interrupted_update(self):
+        """alpha is replaced by v2, then apply dies while staging beta."""
+        alpha = make_skill(self.source, "alpha", "v1")
+        beta = make_skill(self.source, "beta", "v1")
+        self.cli("apply", "--yes")
+        for skill in (alpha, beta):
+            (skill / "SKILL.md").write_text(f"---\nname: {skill.name}\n---\nv2\n", encoding="utf-8")
+        self.cli("apply", "--yes", kill="second_copy", expected=137)
+        self.assertIn("v2", (self.target / "alpha" / "SKILL.md").read_text(encoding="utf-8"))
+
+    def test_recover_killed_while_restoring_backup_can_be_rerun(self):
+        self.interrupted_update()
+        self.recover("--yes", kill="rc_partial_copy", expected=137)
+        self.recover("--yes")
+        self.assertIn("v1", (self.target / "alpha" / "SKILL.md").read_text(encoding="utf-8"))
+        self.assertEqual(self.journal_status(), "recovered_reverted")
+        self.assertEqual(self.status(), {"alpha": "update", "beta": "update"})
+
+    def test_recover_killed_while_removing_new_copy_can_be_rerun(self):
+        self.interrupted_update()
+        self.recover("--yes", kill="rc_partial_remove", expected=137)
+        self.assertIn("v", (self.target / "alpha" / "SKILL.md").read_text(encoding="utf-8"))
+        self.recover("--yes")
+        self.assertIn("v1", (self.target / "alpha" / "SKILL.md").read_text(encoding="utf-8"))
+        self.assertEqual(self.status(), {"alpha": "update", "beta": "update"})
+
+    def test_recover_of_fresh_install_killed_while_removing_can_be_rerun(self):
+        make_skill(self.source, "alpha", "a")
+        make_skill(self.source, "beta", "b")
+        self.cli("apply", "--yes", kill="second_copy", expected=137)
+        self.recover("--yes", kill="rc_partial_remove", expected=137)
+        self.recover("--yes")
+        self.assertFalse((self.target / "alpha").exists())
+        self.assertEqual(self.journal_status(), "recovered_reverted")
+        self.cli("apply", "--yes")
+        self.assertEqual(self.status(), {"alpha": "unchanged", "beta": "unchanged"})
 
     def test_killed_after_state_write_is_finished(self):
         make_skill(self.source, "alpha", "a")
