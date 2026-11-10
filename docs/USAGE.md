@@ -54,6 +54,23 @@ Hai phép so hash được báo riêng, chỉ ghi những gì lệnh thật sự
 
 Đầu ra không chứa đường dẫn máy hay hash nội dung, và giống hệt nhau giữa hai lần chạy trên cùng một trạng thái, nên dùng được cho script và báo lỗi. Tên skill và tên target vẫn xuất hiện; xóa bớt nếu chúng riêng tư. `adopt --explain` từ chối chạy cùng `--yes` hoặc `--diff`. `adopt` có thêm trạng thái `managed_elsewhere`: thư mục đang được quản lý từ một đường dẫn SSOT khác, nên không bao giờ được adopt lại.
 
+### Kiểm kê nguồn gốc (`inventory`, chỉ đọc)
+
+```powershell
+python omniagent.py inventory --target "claude=$HOME\.claude\skills" --json
+```
+
+Liệt kê mọi mục trong thư mục đích, kể cả mục không do manager cài, cùng các mục `state.json` ghi nhận nhưng đã mất. Mỗi mục gồm:
+
+- `kind`: `skill`, `missing`, `link`, `not_a_skill`, `not_a_directory`.
+- `origin`: `installed`, `adopted` hoặc `unmanaged`.
+- `transaction`: giao dịch đã ghi đúng bản ghi hiện tại; là `unknown` nếu không chứng minh được.
+- `hash`: SHA-256 của cây thư mục.
+- `integrity`: `matches_record`, `differs_from_record`, `no_record` hoặc `unknown`.
+- `reason`, khi không băm được: `credential_like_file`, `link_or_unexpected_dir`, `non_regular_file`, `unreadable`.
+
+Không băm được thì `hash` và `integrity` đều là `unknown`; `unknown` không bao giờ được coi là khớp. Lệnh không đi theo link, không ghi gì (kể cả lock hay thư mục state), và bắt buộc có `--target` tường minh. Đầu ra không chứa đường dẫn máy, tên file hay nội dung file; tên thư mục không hợp lệ được in là `unknown`. Hash vẫn cho phép người khác kiểm một bản sao họ đã có là có trùng không, nên xóa bớt trước khi chia sẻ nếu skill riêng tư.
+
 ## Hoàn tác
 
 ```powershell
